@@ -2,5 +2,5 @@ cmake .. -DFDEV_NAME=adm -DTCP_STACK_EN=1 -DTCP_STACK_RX_DDR_BYPASS_EN=1
 OR
 cmake .. -DFDEV_NAME=u200 -DTCP_STACK_EN=1 -DTCP_STACK_RX_DDR_BYPASS_EN=1
 
-faketime '2021-03-01 13:00:00' make installip
+make installip
 
