@@ -116,7 +116,7 @@ set_property -dict [list CONFIG.S_TDATA_NUM_BYTES {32} CONFIG.M_TDATA_NUM_BYTES 
 
 #HLS IP cores
 
-create_ip -name toe -vendor ethz.systems -library hls -version 1.6 -module_name toe_ip 
+create_ip -name toe -vendor ethz.systems -library hls -version 1.7 -module_name toe_ip 
 update_compile_order -fileset sources_1
 
 create_ip -name ip_handler -vendor ethz.systems.fpga -library hls -version 2.0 -module_name ip_handler_ip 
@@ -151,7 +151,7 @@ update_compile_order -fileset sources_1
 #create_ip -name rocev2 -vendor ethz.systems.fpga -library hls -version 0.82 -module_name rocev2_ip 
 # update_compile_order -fileset sources_1
 
-create_ip -name hash_table -vendor ethz.systems.fpga -library hls -version 1.0 -module_name hash_table_ip 
+create_ip -name hash_table -vendor ethz.systems.fpga -library hls -version 1.1 -module_name hash_table_ip 
 update_compile_order -fileset sources_1
 
 ## Crossings
