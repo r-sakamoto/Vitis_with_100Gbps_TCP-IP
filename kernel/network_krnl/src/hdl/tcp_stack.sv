@@ -77,15 +77,20 @@ module tcp_stack #(
    output logic[15:0]   session_count_data
  );
 // Sync the reset (timing)
-(* DONT_TOUCH = "yes" *)
-logic net_aresetn_rr = 1'b1;
-logic net_aresetn_r = 1'b1;
+//(* DONT_TOUCH = "yes" *)
+//logic net_aresetn_rr = 1'b1;
+//logic net_aresetn_r = 1'b1;
 
-always_ff @(posedge net_clk) begin
-    net_aresetn_r <= net_aresetn;
-    net_aresetn_rr <= net_aresetn_r;
-end
+//always_ff @(posedge net_clk) begin
+//    net_aresetn_r <= net_aresetn;
+//    net_aresetn_rr <= net_aresetn_r;
+//end
 
+wire net_aresetn_rr;
+wire net_aresetn_r;
+
+assign net_aresetn_rr = net_aresetn;
+assign net_aresetn_r = net_aresetn;
 
 localparam ddrPortNetworkRx = 1;
 localparam ddrPortNetworkTx = 0;

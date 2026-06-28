@@ -94,12 +94,15 @@ module network_stack #(
  );
 
 // Sync the reset (timing)
-(* DONT_TOUCH = "yes" *)
-logic net_aresetn_r = 1'b1;
+//(* DONT_TOUCH = "yes" *)
+//logic net_aresetn_r = 1'b1;
 
-always_ff @(posedge net_clk) begin
-  net_aresetn_r <= net_aresetn;
-end
+//always_ff @(posedge net_clk) begin
+//  net_aresetn_r <= net_aresetn;
+//end
+wire net_aresetn_r;
+assign net_aresetn_r = net_aresetn;
+
 
 // Tie off RDMA
 axis_meta m_axis_roce_read_cmd ();

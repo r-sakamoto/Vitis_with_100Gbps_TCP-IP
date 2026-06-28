@@ -290,19 +290,19 @@ module network_krnl #(
 ///////////////////////////////////////////////////////////////////////////////
 // Wires and Variables
 ///////////////////////////////////////////////////////////////////////////////
-(* DONT_TOUCH = "yes" *)
-logic areset = 1'b0;
-logic areset_2 = 1'b0;
-logic ap_rst_n_reg = 1'b1;
-logic ap_rst_n_2_reg = 1'b1;
+//(* DONT_TOUCH = "yes" *)
+//logic areset = 1'b0;
+//logic areset_2 = 1'b0;
+//logic ap_rst_n_reg = 1'b1;
+//logic ap_rst_n_2_reg = 1'b1;
 
 // Register and invert reset signal.
-always @(posedge ap_clk) begin
-  areset <= ~ap_rst_n;
-  areset_2 <= ~ap_rst_n;
-  ap_rst_n_reg <= ap_rst_n;
-  ap_rst_n_2_reg <= ap_rst_n;
-end
+//always @(posedge ap_clk) begin
+//  areset <= ~ap_rst_n;
+//  areset_2 <= ~ap_rst_n;
+//  ap_rst_n_reg <= ap_rst_n;
+//  ap_rst_n_2_reg <= ap_rst_n;
+//end
 
 assign interrupt = 1'b0;
 
@@ -481,43 +481,43 @@ axis_meta #(.WIDTH(8))      m_axis_tcp_port_status();
 //open connection
 axis_meta #(.WIDTH(48))     s_axis_tcp_open_connection();
 
-axis_data_fifo_64_d256 s_axis_tcp_open_connection_fifo (
-  //.s_axis_aresetn(~(sys_reset | user_rx_reset)),
-  .s_axis_aresetn(~areset),
-  .s_axis_aclk(ap_clk),
-  .s_axis_tvalid(s_axis_tcp_open_connection_tvalid),
-  .s_axis_tready(s_axis_tcp_open_connection_tready),
-  .s_axis_tdata(s_axis_tcp_open_connection_tdata),
-  .s_axis_tkeep(s_axis_tcp_open_connection_tkeep),
-  .s_axis_tlast(s_axis_tcp_open_connection_tlast),
-  // .m_axis_aclk(ap_clk),
-  .m_axis_tvalid(s_axis_tcp_open_connection.valid),
-  .m_axis_tready(s_axis_tcp_open_connection.ready),
-  .m_axis_tdata(s_axis_tcp_open_connection.data),
-  .m_axis_tkeep(),
-  .m_axis_tlast()
-);
+//axis_data_fifo_64_d256 s_axis_tcp_open_connection_fifo (
+//  //.s_axis_aresetn(~(sys_reset | user_rx_reset)),
+//  .s_axis_aresetn(~areset),
+//  .s_axis_aclk(ap_clk),
+//  .s_axis_tvalid(s_axis_tcp_open_connection_tvalid),
+//  .s_axis_tready(s_axis_tcp_open_connection_tready),
+//  .s_axis_tdata(s_axis_tcp_open_connection_tdata),
+//  .s_axis_tkeep(s_axis_tcp_open_connection_tkeep),
+//  .s_axis_tlast(s_axis_tcp_open_connection_tlast),
+//  // .m_axis_aclk(ap_clk),
+//  .m_axis_tvalid(s_axis_tcp_open_connection.valid),
+//  .m_axis_tready(s_axis_tcp_open_connection.ready),
+//  .m_axis_tdata(s_axis_tcp_open_connection.data),
+//  .m_axis_tkeep(),
+//  .m_axis_tlast()
+//);
 
 
 //open status
 axis_meta #(.WIDTH(72))     m_axis_tcp_open_status();
 
-axis_data_fifo_72_d256 m_axis_tcp_open_status_fifo (
-  //.s_axis_aresetn(~(sys_reset | user_rx_reset)),
-  .s_axis_aresetn(~areset),
-  .s_axis_aclk(ap_clk),
-  .s_axis_tvalid(m_axis_tcp_open_status.valid),
-  .s_axis_tready(m_axis_tcp_open_status.ready),
-  .s_axis_tdata(m_axis_tcp_open_status.data),
-  .s_axis_tkeep('1),
-  .s_axis_tlast(1),
-  // .m_axis_aclk(ap_clk),
-  .m_axis_tvalid(m_axis_tcp_open_status_tvalid),
-  .m_axis_tready(m_axis_tcp_open_status_tready),
-  .m_axis_tdata(m_axis_tcp_open_status_tdata),
-  .m_axis_tkeep(m_axis_tcp_open_status_tkeep),
-  .m_axis_tlast(m_axis_tcp_open_status_tlast)
-);
+//axis_data_fifo_72_d256 m_axis_tcp_open_status_fifo (
+//  //.s_axis_aresetn(~(sys_reset | user_rx_reset)),
+//  .s_axis_aresetn(~areset),
+//  .s_axis_aclk(ap_clk),
+//  .s_axis_tvalid(m_axis_tcp_open_status.valid),
+//  .s_axis_tready(m_axis_tcp_open_status.ready),
+//  .s_axis_tdata(m_axis_tcp_open_status.data),
+//  .s_axis_tkeep('1),
+//  .s_axis_tlast(1),
+//  // .m_axis_aclk(ap_clk),
+//  .m_axis_tvalid(m_axis_tcp_open_status_tvalid),
+//  .m_axis_tready(m_axis_tcp_open_status_tready),
+//  .m_axis_tdata(m_axis_tcp_open_status_tdata),
+//  .m_axis_tkeep(m_axis_tcp_open_status_tkeep),
+//  .m_axis_tlast(m_axis_tcp_open_status_tlast)
+//);
 
 axis_meta #(.WIDTH(16))     s_axis_tcp_close_connection();
 
@@ -619,7 +619,8 @@ axis_meta #(.WIDTH(32))     s_axis_tcp_tx_meta();
 
 axis_data_fifo_32_d256 s_axis_tcp_tx_meta_fifo (
   //.s_axis_aresetn(~(sys_reset | user_rx_reset)),
-  .s_axis_aresetn(~areset),
+  //.s_axis_aresetn(~areset),
+  .s_axis_aresetn(ap_rst_n),
   .s_axis_aclk(ap_clk),
   .s_axis_tvalid(s_axis_tcp_tx_meta_tvalid),
   .s_axis_tready(s_axis_tcp_tx_meta_tready),
@@ -657,7 +658,8 @@ axis_meta #(.WIDTH(64))     m_axis_tcp_tx_status();
 
 axis_data_fifo_64_d256 m_axis_tcp_tx_status_fifo (
   //.s_axis_aresetn(~(sys_reset | user_rx_reset)),
-  .s_axis_aresetn(~areset),
+  //.s_axis_aresetn(~areset),
+  .s_axis_aresetn(ap_rst_n),
   .s_axis_aclk(ap_clk),
   .s_axis_tvalid(m_axis_tcp_tx_status.valid),
   .s_axis_tready(m_axis_tcp_tx_status.ready),
@@ -730,9 +732,12 @@ mem_single_inf #(
     // .UNALIGNED(0)
 ) mem_inf_inst0 (
 .user_clk(ap_clk),
-.user_aresetn(ap_rst_n_2_reg),
+//.user_aresetn(ap_rst_n_2_reg),
+.user_aresetn(ap_rst_n),
 .mem_clk(ap_clk),
-.mem_aresetn(ap_rst_n_reg),
+//.mem_aresetn(ap_rst_n_reg),
+.mem_aresetn(ap_rst_n),
+
 
 /* USER INTERFACE */
 //memory read commands
@@ -962,9 +967,11 @@ mem_single_inf #(
     // .UNALIGNED(0)
 ) mem_inf_inst1 (
 .user_clk(ap_clk),
-.user_aresetn(ap_rst_n_2_reg),
+//.user_aresetn(ap_rst_n_2_reg),
+.user_aresetn(ap_rst_n),
 .mem_clk(ap_clk),
-.mem_aresetn(ap_rst_n_reg),
+//.mem_aresetn(ap_rst_n_reg),
+.mem_aresetn(ap_rst_n),
 
 /* USER INTERFACE */
 //memory read commands
@@ -1033,7 +1040,8 @@ network_top #(
   .C_S_AXI_DATA_WIDTH ( C_S_AXI_CONTROL_DATA_WIDTH )
 )inst_network_top (
   .aclk(ap_clk),
-  .aresetn(ap_rst_n_2_reg),
+  //.aresetn(ap_rst_n_2_reg),
+  .aresetn(ap_rst_n),
   // .sys_reset(1'b0),  
   
   .axis_net_rx_data_aclk(axis_net_rx_data_aclk),
@@ -1162,18 +1170,18 @@ assign m_axis_tcp_port_status_tlast   = 1;
 assign m_axis_tcp_port_status.ready   = m_axis_tcp_port_status_tready;
 
 // //open connection
-// assign s_axis_tcp_open_connection.valid   = s_axis_tcp_open_connection_tvalid;
-// assign s_axis_tcp_open_connection.data    = s_axis_tcp_open_connection_tdata;
+ assign s_axis_tcp_open_connection.valid   = s_axis_tcp_open_connection_tvalid;
+ assign s_axis_tcp_open_connection.data    = s_axis_tcp_open_connection_tdata;
 
-// assign s_axis_tcp_open_connection_tready  = s_axis_tcp_open_connection.ready;
+ assign s_axis_tcp_open_connection_tready  = s_axis_tcp_open_connection.ready;
 
 // //open status
-// assign m_axis_tcp_open_status_tvalid      = m_axis_tcp_open_status.valid;
-// assign m_axis_tcp_open_status_tdata       = m_axis_tcp_open_status.data;
-// assign m_axis_tcp_open_status_tkeep       = '1;
-// assign m_axis_tcp_open_status_tlast       = 1;
+ assign m_axis_tcp_open_status_tvalid      = m_axis_tcp_open_status.valid;
+ assign m_axis_tcp_open_status_tdata       = m_axis_tcp_open_status.data;
+ assign m_axis_tcp_open_status_tkeep       = '1;
+ assign m_axis_tcp_open_status_tlast       = 1;
 
-// assign m_axis_tcp_open_status.ready   = m_axis_tcp_open_status_tready;
+ assign m_axis_tcp_open_status.ready   = m_axis_tcp_open_status_tready;
 
 //close connection
 assign s_axis_tcp_close_connection.valid   = s_axis_tcp_close_connection_tvalid;
