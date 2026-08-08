@@ -32,6 +32,7 @@
 module tcp_stack #(
     parameter TCP_EN = 1,
     parameter WIDTH = 64,
+    parameter TOE_WIDTH = WIDTH, // datapath width of the TOE core itself (64 for the 10G toe build)
     parameter RX_DDR_BYPASS_EN = 0
 )(
     input wire          net_clk,
@@ -126,10 +127,16 @@ axis_meta #(.WIDTH(144))     axis_ht_upd_req();
 axis_meta #(.WIDTH(152))     axis_ht_upd_rsp();
 
 // Signals for registering
-axi_stream #(.WIDTH(WIDTH) )   axis_rxwrite_data();
-axi_stream #(.WIDTH(WIDTH) )   axis_rxread_data();
-axi_stream #(.WIDTH(WIDTH) )   axis_txwrite_data();
-axi_stream #(.WIDTH(WIDTH) )   axis_txread_data();
+axi_stream #(.WIDTH(TOE_WIDTH) )   axis_rxwrite_data();
+axi_stream #(.WIDTH(TOE_WIDTH) )   axis_rxread_data();
+axi_stream #(.WIDTH(TOE_WIDTH) )   axis_txwrite_data();
+axi_stream #(.WIDTH(TOE_WIDTH) )   axis_txread_data();
+
+// TOE-side network/application data streams (TOE_WIDTH wide)
+axi_stream #(.WIDTH(TOE_WIDTH))    axis_toe_rx_data();
+axi_stream #(.WIDTH(TOE_WIDTH))    axis_toe_tx_data();
+axi_stream #(.WIDTH(TOE_WIDTH))    axis_toe_rx_app_data();
+axi_stream #(.WIDTH(TOE_WIDTH))    axis_toe_tx_app_data();
 
 axis_meta #(.WIDTH(16))     axis_listen_port();
 axis_meta #(.WIDTH(8))      axis_listen_port_status();
@@ -146,8 +153,8 @@ axis_meta #(.WIDTH(32))     axis_tx_metadata();
 wire[31:0] rx_buffer_data_count;
 reg[15:0] rx_buffer_data_count_reg;
 reg[15:0] rx_buffer_data_count_reg2;
-axi_stream #(.WIDTH(WIDTH))     axis_rxbuffer2app();
-axi_stream #(.WIDTH(WIDTH))     axis_tcp2rxbuffer();
+axi_stream #(.WIDTH(TOE_WIDTH))     axis_rxbuffer2app();
+axi_stream #(.WIDTH(TOE_WIDTH))     axis_tcp2rxbuffer();
 
 if (RX_DDR_BYPASS_EN == 0) begin
     assign s_axis_mem_read_sts[ddrPortNetworkRx].ready = 1'b1;
@@ -185,17 +192,17 @@ assign m_axis_mem_read_cmd[ddrPortNetworkTx].length = {9'h00, axis_read_cmd_data
 if (RX_DDR_BYPASS_EN == 0) begin
 toe_ip toe_inst (
 // Data output
-.m_axis_tcp_data_TVALID(m_axis_tx_data.valid),
-.m_axis_tcp_data_TREADY(m_axis_tx_data.ready),
-.m_axis_tcp_data_TDATA(m_axis_tx_data.data), // output [63 : 0] AXI_M_Stream_TDATA
-.m_axis_tcp_data_TKEEP(m_axis_tx_data.keep),
-.m_axis_tcp_data_TLAST(m_axis_tx_data.last),
+.m_axis_tcp_data_TVALID(axis_toe_tx_data.valid),
+.m_axis_tcp_data_TREADY(axis_toe_tx_data.ready),
+.m_axis_tcp_data_TDATA(axis_toe_tx_data.data), // output [TOE_WIDTH-1 : 0] AXI_M_Stream_TDATA
+.m_axis_tcp_data_TKEEP(axis_toe_tx_data.keep),
+.m_axis_tcp_data_TLAST(axis_toe_tx_data.last),
 // Data input
-.s_axis_tcp_data_TVALID(s_axis_rx_data.valid),
-.s_axis_tcp_data_TREADY(s_axis_rx_data.ready),
-.s_axis_tcp_data_TDATA(s_axis_rx_data.data),
-.s_axis_tcp_data_TKEEP(s_axis_rx_data.keep),
-.s_axis_tcp_data_TLAST(s_axis_rx_data.last),
+.s_axis_tcp_data_TVALID(axis_toe_rx_data.valid),
+.s_axis_tcp_data_TREADY(axis_toe_rx_data.ready),
+.s_axis_tcp_data_TDATA(axis_toe_rx_data.data),
+.s_axis_tcp_data_TKEEP(axis_toe_rx_data.keep),
+.s_axis_tcp_data_TLAST(axis_toe_rx_data.last),
 
 // rx read commands
 .m_axis_rxread_cmd_TVALID(m_axis_mem_read_cmd[ddrPortNetworkRx].valid),
@@ -294,21 +301,21 @@ toe_ip toe_inst (
 .m_axis_rx_data_rsp_metadata_TVALID(axis_rx_metadata.valid),
 .m_axis_rx_data_rsp_metadata_TREADY(axis_rx_metadata.ready),
 .m_axis_rx_data_rsp_metadata_TDATA(axis_rx_metadata.data),
-.m_axis_rx_data_rsp_TVALID(m_axis_rx_data.valid),
-.m_axis_rx_data_rsp_TREADY(m_axis_rx_data.ready),
-.m_axis_rx_data_rsp_TDATA(m_axis_rx_data.data),
-.m_axis_rx_data_rsp_TKEEP(m_axis_rx_data.keep),
-.m_axis_rx_data_rsp_TLAST(m_axis_rx_data.last),
+.m_axis_rx_data_rsp_TVALID(axis_toe_rx_app_data.valid),
+.m_axis_rx_data_rsp_TREADY(axis_toe_rx_app_data.ready),
+.m_axis_rx_data_rsp_TDATA(axis_toe_rx_app_data.data),
+.m_axis_rx_data_rsp_TKEEP(axis_toe_rx_app_data.keep),
+.m_axis_rx_data_rsp_TLAST(axis_toe_rx_app_data.last),
 
 // tx data
 .s_axis_tx_data_req_metadata_TVALID(axis_tx_metadata.valid),
 .s_axis_tx_data_req_metadata_TREADY(axis_tx_metadata.ready),
 .s_axis_tx_data_req_metadata_TDATA(axis_tx_metadata.data),
-.s_axis_tx_data_req_TVALID(s_axis_tx_data.valid),
-.s_axis_tx_data_req_TREADY(s_axis_tx_data.ready),
-.s_axis_tx_data_req_TDATA(s_axis_tx_data.data),
-.s_axis_tx_data_req_TKEEP(s_axis_tx_data.keep),
-.s_axis_tx_data_req_TLAST(s_axis_tx_data.last),
+.s_axis_tx_data_req_TVALID(axis_toe_tx_app_data.valid),
+.s_axis_tx_data_req_TREADY(axis_toe_tx_app_data.ready),
+.s_axis_tx_data_req_TDATA(axis_toe_tx_app_data.data),
+.s_axis_tx_data_req_TKEEP(axis_toe_tx_app_data.keep),
+.s_axis_tx_data_req_TLAST(axis_toe_tx_app_data.last),
 .m_axis_tx_data_rsp_TVALID(m_axis_tx_status.valid),
 .m_axis_tx_data_rsp_TREADY(m_axis_tx_status.ready),
 .m_axis_tx_data_rsp_TDATA(m_axis_tx_status.data),
@@ -325,17 +332,17 @@ else begin //RX_DDR_BYPASS_EN == 1
 //TOE Module with RX_DDR_BYPASS enabled
 toe_ip toe_inst (
 // Data output
-.m_axis_tcp_data_TVALID(m_axis_tx_data.valid),
-.m_axis_tcp_data_TREADY(m_axis_tx_data.ready),
-.m_axis_tcp_data_TDATA(m_axis_tx_data.data), // output [63 : 0] AXI_M_Stream_TDATA
-.m_axis_tcp_data_TKEEP(m_axis_tx_data.keep),
-.m_axis_tcp_data_TLAST(m_axis_tx_data.last),
+.m_axis_tcp_data_TVALID(axis_toe_tx_data.valid),
+.m_axis_tcp_data_TREADY(axis_toe_tx_data.ready),
+.m_axis_tcp_data_TDATA(axis_toe_tx_data.data), // output [TOE_WIDTH-1 : 0] AXI_M_Stream_TDATA
+.m_axis_tcp_data_TKEEP(axis_toe_tx_data.keep),
+.m_axis_tcp_data_TLAST(axis_toe_tx_data.last),
 // Data input
-.s_axis_tcp_data_TVALID(s_axis_rx_data.valid),
-.s_axis_tcp_data_TREADY(s_axis_rx_data.ready),
-.s_axis_tcp_data_TDATA(s_axis_rx_data.data),
-.s_axis_tcp_data_TKEEP(s_axis_rx_data.keep),
-.s_axis_tcp_data_TLAST(s_axis_rx_data.last),
+.s_axis_tcp_data_TVALID(axis_toe_rx_data.valid),
+.s_axis_tcp_data_TREADY(axis_toe_rx_data.ready),
+.s_axis_tcp_data_TDATA(axis_toe_rx_data.data),
+.s_axis_tcp_data_TKEEP(axis_toe_rx_data.keep),
+.s_axis_tcp_data_TLAST(axis_toe_rx_data.last),
 
 // rx buffer read path
 .s_axis_rxread_data_TVALID(axis_rxbuffer2app.valid),
@@ -422,21 +429,21 @@ toe_ip toe_inst (
 .m_axis_rx_data_rsp_metadata_TVALID(axis_rx_metadata.valid),
 .m_axis_rx_data_rsp_metadata_TREADY(axis_rx_metadata.ready),
 .m_axis_rx_data_rsp_metadata_TDATA(axis_rx_metadata.data),
-.m_axis_rx_data_rsp_TVALID(m_axis_rx_data.valid),
-.m_axis_rx_data_rsp_TREADY(m_axis_rx_data.ready),
-.m_axis_rx_data_rsp_TDATA(m_axis_rx_data.data),
-.m_axis_rx_data_rsp_TKEEP(m_axis_rx_data.keep),
-.m_axis_rx_data_rsp_TLAST(m_axis_rx_data.last),
+.m_axis_rx_data_rsp_TVALID(axis_toe_rx_app_data.valid),
+.m_axis_rx_data_rsp_TREADY(axis_toe_rx_app_data.ready),
+.m_axis_rx_data_rsp_TDATA(axis_toe_rx_app_data.data),
+.m_axis_rx_data_rsp_TKEEP(axis_toe_rx_app_data.keep),
+.m_axis_rx_data_rsp_TLAST(axis_toe_rx_app_data.last),
 
 // tx data
 .s_axis_tx_data_req_metadata_TVALID(axis_tx_metadata.valid),
 .s_axis_tx_data_req_metadata_TREADY(axis_tx_metadata.ready),
 .s_axis_tx_data_req_metadata_TDATA(axis_tx_metadata.data),
-.s_axis_tx_data_req_TVALID(s_axis_tx_data.valid),
-.s_axis_tx_data_req_TREADY(s_axis_tx_data.ready),
-.s_axis_tx_data_req_TDATA(s_axis_tx_data.data),
-.s_axis_tx_data_req_TKEEP(s_axis_tx_data.keep),
-.s_axis_tx_data_req_TLAST(s_axis_tx_data.last),
+.s_axis_tx_data_req_TVALID(axis_toe_tx_app_data.valid),
+.s_axis_tx_data_req_TREADY(axis_toe_tx_app_data.ready),
+.s_axis_tx_data_req_TDATA(axis_toe_tx_app_data.data),
+.s_axis_tx_data_req_TKEEP(axis_toe_tx_app_data.keep),
+.s_axis_tx_data_req_TLAST(axis_toe_tx_app_data.last),
 .m_axis_tx_data_rsp_TVALID(m_axis_tx_status.valid),
 .m_axis_tx_data_rsp_TREADY(m_axis_tx_status.ready),
 .m_axis_tx_data_rsp_TDATA(m_axis_tx_status.data),
@@ -453,11 +460,109 @@ toe_ip toe_inst (
 );
 end //RX_DDR_BYPASS_EN
 
+// Bridge between the WIDTH-wide external streams and the TOE_WIDTH-wide TOE core
+if (TOE_WIDTH == WIDTH) begin
+    // network path
+    assign axis_toe_rx_data.valid = s_axis_rx_data.valid;
+    assign s_axis_rx_data.ready = axis_toe_rx_data.ready;
+    assign axis_toe_rx_data.data = s_axis_rx_data.data;
+    assign axis_toe_rx_data.keep = s_axis_rx_data.keep;
+    assign axis_toe_rx_data.last = s_axis_rx_data.last;
+
+    assign m_axis_tx_data.valid = axis_toe_tx_data.valid;
+    assign axis_toe_tx_data.ready = m_axis_tx_data.ready;
+    assign m_axis_tx_data.data = axis_toe_tx_data.data;
+    assign m_axis_tx_data.keep = axis_toe_tx_data.keep;
+    assign m_axis_tx_data.last = axis_toe_tx_data.last;
+
+    // application path
+    assign m_axis_rx_data.valid = axis_toe_rx_app_data.valid;
+    assign axis_toe_rx_app_data.ready = m_axis_rx_data.ready;
+    assign m_axis_rx_data.data = axis_toe_rx_app_data.data;
+    assign m_axis_rx_data.keep = axis_toe_rx_app_data.keep;
+    assign m_axis_rx_data.last = axis_toe_rx_app_data.last;
+
+    assign axis_toe_tx_app_data.valid = s_axis_tx_data.valid;
+    assign s_axis_tx_data.ready = axis_toe_tx_app_data.ready;
+    assign axis_toe_tx_app_data.data = s_axis_tx_data.data;
+    assign axis_toe_tx_app_data.keep = s_axis_tx_data.keep;
+    assign axis_toe_tx_app_data.last = s_axis_tx_data.last;
+end
+else begin // WIDTH == 512, TOE_WIDTH == 64: 10G TOE inside the 512bit stack
+    // network rx: 512 -> 64
+    axis_512_to_64_converter toe_net_rx_converter (
+      .aclk(net_clk),
+      .aresetn(net_aresetn_rr),
+      .s_axis_tvalid(s_axis_rx_data.valid),
+      .s_axis_tready(s_axis_rx_data.ready),
+      .s_axis_tdata(s_axis_rx_data.data),
+      .s_axis_tkeep(s_axis_rx_data.keep),
+      .s_axis_tlast(s_axis_rx_data.last),
+      .m_axis_tvalid(axis_toe_rx_data.valid),
+      .m_axis_tready(axis_toe_rx_data.ready),
+      .m_axis_tdata(axis_toe_rx_data.data),
+      .m_axis_tkeep(axis_toe_rx_data.keep),
+      .m_axis_tlast(axis_toe_rx_data.last)
+    );
+
+    // network tx: 64 -> 512
+    axis_64_to_512_converter toe_net_tx_converter (
+      .aclk(net_clk),
+      .aresetn(net_aresetn_rr),
+      .s_axis_tvalid(axis_toe_tx_data.valid),
+      .s_axis_tready(axis_toe_tx_data.ready),
+      .s_axis_tdata(axis_toe_tx_data.data),
+      .s_axis_tkeep(axis_toe_tx_data.keep),
+      .s_axis_tlast(axis_toe_tx_data.last),
+      .s_axis_tdest(1'b0),
+      .m_axis_tvalid(m_axis_tx_data.valid),
+      .m_axis_tready(m_axis_tx_data.ready),
+      .m_axis_tdata(m_axis_tx_data.data),
+      .m_axis_tkeep(m_axis_tx_data.keep),
+      .m_axis_tlast(m_axis_tx_data.last),
+      .m_axis_tdest()
+    );
+
+    // application rx: 64 -> 512
+    axis_64_to_512_converter toe_app_rx_converter (
+      .aclk(net_clk),
+      .aresetn(net_aresetn_rr),
+      .s_axis_tvalid(axis_toe_rx_app_data.valid),
+      .s_axis_tready(axis_toe_rx_app_data.ready),
+      .s_axis_tdata(axis_toe_rx_app_data.data),
+      .s_axis_tkeep(axis_toe_rx_app_data.keep),
+      .s_axis_tlast(axis_toe_rx_app_data.last),
+      .s_axis_tdest(1'b0),
+      .m_axis_tvalid(m_axis_rx_data.valid),
+      .m_axis_tready(m_axis_rx_data.ready),
+      .m_axis_tdata(m_axis_rx_data.data),
+      .m_axis_tkeep(m_axis_rx_data.keep),
+      .m_axis_tlast(m_axis_rx_data.last),
+      .m_axis_tdest()
+    );
+
+    // application tx: 512 -> 64
+    axis_512_to_64_converter toe_app_tx_converter (
+      .aclk(net_clk),
+      .aresetn(net_aresetn_rr),
+      .s_axis_tvalid(s_axis_tx_data.valid),
+      .s_axis_tready(s_axis_tx_data.ready),
+      .s_axis_tdata(s_axis_tx_data.data),
+      .s_axis_tkeep(s_axis_tx_data.keep),
+      .s_axis_tlast(s_axis_tx_data.last),
+      .m_axis_tvalid(axis_toe_tx_app_data.valid),
+      .m_axis_tready(axis_toe_tx_app_data.ready),
+      .m_axis_tdata(axis_toe_tx_app_data.data),
+      .m_axis_tkeep(axis_toe_tx_app_data.keep),
+      .m_axis_tlast(axis_toe_tx_app_data.last)
+    );
+end
+
 
 
 if (RX_DDR_BYPASS_EN == 1) begin
 //RX BUFFER FIFO
-if (WIDTH==64) begin
+if (TOE_WIDTH==64) begin
 axis_data_fifo_64_d1024 rx_buffer_fifo (
   .s_axis_aresetn(net_aresetn_rr),          // input wire s_axis_aresetn
   .s_axis_aclk(net_clk),                // input wire s_axis_aclk
@@ -475,7 +580,7 @@ axis_data_fifo_64_d1024 rx_buffer_fifo (
   .axis_rd_data_count()
 );
 end
-if (WIDTH==128) begin
+if (TOE_WIDTH==128) begin
 axis_data_fifo_128_d1024 rx_buffer_fifo (
   .s_axis_aresetn(net_aresetn_rr),          // input wire s_axis_aresetn
   .s_axis_aclk(net_clk),                // input wire s_axis_aclk
@@ -493,7 +598,7 @@ axis_data_fifo_128_d1024 rx_buffer_fifo (
   .axis_rd_data_count()
 );
 end
-if (WIDTH==256) begin
+if (TOE_WIDTH==256) begin
 axis_data_fifo_256_d1024 rx_buffer_fifo (
   .s_axis_aresetn(net_aresetn_rr),          // input wire s_axis_aresetn
   .s_axis_aclk(net_clk),                // input wire s_axis_aclk
@@ -511,7 +616,7 @@ axis_data_fifo_256_d1024 rx_buffer_fifo (
   .axis_rd_data_count()
 );
 end
-if (WIDTH==512) begin
+if (TOE_WIDTH==512) begin
 axis_data_fifo_512_d1024 rx_buffer_fifo (
   .s_axis_aresetn(net_aresetn_rr),          // input wire s_axis_aresetn
   .s_axis_aclk(net_clk),                // input wire s_axis_aclk
@@ -603,7 +708,7 @@ hash_table_ip hash_table_inst (
 //   .probe11(axis_ht_upd_rsp.data) //152
 // );
 
-if (WIDTH==64) begin
+if (TOE_WIDTH==64) begin
 //TCP Data Path
 if (RX_DDR_BYPASS_EN == 0) begin
 axis_512_to_64_converter tcp_rxread_data_converter (
@@ -670,7 +775,7 @@ axis_64_to_512_converter tcp_txwrite_data_converter (
   .m_axis_tdest()    // output wire m_axis_tlast
 );
 end
-if (WIDTH==128) begin
+if (TOE_WIDTH==128) begin
 //TCP Data Path
 if (RX_DDR_BYPASS_EN == 0) begin
 axis_512_to_128_converter tcp_rxread_data_converter (
@@ -737,7 +842,7 @@ axis_128_to_512_converter tcp_txwrite_data_converter (
   .m_axis_tdest()    // output wire m_axis_tlast
 );
 end
-if (WIDTH==256) begin
+if (TOE_WIDTH==256) begin
 //TCP Data Path
 if (RX_DDR_BYPASS_EN == 0) begin
 axis_512_to_256_converter tcp_rxread_data_converter (
@@ -804,7 +909,7 @@ axis_256_to_512_converter tcp_txwrite_data_converter (
   .m_axis_tdest()    // output wire m_axis_tlast
 );
 end
-if (WIDTH==512) begin
+if (TOE_WIDTH==512) begin
 //TCP Data Path
 assign axis_rxread_data.valid = s_axis_mem_read_data[ddrPortNetworkRx].valid;
 assign s_axis_mem_read_data[ddrPortNetworkRx].ready = axis_rxread_data.ready;
