@@ -68,8 +68,8 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 				{
 					tx_table[tst_txEngUpdate.sessionID].app = tst_txEngUpdate.not_ackd;
 					tx_table[tst_txEngUpdate.sessionID].ackd = tst_txEngUpdate.not_ackd-1;
-					tx_table[tst_txEngUpdate.sessionID].cong_window = 0x3908; // 10 x 1460(MSS)
-					tx_table[tst_txEngUpdate.sessionID].slowstart_threshold = 0xFFFF;
+					// cong_window/slowstart_threshold are initialized by the
+					// rx-side init, which carries the session MSS
 					tx_table[tst_txEngUpdate.sessionID].finReady = tst_txEngUpdate.finReady;
 					tx_table[tst_txEngUpdate.sessionID].finSent = tst_txEngUpdate.finSent;
 					// Init ACK to txAppInterface
@@ -92,7 +92,9 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			{
 				txTxSarRtQuery txEngRtUpdate = tst_txEngUpdate;
 				tx_table[tst_txEngUpdate.sessionID].slowstart_threshold = txEngRtUpdate.getThreshold();
-				tx_table[tst_txEngUpdate.sessionID].cong_window = 0x3908; // 10 x 1460(MSS) TODO is this correct or less, eg. 1/2 * MSS
+				// RFC 5681: after an RTO the loss window is one full-sized segment
+				ap_uint<16> lwMss = tx_table[tst_txEngUpdate.sessionID].mss;
+				tx_table[tst_txEngUpdate.sessionID].cong_window = (lwMss == 0) ? (ap_uint<16>)MSS : lwMss;
 			}
 		}
 		else // Read
@@ -164,13 +166,27 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			tx_table[tst_rxEngUpdate.sessionID].cong_window = tst_rxEngUpdate.cong_window;
 			tx_table[tst_rxEngUpdate.sessionID].count = tst_rxEngUpdate.count;
 			tx_table[tst_rxEngUpdate.sessionID].fastRetransmitted = tst_rxEngUpdate.fastRetransmitted;
+			// effective cwnd for the app-side min_window push (on init the
+			// query still carries a stale value, use the fresh IW instead)
+			ap_uint<WINDOW_BITS> effCongWindow = tst_rxEngUpdate.cong_window;
 #if (WINDOW_SCALE)
 			ap_uint<4> win_shift;
+			if (tst_rxEngUpdate.writeSsthresh)
+			{
+				// entering fast recovery (RFC 5681): rx engine computed the new threshold
+				tx_table[tst_rxEngUpdate.sessionID].slowstart_threshold = tst_rxEngUpdate.ssthresh;
+			}
 			if (tst_rxEngUpdate.init)
 			{
 				win_shift = tst_rxEngUpdate.win_shift;
 				tx_table[tst_rxEngUpdate.sessionID].win_shift = tst_rxEngUpdate.win_shift;
 				tx_table[tst_rxEngUpdate.sessionID].mss = tst_rxEngUpdate.mss;
+				// RFC 6928 initial window: min(10*MSS, max(2*MSS, 14600))
+				ap_uint<WINDOW_BITS> iw = 10 * tst_rxEngUpdate.mss;
+				ap_uint<WINDOW_BITS> iwCap = (2 * tst_rxEngUpdate.mss > 14600) ? (ap_uint<WINDOW_BITS>)(2 * tst_rxEngUpdate.mss) : (ap_uint<WINDOW_BITS>)14600;
+				effCongWindow = (iw > iwCap) ? iwCap : iw;
+				tx_table[tst_rxEngUpdate.sessionID].cong_window = effCongWindow;
+				tx_table[tst_rxEngUpdate.sessionID].slowstart_threshold = CONGESTION_WINDOW_MAX;
 			}
 			else
 			{
@@ -189,9 +205,9 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			ap_uint<30> scaled_recv_window = tst_rxEngUpdate.recv_window;
 #endif
 			ap_uint<WINDOW_BITS> minWindow;
-			if (tst_rxEngUpdate.cong_window < scaled_recv_window) //tst_rxEngUpdate.recv_window)
+			if (effCongWindow < scaled_recv_window) //tst_rxEngUpdate.recv_window)
 			{
-				minWindow = tst_rxEngUpdate.cong_window;
+				minWindow = effCongWindow;
 			}
 			else
 			{

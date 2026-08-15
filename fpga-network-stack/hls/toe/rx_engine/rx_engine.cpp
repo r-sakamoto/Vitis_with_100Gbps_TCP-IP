@@ -1106,6 +1106,9 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				rxEng2timer_clearRetransmitTimer.write(rxRetransmitTimerUpdate(fsm_meta.sessionID, (fsm_meta.meta.ackNumb == txSar.nextByte)));
 				if (tcpState == ESTABLISHED || tcpState == SYN_RECEIVED || tcpState == FIN_WAIT_1 || tcpState == CLOSING || tcpState == LAST_ACK)
 				{
+					// per-session effective MSS for congestion arithmetic
+					ap_uint<16> sessMSS = (txSar.mss == 0) ? (ap_uint<16>)MSS : txSar.mss;
+					bool enterFastRecovery = false;
 					// Check if new ACK arrived
 					if (fsm_meta.meta.ackNumb == txSar.prevAck && txSar.prevAck != txSar.nextByte)
 					{
@@ -1113,31 +1116,64 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						if (fsm_meta.meta.length == 0)
 						{
 							txSar.count++;
+							if (txSar.count == 3 && !txSar.fastRetransmitted)
+							{
+								// RFC 5681 fast recovery entry on the 3rd duplicate ACK:
+								// ssthresh = max(FlightSize/2, 2*MSS), cwnd = ssthresh + 3*MSS
+								ap_uint<32> flightSize = txSar.nextByte - txSar.prevAck;
+								ap_uint<WINDOW_BITS> ssthreshNew;
+								if (flightSize > (ap_uint<32>)(4*sessMSS))
+								{
+									ssthreshNew = (ap_uint<WINDOW_BITS>)(flightSize >> 1);
+								}
+								else
+								{
+									ssthreshNew = 2*sessMSS;
+								}
+								txSar.slowstart_threshold = ssthreshNew;
+								txSar.cong_window = ssthreshNew + 3*sessMSS;
+								enterFastRecovery = true;
+							}
+							else if (txSar.fastRetransmitted && txSar.cong_window <= (CONGESTION_WINDOW_MAX - sessMSS))
+							{
+								// window inflation for each further duplicate ACK
+								txSar.cong_window += sessMSS;
+							}
 						}
 					}
-					else
+					else if (seq_gt(fsm_meta.meta.ackNumb, txSar.prevAck))
 					{
 						// Notify probeTimer about new ACK
 						rxEng2timer_clearProbeTimer.write(fsm_meta.sessionID);
 						// Report the cumulative ACK to the RTT estimator
 						rxEng2rtt_ack.write(rttAck(fsm_meta.sessionID, fsm_meta.meta.ackNumb));
-						// Check for SlowStart & Increase Congestion Window
-						if (txSar.cong_window <= (txSar.slowstart_threshold-MSS))
+						if (txSar.fastRetransmitted)
 						{
-							txSar.cong_window += MSS;
+							// leaving fast recovery: deflate cwnd to ssthresh (RFC 5681)
+							txSar.cong_window = txSar.slowstart_threshold;
 						}
-						else if (txSar.cong_window <= CONGESTION_WINDOW_MAX) //0xF7FF
+						// Check for SlowStart & Increase Congestion Window
+						else if (txSar.cong_window <= (txSar.slowstart_threshold-sessMSS))
 						{
-							txSar.cong_window += 365; //TODO replace by approx. of (MSS x MSS) / cong_window
+							txSar.cong_window += sessMSS;
+						}
+						else if (txSar.cong_window <= (ap_uint<WINDOW_BITS>)(CONGESTION_WINDOW_MAX - (sessMSS>>2)))
+						{
+							//congestion avoidance: ~MSS/4 per ACK (TODO proper MSS^2/cwnd)
+							txSar.cong_window += (sessMSS>>2);
 						}
 						txSar.count = 0;
 						txSar.fastRetransmitted = false;
 					}
+					// else: stale ACK (older than snd_una) - ignore for congestion state
 					// TX SAR
 					if ((txSar.prevAck <= fsm_meta.meta.ackNumb && fsm_meta.meta.ackNumb <= txSar.nextByte)
 							|| ((txSar.prevAck <= fsm_meta.meta.ackNumb || fsm_meta.meta.ackNumb <= txSar.nextByte) && txSar.nextByte < txSar.prevAck))
 					{
-						rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, txSar.count, ((txSar.count == 3) || txSar.fastRetransmitted))));
+						rxTxSarQuery txSarUpd(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, txSar.count, ((txSar.count == 3) || txSar.fastRetransmitted));
+						txSarUpd.ssthresh = txSar.slowstart_threshold;
+						txSarUpd.writeSsthresh = enterFastRecovery;
+						rxEng2txSar_upd_req.write(txSarUpd);
 					}
 
 // 					// Check if packet contains payload

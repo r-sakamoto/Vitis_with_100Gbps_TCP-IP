@@ -1718,6 +1718,89 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // P3 regression: RFC 5681 fast recovery. The congestion-window trajectory
+  // is verified by probing the tx_sar_table BRAMs:
+  //   IW10 (14600) -> +MSS on new ACK (16060) -> 3rd dup ACK enters recovery
+  //   (ssthresh = flight/2 = 4900, cwnd = ssthresh+3*MSS = 9280) -> 4th dup
+  //   inflates (+MSS = 10740) -> recovery-exit ACK deflates to ssthresh (4900).
+  task automatic test_fast_recovery();
+    bytes_t p, pay;
+    bit ok, ok2;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] d0_seq;
+    int got;
+    int unsigned cw, ssth;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd41100);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    // IW10 = 14600, plus one slow-start increment from the handshake ACK
+    cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cw == 14600 + 1460, $sformatf("initial cwnd=%0d expected 16060 (IW10 + handshake ACK)", cw));
+
+    // 8 x 1400B in flight
+    for (int i = 0; i < 8; i++) begin
+      pay = gen_payload(1400, 8'h30 + i[7:0]);
+      app_send(sid, pay, rsp);
+      tb_check(rsp.error == 0, $sformatf("app_send %0d accepted", i));
+    end
+    got = 0;
+    while (got < 8) begin
+      wait_pkt(p, 400000, ok2);
+      if (!ok2) begin tb_error("timeout collecting data segments"); return; end
+      if (f_payload_len(p) == 1400) begin
+        if (got == 0) d0_seq = f_seq(p);
+        got++;
+      end
+    end
+
+    // new ACK for the first segment: slow start grows cwnd by one MSS
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq + 1400, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cw == 16060 + 1460, $sformatf("cwnd=%0d expected 17520 after slow-start +MSS", cw));
+
+    // 3 duplicate ACKs -> fast recovery entry
+    for (int i = 0; i < 3; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, d0_seq + 1400, F_ACK, peer_win, no_bytes(), no_bytes()));
+      repeat (100) @(posedge ap_clk);
+    end
+    repeat (3000) @(posedge ap_clk);
+    ssth = dut.tx_sar_table_U0.tx_table_slowstart_threshold_V_U.ram[sid];
+    cw   = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(ssth == 4900, $sformatf("ssthresh=%0d expected 4900 (flight 9800 / 2)", ssth));
+    tb_check(cw == 9280, $sformatf("cwnd=%0d expected 9280 (ssthresh + 3*MSS) on recovery entry", cw));
+
+    // one more duplicate ACK -> window inflation
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq + 1400, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cw == 10740, $sformatf("cwnd=%0d expected 10740 (inflation +MSS)", cw));
+
+    // full ACK -> recovery exit, cwnd deflates to ssthresh
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq + 11200, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cw == 4900, $sformatf("cwnd=%0d expected 4900 (deflated to ssthresh)", cw));
+
+    while (net_pkts.size() > 0) void'(net_pkts.pop_front());
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   // F3 regression: a FIN carrying no ACK flag must still close the
   // connection (it previously fell into the ignored default flag case).
   task automatic test_pure_fin_close();
@@ -2297,6 +2380,7 @@ module tb_toe_top;
       "pure_fin_close" : test_pure_fin_close();
       "mss_option"     : test_mss_option();
       "tx_segmentation": test_tx_segmentation();
+      "fast_recovery"  : test_fast_recovery();
 `ifdef NO_RX_BYPASS
       "rx_ooo_overlap" : test_rx_ooo_overlap();
       "seq_window_check": test_seq_window_check();

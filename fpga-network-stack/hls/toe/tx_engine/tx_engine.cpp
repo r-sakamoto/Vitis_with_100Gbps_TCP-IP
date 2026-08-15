@@ -445,13 +445,13 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				// Decrease Slow Start Threshold, only on first RT from retransmitTimer
 				if (!ml_sarLoaded && (ml_curEvent.rt_count == 1))
 				{
-					if (currLength > (4*MSS)) // max( FlightSize/2, 2*MSS) RFC:5681
+					if (currLength > (4*sessionMSS)) // max( FlightSize/2, 2*MSS) RFC:5681
 					{
 						slowstart_threshold = currLength/2;
 					}
 					else
 					{
-						slowstart_threshold = (2 * MSS);
+						slowstart_threshold = (2 * sessionMSS);
 					}
 					txEng2txSar_upd_req.write(txTxSarRtQuery(ml_curEvent.sessionID, slowstart_threshold));
 				}

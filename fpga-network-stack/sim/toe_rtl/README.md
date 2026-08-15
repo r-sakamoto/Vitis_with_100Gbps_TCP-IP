@@ -67,6 +67,7 @@ dup ACKのみ送出(アプリ通知なし。内部の長さ0通知はrxAppNotifi
 | `pure_fin_close` | 両方 | F3回帰: ACKビットなしFINでもクローズ処理が走る |
 | `mss_option` | 両方 | F4回帰: 相手SYNのMSS(536)が再送セグメントサイズを制限する |
 | `tx_segmentation` | 両方 | P1回帰: MSS超過のapp書込み(1400B)が536B単位で分割送信され、直後のバイパス送信も正常 |
+| `fast_recovery` | 両方 | P3回帰: cwnd軌跡(IW10+16060→17520→回復entry 9280→膨張10740→収縮4900)をtx_sar BRAMプローブで検証 |
 | `rto_retransmit` | 両方 | RTO再送(同一seq)。**タイマ短縮ビルド専用** |
 | `fin_retransmit` | 両方 | B7回帰: FINのRTO再送でファントムデータが出ない。**タイマ短縮ビルド専用** |
 | `adaptive_rto` | 両方 | P2回帰: RTTサンプル後にRTOが初期1s→RTO_MIN(250ms)へ収束し指数バックオフする。**タイマ短縮ビルド専用** |
