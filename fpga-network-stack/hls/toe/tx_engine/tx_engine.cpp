@@ -80,7 +80,10 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 	static ap_uint<1> ml_FsmState = 0;
 	static bool ml_sarLoaded = false;
 	static extendedEvent ml_curEvent;
-	static ap_uint<32> ml_randomValue= 0x562301af; //Random seed initialization
+	static ap_uint<32> ml_randomValue= 0x562301af;
+	// free-running counter mixed into the ISN (RFC 6528 direction: a
+	// monotonic time component so ISNs are not a pure LFSR sequence)
+	static ap_uint<32> isnClock = 0;
 
 	static ap_uint<2> ml_segmentCount = 0;
 	static ap_uint<16> ml_segOffset = 0; //progress within an oversized app write (TX segmentation)
@@ -89,6 +92,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 	ap_uint<WINDOW_BITS> slowstart_threshold;
 	static tx_engine_meta meta;
 	rstEvent resetEvent;
+
+	isnClock++;
 
 	switch (ml_FsmState)
 	{
@@ -628,7 +633,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					// txSar.not_ackd = ml_randomValue; // FIXME better rand()
 					// ml_randomValue = (ml_randomValue* 8) xor ml_randomValue;
 					// meta.seqNumb = txSar.not_ackd;
-					txSar.not_ackd = ((ml_randomValue << 6) - 1); 
+					txSar.not_ackd = (ml_randomValue ^ ((ap_uint<32>)ml_curEvent.sessionID << 16)) + isnClock; //LFSR + time + session mix (was: <<6 with constant low bits)
+					
 					meta.seqNumb = txSar.not_ackd;
 					ml_randomValue = (ml_randomValue* 8) xor ml_randomValue;
 					txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID, txSar.not_ackd+1, 1, 1));
@@ -709,7 +715,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					// txSar.not_ackd = ml_randomValue; // FIXME better rand();
 					// ml_randomValue = (ml_randomValue* 8) xor ml_randomValue;
 					// meta.seqNumb = txSar.not_ackd;
-					txSar.not_ackd = ((ml_randomValue << 6) - 1); 
+					txSar.not_ackd = (ml_randomValue ^ ((ap_uint<32>)ml_curEvent.sessionID << 16)) + isnClock; //LFSR + time + session mix (was: <<6 with constant low bits)
+					
 					meta.seqNumb = txSar.not_ackd;
 					ml_randomValue = (ml_randomValue* 8) xor ml_randomValue;
 					txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID, txSar.not_ackd+1, 1, 1));

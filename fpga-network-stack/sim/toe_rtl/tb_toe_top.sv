@@ -3069,6 +3069,102 @@ module tb_toe_top;
     end
   endtask
 
+  // R1: segments arriving in TIME_WAIT are answered with an ACK, not a RST
+  // (RFC 793). Path to TIME_WAIT: app closes first (FIN), peer ACKs and sends
+  // its own FIN, TOE ACKs it -> TIME_WAIT. Then a retransmitted FIN and a
+  // stray pure ACK must both draw an ACK.
+  task automatic test_time_wait_ack();
+    bytes_t p;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    bit [31:0] fin_seq;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd41500);
+    if (err_count) return;
+
+    // learn session id
+    peer_send_seg(F_ACK, gen_payload(8, 8'h31));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+    if (err_count) return;
+
+    // active close by the TOE
+    app_close(sid);
+    expect_flags(F_FIN, "TOE FIN", p, 400000, 1);
+    if (err_count) return;
+    fin_seq = f_seq(p);
+    // ACK the FIN -> TOE enters FIN_WAIT_2
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, fin_seq + 1, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+    // peer FIN -> TOE ACKs, enters TIME_WAIT
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, fin_seq + 1, F_FIN | F_ACK, peer_win, no_bytes(), no_bytes()));
+    peer_seq += 1;
+    expect_flags(F_ACK, "ACK of peer FIN", p, 400000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq, "FIN ACK number");
+    wait_notif(n, 200000, ok); // closed notification
+    repeat (2000) @(posedge ap_clk);
+
+    // (1) retransmitted FIN in TIME_WAIT -> ACK, not RST
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq - 1, fin_seq + 1, F_FIN | F_ACK, peer_win, no_bytes(), no_bytes()));
+    wait_pkt(p, 400000, ok);
+    tb_check(ok, "response to retransmitted FIN");
+    if (ok) begin
+      tb_check((f_flags(p) & F_RST) == 0, "no RST for retransmitted FIN in TIME_WAIT");
+      tb_check((f_flags(p) & F_ACK) != 0, "ACK for retransmitted FIN in TIME_WAIT");
+    end
+
+    // (2) stray pure ACK in TIME_WAIT -> ACK, not RST (pre-fix: RST)
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, fin_seq + 1, F_ACK, peer_win, no_bytes(), no_bytes()));
+    wait_pkt(p, 400000, ok);
+    tb_check(ok, "response to stray ACK in TIME_WAIT");
+    if (ok) begin
+      tb_check((f_flags(p) & F_RST) == 0, "no RST for stray ACK in TIME_WAIT");
+      tb_check((f_flags(p) & F_ACK) != 0, "ACK for stray ACK in TIME_WAIT");
+    end
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  // R1: ISN quality - two connections must not draw the old LFSR pattern
+  // (identical low 6 bits = 6'b111111) and must differ from each other
+  task automatic test_isn_quality();
+    bytes_t p;
+    bit ok;
+    bit [31:0] iss[2];
+    bit [15:0] rports[2];
+
+    app_listen(16'd80, ok);
+    rports[0] = 16'd41510; rports[1] = 16'd41511;
+    for (int k = 0; k < 2; k++) begin
+      peer_port = rports[k]; toe_port = 16'd80;
+      peer_seq  = 32'h6000_0000 + (k << 16);
+      peer_win  = 16'hFFFF;
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, 0, F_SYN, 16'hFFFF, syn_options(1), no_bytes()));
+      expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 100000, 1);
+      if (err_count) return;
+      iss[k] = f_seq(p);
+      tb_info($sformatf("connection %0d ISS=%08h", k, iss[k]));
+      peer_ack = iss[k] + 1;
+      peer_seq += 1;
+      peer_send_seg(F_ACK, no_bytes());
+      repeat (1000) @(posedge ap_clk);
+    end
+    tb_check(iss[0] != iss[1], "ISNs differ between connections");
+    tb_check(!(iss[0][5:0] == 6'h3F && iss[1][5:0] == 6'h3F),
+             "low ISN bits are not the fixed pre-fix 111111 pattern");
+  endtask
+
   //---------------------------------------------------------------------------
   // Main
   //---------------------------------------------------------------------------
@@ -3124,6 +3220,8 @@ module tb_toe_top;
       "keepalive"      : test_keepalive();
       "ts_negotiate"   : test_ts_negotiate();
       "paws_drop"      : test_paws_drop();
+      "time_wait_ack"  : test_time_wait_ack();
+      "isn_quality"    : test_isn_quality();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 

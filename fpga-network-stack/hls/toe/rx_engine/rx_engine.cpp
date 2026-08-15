@@ -1589,8 +1589,19 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, tcpState, 1)); // or ESTABLISHED
 					}
 				} //end state if
-				// TODO if timewait just send ACK, can it be time wait??
-				else // state == (CLOSED || SYN_SENT || CLOSE_WAIT || FIN_WAIT_2 || TIME_WAIT)
+				else if (tcpState == TIME_WAIT)
+				{
+					// RFC 793: a stray in-window segment in TIME_WAIT is
+					// answered with an ACK, never a RST (the RST would hit the
+					// peer's LAST_ACK/retransmitted FIN exchange)
+					rxEng2eventEng_setEvent.write(event(ACK_NODELAY, fsm_meta.sessionID));
+					if (fsm_meta.meta.length != 0)
+					{
+						dropDataFifoOut.write(true);
+					}
+					rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, tcpState, 1));
+				}
+				else // state == (CLOSED || SYN_SENT)
 				{
 					// SENT RST, RFC 793: fig.11
 					rxEng2eventEng_setEvent.write(rstEvent(fsm_meta.sessionID, fsm_meta.meta.seqNumb+fsm_meta.meta.length)); // noACK ?

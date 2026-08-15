@@ -55,12 +55,12 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | 機能 | 現状 | Linux | 優先度 |
 |---|---|---|---|
 | ハーフクローズ | **実装済** (N1, `half_close`テスト): 相手FINでCLOSE_WAITへ入りACKのみ返答、appはclose通知後も送信可能(tx_app_stream_ifがCLOSE_WAIT送信を許可)。app closeでFIN→LAST_ACK→解放 | shutdown(SHUT_WR)対応 | 完了 |
-| FIN_WAIT_2 | **実装済** (N1): FIN_WAIT_1で自FINのACK受信→FIN_WAIT_2へ遷移、FIN_WAIT_2でのデータ受信・配送・相手FIN→TIME_WAITを確認。TIME_WAIT中ACKへのRSTは未対処 | 準拠 | ★(残: TIME_WAIT ACK) |
+| FIN_WAIT_2 | **実装済** (N1+R1, `time_wait_ack`テスト): FIN_WAIT_1→FIN_WAIT_2遷移、FIN_WAIT_2でのデータ受信・相手FIN→TIME_WAIT。TIME_WAIT中の迷子ACK/再送FINにはRSTでなくACKを返す(RFC 793) | 準拠 | 完了 |
 | ACKなしFIN | **実装済** (F3, `pure_fin_close`テスト): 純FINもFIN+ACKと同様に処理(ACK番号依存処理はACKフラグでガード) | 処理する | 完了 |
 | 同時オープン | 非対応(SYN_SENT中のSYNをパッシブオープン扱い) | 対応 | ★ |
 | TIME_WAIT | 60秒固定(2MSLでない)。TIME_WAIT中の同タプルSYN再利用不可 | 60s + 再利用(RFC 1122) | ★ |
 | listen解除 | **不可**(stop-listeningパスがコメントアウト, `rx_app_if.cpp:79-82`)。port>=32768はlistne不可、二重bind検出なし | close/bind準拠 | ★ |
-| ISN生成 | **固定シード(0x562301af)の決定的LFSR**、下位6bit常に0x3F (`tx_engine.cpp:82,488-490`) | RFC 6528(秘密鍵+4タプルハッシュ+時刻) | ★★ |
+| ISN生成 | **改善済** (R1, `isn_quality`テスト): ISN = LFSR ^ (sessionID<<16) + フリーランカウンタ。旧実装の「下位6bit常に0x3F」パターンを解消し時間成分を追加。RFC 6528完全準拠(秘密鍵+4タプルハッシュ)は未 | RFC 6528(秘密鍵+4タプルハッシュ+時刻) | ★(残) |
 | SYNバックログ制限 | なし。1000個の偽SYNで**全セッション枯渇**(SYN flood無防備) | syncookies等 | ★ |
 | RST検証 | seq==recvd完全一致のみ(RFC 5961のchallenge ACKなし) | RFC 5961 | ★ |
 | マルチホーム | 3タプル(theirIp,myPort,theirPort)キーで**ローカルIPは1つのみ** | 4タプル | ★ |
