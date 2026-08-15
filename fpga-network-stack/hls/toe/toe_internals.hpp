@@ -60,12 +60,13 @@ inline bool seq_geq(ap_uint<32> a, ap_uint<32> b) { return ((ap_int<32>)(ap_uint
 
 enum eventType {TX, RT, ACK, SYN, SYN_ACK, FIN, RST, ACK_NODELAY};
 /*
- * There is no explicit LISTEN state
- * CLOSE-WAIT state is not used, since the FIN is sent out immediately after we receive a FIN, the application is simply notified
- * FIN_WAIT_2 is also unused
- * LISTEN is merged into CLOSED
+ * There is no explicit LISTEN state (merged into CLOSED).
+ * CLOSE_WAIT and FIN_WAIT_2 are supported (half-close): on a peer FIN in
+ * ESTABLISHED the session enters CLOSE_WAIT and the application may keep
+ * sending until it closes; the ACK of our own FIN moves FIN_WAIT_1 to
+ * FIN_WAIT_2.
  */
-enum sessionState {CLOSED, SYN_SENT, SYN_RECEIVED, ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2, CLOSING, TIME_WAIT, LAST_ACK};
+enum sessionState {CLOSED, SYN_SENT, SYN_RECEIVED, ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2, CLOSING, TIME_WAIT, LAST_ACK, CLOSE_WAIT};
 
 
 struct fourTuple

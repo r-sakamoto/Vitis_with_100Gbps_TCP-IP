@@ -1092,8 +1092,14 @@ module tb_toe_top;
     // TOE notifies app of close
     wait_notif(n, 300000, ok);
     tb_check(ok && n.closed, "close notification");
-    // TOE sends its own FIN (possibly preceded by an ACK) - CLOSE_WAIT is skipped
-    expect_flags(F_FIN, "FIN from TOE", p, 400000, 1);
+    // half-close: TOE ACKs the FIN and stays in CLOSE_WAIT
+    expect_flags(F_ACK, "ACK of peer FIN", p, 400000, 0);
+    if (err_count) return;
+    tb_check((f_flags(p) & F_FIN) == 0, "no premature FIN from TOE (CLOSE_WAIT)");
+    tb_check(f_ack(p) == peer_seq, $sformatf("FIN ACK ack=%0d expected %0d", f_ack(p), peer_seq));
+    // app closes -> now the TOE sends its FIN
+    app_close(sid);
+    expect_flags(F_FIN, "FIN after app close", p, 400000, 1);
     if (err_count) return;
     tb_check(f_ack(p) == peer_seq, $sformatf("FIN ack=%0d expected %0d", f_ack(p), peer_seq));
     peer_ack = f_seq(p) + f_payload_len(p) + 1;
@@ -1846,6 +1852,130 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // N1 regression: half-close. After the peer's FIN the session enters
+  // CLOSE_WAIT: the application can keep sending data and the TOE's own FIN
+  // goes out only when the app closes. Also exercises FIN_WAIT_1->FIN_WAIT_2
+  // (peer keeps sending data after ACKing our FIN).
+  task automatic test_half_close();
+    bytes_t p, pay;
+    bit ok, ok2;
+    notif_t n;
+    byte unsigned rdata[$];
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] fin_seq, data_seq;
+    int base_deletes, nn;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+
+    // --- part 1: peer half-closes, app keeps sending ---
+    do_passive_handshake(16'd80, 16'd41130);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    app_read(sid, 8, rdata); //drain so later reads start at fresh data
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    peer_send_seg(F_FIN | F_ACK, no_bytes());
+    peer_seq += 1;
+    wait_notif(n, 300000, ok);
+    tb_check(ok && n.closed, "close notification (peer FIN)");
+    // the ACK of the FIN must arrive with NO FIN from our side
+    expect_flags(F_ACK, "ACK of peer FIN", p, 400000, 0);
+    if (err_count) return;
+    tb_check((f_flags(p) & F_FIN) == 0, "no FIN from TOE while in CLOSE_WAIT");
+    tb_check(f_ack(p) == peer_seq, "FIN ACK number");
+
+    // app can still send after the peer's FIN (this is the half-close)
+    pay = gen_payload(500, 8'hE0);
+    app_send(sid, pay, rsp);
+    tb_check(rsp.error == 0, "app_send in CLOSE_WAIT accepted");
+    ok = 0;
+    while (!ok) begin
+      wait_pkt(p, 400000, ok2);
+      if (!ok2) begin tb_error("timeout waiting for CLOSE_WAIT data"); return; end
+      if (f_payload_len(p) == 500) ok = 1;
+    end
+    tb_check(f_ack(p) == peer_seq, "CLOSE_WAIT data acks the peer FIN");
+    data_seq = f_seq(p);
+    begin
+      bytes_t d;
+      d = f_payload(p);
+      for (int i = 0; i < 500 && i < d.size(); i++)
+        if (d[i] !== pay[i]) begin
+          tb_check(0, $sformatf("CLOSE_WAIT payload mismatch at %0d", i));
+          return;
+        end
+    end
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, data_seq + 500, F_ACK, peer_win, no_bytes(), no_bytes()));
+
+    // app closes -> FIN, peer ACKs -> LAST_ACK -> CLOSED (session released)
+    base_deletes = cam_delete_count;
+    app_close(sid);
+    expect_flags(F_FIN, "FIN after app close", p, 400000, 1);
+    if (err_count) return;
+    tb_check(f_seq(p) == data_seq + 500, "FIN seq follows the CLOSE_WAIT data");
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, f_seq(p) + 1, F_ACK, peer_win, no_bytes(), no_bytes()));
+    nn = 0;
+    while (cam_delete_count == base_deletes && nn < 200000) begin
+      @(posedge ap_clk); nn++;
+    end
+    tb_check(cam_delete_count > base_deletes, "session released after LAST_ACK");
+
+    // --- part 2: we half-close first, peer keeps sending (FIN_WAIT_2) ---
+    do_passive_handshake(16'd80, 16'd41131);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h02));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "data notification (part 2)");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    app_read(sid, 8, rdata); //drain so the FIN_WAIT_2 read starts at fresh data
+    expect_flags(F_ACK, "ACK of 8B (part 2)", p, 400000, 0);
+
+    app_close(sid);
+    expect_flags(F_FIN, "our FIN", p, 400000, 1);
+    if (err_count) return;
+    fin_seq = f_seq(p);
+    // peer ACKs our FIN (no FIN of its own yet) -> FIN_WAIT_2
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, fin_seq + 1, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+    // peer keeps sending data; the TOE must accept and deliver it
+    pay = gen_payload(300, 8'hF0);
+    peer_ack = fin_seq + 1;
+    peer_send_seg(F_ACK, pay);
+    wait_notif(n, 300000, ok);
+    tb_check(ok && n.length == 300, "data delivered in FIN_WAIT_2");
+    if (!ok) return;
+    peer_seq += 300;
+    app_read(sid, 300, rdata);
+    for (int i = 0; i < 300 && i < rdata.size(); i++)
+      if (rdata[i] != pay[i]) begin
+        tb_check(0, $sformatf("FIN_WAIT_2 payload mismatch at %0d", i));
+        break;
+      end
+    // finally the peer closes too -> TIME_WAIT ACK
+    peer_send_seg(F_FIN | F_ACK, no_bytes());
+    peer_seq += 1;
+    ok = 0;
+    while (!ok) begin
+      wait_pkt(p, 400000, ok2);
+      if (!ok2) begin tb_error("timeout waiting for TIME_WAIT ACK"); return; end
+      if ((f_flags(p) & F_ACK) && f_payload_len(p) == 0 && f_ack(p) == peer_seq) ok = 1;
+    end
+    tb_check(ok, "peer FIN acked (TIME_WAIT)");
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   // S2 regression: SACK blocks from the peer suppress retransmission of the
   // already-received range - selective retransmit instead of pure go-back-N.
   task automatic test_sack_selective_rtx();
@@ -1993,6 +2123,7 @@ module tb_toe_top;
     bytes_t p;
     bit ok;
     notif_t n;
+    bit [15:0] sid;
 
     app_listen(16'd80, ok);
     tb_check(ok, "listen(80)");
@@ -2003,6 +2134,7 @@ module tb_toe_top;
     wait_notif(n, 200000, ok);
     tb_check(ok && n.length == 8, "data notification");
     if (!ok) return;
+    sid = n.sessionID;
     peer_seq += 8;
     expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
 
@@ -2011,7 +2143,13 @@ module tb_toe_top;
     peer_seq += 1;
     wait_notif(n, 300000, ok);
     tb_check(ok && n.closed, "close notification for pure FIN");
-    expect_flags(F_FIN, "FIN from TOE after pure FIN", p, 400000, 1);
+    // half-close: ACK only, FIN comes after the app closes
+    expect_flags(F_ACK, "ACK of pure FIN", p, 400000, 0);
+    if (err_count) return;
+    tb_check((f_flags(p) & F_FIN) == 0, "no premature FIN (CLOSE_WAIT)");
+    tb_check(f_ack(p) == peer_seq, "FIN ACK number");
+    app_close(sid);
+    expect_flags(F_FIN, "FIN after app close", p, 400000, 1);
     if (err_count) return;
     tb_check(f_ack(p) == peer_seq, "TOE FIN acks the peer FIN");
     peer_ack = f_seq(p) + 1;
@@ -2668,6 +2806,7 @@ module tb_toe_top;
       "tx_segmentation": test_tx_segmentation();
       "fast_recovery"  : test_fast_recovery();
       "sack_selective_rtx": test_sack_selective_rtx();
+      "half_close"     : test_half_close();
 `ifdef NO_RX_BYPASS
       "rx_ooo_overlap" : test_rx_ooo_overlap();
       "seq_window_check": test_seq_window_check();

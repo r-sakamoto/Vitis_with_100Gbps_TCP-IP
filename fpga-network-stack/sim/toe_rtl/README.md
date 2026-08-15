@@ -66,6 +66,7 @@ dup ACKのみ送出(アプリ通知なし。内部の長さ0通知はrxAppNotifi
 | `seq_window_check` | bypass=0 | F2回帰: ウィンドウ外セグメント排除(バッファ別名書込み防止)+2^32 wrapまたぎOOO再構成 |
 | `sack_rx_gen` | bypass=0 | S1回帰: SACK-Permitted交渉とdup ACK上の単一SACKブロック生成/拡大/消滅 |
 | `sack_selective_rtx` | 両方 | S2回帰: peer SACK範囲を再送しない選択的再送(先頭欠落=1000Bのみ、中間穴=前後2領域のみ) |
+| `half_close` | 両方 | N1回帰: 相手FIN後のCLOSE_WAIT送信継続→app closeでFIN→解放、およびFIN_WAIT_2でのデータ受信 |
 | `pure_fin_close` | 両方 | F3回帰: ACKビットなしFINでもクローズ処理が走る |
 | `mss_option` | 両方 | F4回帰: 相手SYNのMSS(536)が再送セグメントサイズを制限する |
 | `tx_segmentation` | 両方 | P1回帰: MSS超過のapp書込み(1400B)が536B単位で分割送信され、直後のバイパス送信も正常 |

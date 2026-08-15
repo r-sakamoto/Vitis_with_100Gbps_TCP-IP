@@ -83,7 +83,9 @@ void tasi_metaLoader(	stream<appTxMeta>&			appTxDataReqMetaData,
 				usableWindow = writeSar.min_window - usedLength;
 			}
 #endif
-			if (state != ESTABLISHED)
+			// half-close: sending is still allowed in CLOSE_WAIT (the peer
+			// closed its write side, ours stays open until the app closes)
+			if (state != ESTABLISHED && state != CLOSE_WAIT)
 			{
 				// Notify app about fail
 				appTxDataRsp.write(appTxRsp(tasi_writeMeta.sessionID, tasi_writeMeta.length, maxWriteLength, ERROR_NOCONNCECTION));

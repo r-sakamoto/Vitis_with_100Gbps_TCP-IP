@@ -1140,7 +1140,9 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				rxSar2rxEng_upd_rsp.read(rxSar);
 				txSar2rxEng_upd_rsp.read(txSar);
 				rxEng2timer_clearRetransmitTimer.write(rxRetransmitTimerUpdate(fsm_meta.sessionID, (fsm_meta.meta.ackNumb == txSar.nextByte)));
-				if (tcpState == ESTABLISHED || tcpState == SYN_RECEIVED || tcpState == FIN_WAIT_1 || tcpState == CLOSING || tcpState == LAST_ACK)
+				if (tcpState == ESTABLISHED || tcpState == SYN_RECEIVED || tcpState == FIN_WAIT_1
+						|| tcpState == FIN_WAIT_2 || tcpState == CLOSE_WAIT
+						|| tcpState == CLOSING || tcpState == LAST_ACK)
 				{
 					// per-session effective MSS for congestion arithmetic
 					ap_uint<16> sessMSS = (txSar.mss == 0) ? (ap_uint<16>)MSS : txSar.mss;
@@ -1494,6 +1496,9 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						case SYN_RECEIVED:
 							rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, ESTABLISHED, 1)); //TODO MAYBE REARRANGE
 							break;
+						case FIN_WAIT_1: //our FIN got ACKed
+							rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, FIN_WAIT_2, 1));
+							break;
 						case CLOSING:
 							rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, TIME_WAIT, 1));
 							rxEng2timer_setCloseTimer.write(fsm_meta.sessionID);
@@ -1706,8 +1711,10 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					// Update state
 					if (tcpState == ESTABLISHED)
 					{
-						rxEng2eventEng_setEvent.write(event(FIN, fsm_meta.sessionID));
-						rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, LAST_ACK, 1));
+						// half-close: ACK the peer's FIN and enter CLOSE_WAIT;
+						// our own FIN is sent when the application closes
+						rxEng2eventEng_setEvent.write(event(ACK, fsm_meta.sessionID));
+						rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, CLOSE_WAIT, 1));
 					}
 					else //FIN_WAIT_1 || FIN_WAIT_2
 					{

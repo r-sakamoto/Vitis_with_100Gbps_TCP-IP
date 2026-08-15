@@ -131,10 +131,16 @@ void tx_app_if(	stream<ipTuple>&				appOpenConnReq,
 		if (!stateTable2txApp_upd_rsp.empty())
 		{
 			stateTable2txApp_upd_rsp.read(state);
-			//TODO might add CLOSE_WAIT here???
 			if ((state == ESTABLISHED) || (state == FIN_WAIT_2) || (state == FIN_WAIT_1)) //TODO Why if FIN already SENT
 			{
 				txApp2stateTable_upd_req.write(stateQuery(tai_closeSessionID, FIN_WAIT_1, 1));
+				txApp2eventEng_setEvent.write(event(FIN, tai_closeSessionID));
+			}
+			else if (state == CLOSE_WAIT)
+			{
+				// half-close: the peer already sent its FIN, ours completes
+				// the teardown -> LAST_ACK
+				txApp2stateTable_upd_req.write(stateQuery(tai_closeSessionID, LAST_ACK, 1));
 				txApp2eventEng_setEvent.write(event(FIN, tai_closeSessionID));
 			}
 			else
