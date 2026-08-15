@@ -648,11 +648,11 @@ void drop_optional_header_fields(	hls::stream<optionalFieldsMeta>&		metaIn,
  *   3  |     3B | Window scale
  *   4  |     2B | SACK permitted (Selective Acknowledgment)
  */
-// Result is packed as {mss[19:4], windowScale[3:0]}. MSS defaults to 536
-// (RFC 1122) when the peer's SYN carries no MSS option.
+// Result is packed as {sackPermitted[20], mss[19:4], windowScale[3:0]}. MSS
+// defaults to 536 (RFC 1122) when the peer's SYN carries no MSS option.
 void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 												hls::stream<ap_uint<320> >&	optionalHeaderFieldsIn,
-												hls::stream<ap_uint<20> >&		parsedOptionsOut)
+												hls::stream<ap_uint<21> >&		parsedOptionsOut)
 {
 	#pragma HLS PIPELINE II=1
 	#pragma HLS INLINE off
@@ -666,6 +666,7 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 	static ap_uint<320> fields;
 	static ap_uint<4> wsVal;
 	static ap_uint<16> mssVal;
+	static ap_uint<1> sackPermVal;
 
 	switch (state)
 	{
@@ -678,6 +679,7 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 			remainingBytes = ((ap_uint<6>)dataOffset) * 4;
 			wsVal = 0;
 			mssVal = 536;
+			sackPermVal = 0;
 			state = PARSE;
 		}
 		break;
@@ -711,6 +713,16 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 					done = true; //malformed MSS option, stop parsing
 				}
 				break;
+			case 4: //SACK permitted
+				if (optionLength == 2 && remainingBytes >= 2)
+				{
+					sackPermVal = 1;
+				}
+				else
+				{
+					done = true; //malformed SACK-permitted option, stop parsing
+				}
+				break;
 			case 3: //Window scale
 				if (optionLength == 3 && remainingBytes >= 3)
 				{
@@ -739,7 +751,7 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 
 		if (done)
 		{
-			parsedOptionsOut.write((mssVal, wsVal));
+			parsedOptionsOut.write((sackPermVal, mssVal, wsVal));
 			state = IDLE;
 		}
 		else
@@ -752,7 +764,7 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 	}//switch
 }
 
-void merge_header_meta(hls::stream<ap_uint<20> >&			rxEng_winScaleFifo,
+void merge_header_meta(hls::stream<ap_uint<21> >&			rxEng_winScaleFifo,
 								hls::stream<rxEngineMetaData>&	rxEng_headerMetaFifo,
 								hls::stream<rxEngineMetaData>& 	rxEng_metaDataFifo)
 {
@@ -777,6 +789,7 @@ void merge_header_meta(hls::stream<ap_uint<20> >&			rxEng_winScaleFifo,
 			{
 				meta.winScale = 0;
 				meta.mss = 536; //RFC 1122 default when no MSS option present
+				meta.sackPermitted = 0;
 				rxEng_metaDataFifo.write(meta);
 			}
 		}
@@ -785,9 +798,10 @@ void merge_header_meta(hls::stream<ap_uint<20> >&			rxEng_winScaleFifo,
 		if (!rxEng_winScaleFifo.empty())
 		{
 			// std::cout << "META MERGE 1" << std::endl;
-			ap_uint<20> parsedOptions = rxEng_winScaleFifo.read();
+			ap_uint<21> parsedOptions = rxEng_winScaleFifo.read();
 			meta.winScale = parsedOptions(3, 0);
 			meta.mss = parsedOptions(19, 4);
+			meta.sackPermitted = parsedOptions[20];
 			rxEng_metaDataFifo.write(meta);
 			state = 0;
 		}
@@ -1499,7 +1513,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					// effective segment size for this session (RFC 879)
 					ap_uint<16> session_mss = (fsm_meta.meta.mss < MSS) ? fsm_meta.meta.mss : (ap_uint<16>)MSS;
 					// Initialize rxSar, SEQ + phantom byte for recvd and head pointer, offset to 0, gap set to false
-					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, rx_win_shift));
+					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, rx_win_shift, (bool)fsm_meta.meta.sackPermitted));
 					// Initialize receive window
 					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, 0, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift, session_mss))); //TODO maybe include count check
 #else
@@ -1565,7 +1579,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					ap_uint<4> tx_win_shift = fsm_meta.meta.winScale;
 					// effective segment size for this session (RFC 879)
 					ap_uint<16> session_mss = (fsm_meta.meta.mss < MSS) ? fsm_meta.meta.mss : (ap_uint<16>)MSS;
-					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, rx_win_shift));
+					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, rx_win_shift, (bool)fsm_meta.meta.sackPermitted));
 					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift, session_mss))); //TODO maybe include count check
 #else
 					//initialize rx_sar, SEQ + phantom byte, last '1' for appd init
@@ -2204,7 +2218,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 	static hls::stream<rxEngineMetaData>		rxEng_headerMetaFifo("rxEng_headerMetaFifo");
 	static hls::stream<ap_uint<4> >		rxEng_dataOffsetFifo("rxEng_dataOffsetFifo");
 	static hls::stream<ap_uint<320> >		rxEng_optionalFieldsFifo("rxEng_optionalFieldsFifo");
-	static hls::stream<ap_uint<20> >		rxEng_winScaleFifo("rxEng_winScaleFifo");
+	static hls::stream<ap_uint<21> >		rxEng_winScaleFifo("rxEng_winScaleFifo");
 	#pragma HLS stream variable=rxEng_headerMetaFifo depth=16
 	#pragma HLS stream variable=rxEng_dataOffsetFifo depth=2
 	#pragma HLS stream variable=rxEng_optionalFieldsFifo depth=2

@@ -59,6 +59,7 @@ struct rxEngineMetaData
 //#if (WINDOW_SCALE)
 	ap_uint<4>	winScale;
 	ap_uint<16>	mss; //peer MSS from the SYN options (536 if absent)
+	ap_uint<1>	sackPermitted; //peer offered SACK in its SYN
 //#endif
 	ap_uint<16> length;
 	ap_uint<1>	ack;

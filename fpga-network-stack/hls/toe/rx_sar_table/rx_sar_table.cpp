@@ -99,6 +99,7 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 			if (in_recvd.init)
 			{
 				rx_table[in_recvd.sessionID].appd = in_recvd.recvd;
+				rx_table[in_recvd.sessionID].sackEnabled = in_recvd.sackEnabled;
 #if (WINDOW_SCALE)
 				rx_table[in_recvd.sessionID].win_shift = in_recvd.win_shift;
 #endif

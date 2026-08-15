@@ -20,7 +20,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 |---|---|---|---|
 | MSSオプション(受信) | **実装済** (F4+P1, `mss_option`/`tx_segmentation`テスト): 実効MSS=min(peer,local)をセッション毎に保存し、初送・再送ともMSS超過書込みをDDR読出しで分割送信(バイパス複製ストリームは破棄モードで整合)。PMTUDは未 | 相手MSSとPMTUからMSSを決定 | ★(残: PMTUD) |
 | Window Scale(受信) | SYN時のみパース。**自側shiftは0か2の固定** (`rx_engine.cpp:1366,1429`)。相手shiftは**14超の値を無検証で格納** → `tx_sar_table.cpp:121` でビット範囲オーバーフロー(issue #42) | shift 0〜14を交渉、バッファサイズから導出 | ★★★ |
-| SACK / SACK-Permitted | **なし**(生成・解釈とも) | あり(選択再送・D-SACK) | ★★★ |
+| SACK / SACK-Permitted | **生成側実装済** (S1, `sack_rx_gen`テスト): SYNで常時SACK-Permitted提示、SYN-ACKは相手提示時のみエコー。ギャップ保持中のdup ACKに単一SACKブロック[offset,head)付与(単一ギャップOOOと1対1)。**解釈+選択再送(S2)は未** | あり(選択再送・D-SACK) | ★★(残: S2) |
 | Timestamps (RFC 7323) | **なし** → PAWSなし、RTT計測なし | あり | ★★★ |
 | ECN (ECE/CWR/ECT) | **なし**。フラグは常時0固定 (`toe_internals.hpp:522`) | あり | ★ |
 | オプションパーサの正当性 | dataOffsetの単位バグ(ワード vs バイト混在, issue #43)、不正オプション列でRXパイプラインがストールし得る (`rx_engine.cpp:645-700,730-738`) | — | ★★★(バグ修正) |

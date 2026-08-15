@@ -46,11 +46,16 @@ struct tx_engine_meta //same as rxEngine
 	ap_uint<1>	rst;
 	ap_uint<1>	syn;
 	ap_uint<1>	fin;
-	tx_engine_meta() {}
+	// SACK (RFC 2018): on a SYN this flag requests the SACK-Permitted option;
+	// on a pure ACK it appends one SACK block [sackStart, sackEnd)
+	ap_uint<1>	sack;
+	ap_uint<32>	sackStart;
+	ap_uint<32>	sackEnd;
+	tx_engine_meta() : sack(0) {}
 	tx_engine_meta(ap_uint<1> ack, ap_uint<1> rst, ap_uint<1> syn, ap_uint<1> fin)
-			:seqNumb(0), ackNumb(0), window_size(0), length(0), ack(ack), rst(rst), syn(syn), fin(fin) {}
+			:seqNumb(0), ackNumb(0), window_size(0), length(0), ack(ack), rst(rst), syn(syn), fin(fin), sack(0) {}
 	tx_engine_meta(ap_uint<32> seqNumb, ap_uint<32> ackNumb, ap_uint<1> ack, ap_uint<1> rst, ap_uint<1> syn, ap_uint<1> fin)
-			:seqNumb(seqNumb), ackNumb(ackNumb), window_size(0), length(0), ack(ack), rst(rst), syn(syn), fin(fin) {}
+			:seqNumb(seqNumb), ackNumb(ackNumb), window_size(0), length(0), ack(ack), rst(rst), syn(syn), fin(fin), sack(0) {}
 };
 
 /** @ingroup tx_engine

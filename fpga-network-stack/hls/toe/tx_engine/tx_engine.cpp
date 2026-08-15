@@ -174,6 +174,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.rst = 0;
 				meta.syn = 0;
 				meta.fin = 0;
+				meta.sack = 0;
 
 				if (ml_curEvent.length <= sessionMSS)
 				{
@@ -288,6 +289,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.rst = 0;
 				meta.syn = 0;
 				meta.fin = 0;
+				meta.sack = 0;
 				meta.length = 0;
 
 				currLength = (txSar.app - ((ap_uint<WINDOW_BITS>)txSar.not_ackd));
@@ -435,6 +437,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.rst = 0;
 				meta.syn = 0;
 				meta.fin = 0;
+				meta.sack = 0;
 
 				// Construct address before modifying txSar.ackd
 				ap_uint<32> pkgAddr;
@@ -536,7 +539,17 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.rst = 0;
 				meta.syn = 0;
 				meta.fin = 0;
-				txEng_ipMetaFifoOut.write(meta.length);
+				meta.sack = 0;
+				// RFC 2018: advertise the buffered out-of-order range as a
+				// single SACK block while a receive gap is open
+				if (rxSar.gap && rxSar.sackEnabled)
+				{
+					meta.sack = 1;
+					meta.sackStart = rxSar.offset;
+					meta.sackEnd = rxSar.head;
+				}
+				//ipMeta carries the option length for header-only segments
+				txEng_ipMetaFifoOut.write(meta.sack ? (ap_uint<16>)12 : meta.length);
 				txEng_tcpMetaFifoOut.write(meta);
 				txEng_isLookUpFifoOut.write(true);
 				txEng2sLookup_rev_req.write(ml_curEvent.sessionID);
@@ -580,13 +593,14 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.ackNumb = 0;
 				//meta.seqNumb = txSar.not_ackd;
 				meta.window_size = 0xFFFF;
-				meta.length = 4; // For MSS Option, 4 bytes
+				meta.length = 8; // MSS(4) + SACK-Permitted(2) + padding(2)
 				meta.ack = 0;
 				meta.rst = 0;
 				meta.syn = 1;
 				meta.fin = 0;
+				meta.sack = 1; // offer SACK-Permitted (RFC 2018)
 #if (WINDOW_SCALE)
-				meta.length = 8;
+				meta.length = 12; // MSS(4) + SACKperm(2) + WS(3) + padding(3)
 				meta.win_shift = WINDOW_SCALE_BITS;
 #endif
 
@@ -626,6 +640,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.rst = 0;
 				meta.syn = 1;
 				meta.fin = 0;
+				meta.sack = 0;
 				if (ml_curEvent.rt_count != 0)
 				{
 					meta.seqNumb = txSar.ackd;
@@ -651,6 +666,12 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				}
 				meta.win_shift = rxSar.win_shift;
 #endif
+				// echo SACK-Permitted if the peer's SYN offered it (RFC 2018)
+				if (rxSar.sackEnabled)
+				{
+					meta.sack = 1;
+					meta.length = (meta.length == 4) ? (ap_uint<16>)8 : (ap_uint<16>)12;
+				}
 
 				txEng_ipMetaFifoOut.write(meta.length);
 				txEng_tcpMetaFifoOut.write(meta);
@@ -698,6 +719,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.rst = 0;
 				meta.syn = 0;
 				meta.fin = 1;
+				meta.sack = 0;
 
 				// Check if retransmission, in case of RT, we have to reuse not_ackd number
 				if (ml_curEvent.rt_count != 0)
@@ -1138,12 +1160,15 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-	enum fsmState {META, HEADER, PARTIAL_HEADER, BODY, HEADER_MSS_OPTION};
+	enum fsmState {META, HEADER, PARTIAL_HEADER, BODY, HEADER_MSS_OPTION, HEADER_OPT_WORD2, HEADER_SACK_OPTION, HEADER_SACK_WORD2};
 	static fsmState state = META;
 	static tcpFullPseudoHeader<WIDTH> header; //size 256Bit
 	static bool hasBody = false;
 	static bool isSYN = false;
 	static ap_uint<4> win_shift = 0;
+	static bool hasSack = false;
+	static ap_uint<32> sackStart = 0;
+	static ap_uint<32> sackEnd = 0;
 
 	switch (state)
 	{
@@ -1156,31 +1181,28 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 			header.clear();
 			header.setSrcAddr(tuple.srcIp);
 			header.setDstAddr(tuple.dstIp);
-			header.setLength(meta.length + 0x14); // +20 bytes for the header without options
+			// TCP length: payload/options + 20B base header; a pure-ACK SACK
+			// block adds 12 option bytes not counted in meta.length
+			header.setLength(meta.length + 0x14 + ((!meta.syn && meta.sack) ? 12 : 0));
 			header.setSrcPort(tuple.srcPort);
 			header.setDstPort(tuple.dstPort);
 			header.setSeqNumb(meta.seqNumb);
 			header.setAckNumb(meta.ackNumb);
-#if !(WINDOW_SCALE)
-			header.setDataOffset(0x5 + meta.syn);
-#else
+#if (WINDOW_SCALE)
 			win_shift = meta.win_shift;
+#endif
+			hasSack = meta.sack;
+			sackStart = meta.sackStart;
+			sackEnd = meta.sackEnd;
 			if (meta.syn)
 			{
-				if (meta.win_shift != 0)
-				{
-					header.setDataOffset(0x7);
-				}
-				else
-				{
-					header.setDataOffset(0x6);
-				}
+				// meta.length carries the option byte count (multiple of 4)
+				header.setDataOffset(0x5 + (meta.length >> 2));
 			}
 			else
 			{
-				header.setDataOffset(0x5);
+				header.setDataOffset(meta.sack ? 0x8 : 0x5);
 			}
-#endif
 			//flags
 			header.setFinFlag(meta.fin);
 			header.setSynFlag(meta.syn);
@@ -1227,6 +1249,10 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 					// std::cout << "switch to MSS" << std::endl;
 					state = HEADER_MSS_OPTION;
 				}
+				else if (!isSYN && hasSack && WIDTH <= 256)
+				{
+					state = HEADER_SACK_OPTION;
+				}
 				else
 				{
 					sendWord.last = 1;
@@ -1239,7 +1265,7 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 		// printLE(std::cout, sendWord);
 		// std::cout << std::endl;
 
-		//In case of WIDTH == 512, we can add the MSS option into the first word
+		//In case of WIDTH == 512, we can add the options into the first word
 		if (isSYN && WIDTH == 512)
 		{
 			// MSS negotiation is only used in SYN packets
@@ -1250,18 +1276,42 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 			sendWord.data(511, 288) = 0;
 #endif
 			sendWord.keep(35,32) = 0xF;
+			ap_uint<9> optBit = 288; //next free option bit position
+			if (hasSack)
+			{
+				//SACK-Permitted (RFC 2018)
+				sendWord.data(optBit+7, optBit) = 0x04;
+				sendWord.data(optBit+15, optBit+8) = 0x02;
+				optBit += 16;
+			}
 #if (WINDOW_SCALE)
 			// WSopt negotiation, only send in SYN-ACK if received with SYN as in RFC 7323 1.3
-			// std::cout << "PSEUDO NEW: " << win_shift << std::endl;
 			if (win_shift != 0)
 			{
-				sendWord.data(295, 288) = 0x03; // Option Kind
-				sendWord.data(303, 296) = 0x03; // Option length
-				sendWord.data(311, 304) = win_shift;
-				sendWord.data(319, 312) = 0x0; // End of option list
-				sendWord.keep(39, 36) = 0xF;
+				sendWord.data(optBit+7, optBit) = 0x03; // Option Kind
+				sendWord.data(optBit+15, optBit+8) = 0x03; // Option length
+				sendWord.data(optBit+23, optBit+16) = win_shift;
+				optBit += 24;
 			}
 #endif
+			//pad with NOPs up to the 4-byte option boundary
+			while (optBit(4, 3) != 0) //optBit % 32 != 0
+			{
+				sendWord.data(optBit+7, optBit) = 0x01;
+				optBit += 8;
+			}
+			sendWord.keep((optBit>>3)-1, 32) = -1;
+		}
+		if (!isSYN && hasSack && WIDTH == 512)
+		{
+			//single SACK block: NOP NOP kind=5 len=10 start end
+			sendWord.data(263, 256) = 0x01;
+			sendWord.data(271, 264) = 0x01;
+			sendWord.data(279, 272) = 0x05;
+			sendWord.data(287, 280) = 0x0A;
+			sendWord.data(319, 288) = reverse(sackStart);
+			sendWord.data(351, 320) = reverse(sackEnd);
+			sendWord.keep(43, 32) = -1;
 		}
 
 		dataOut.write(sendWord);
@@ -1292,22 +1342,45 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 			}
 		}
 		break;
-	case HEADER_MSS_OPTION: //TODO Rename
+	case HEADER_MSS_OPTION: //SYN options, first (and possibly only) word
 	{
 		net_axis<WIDTH> sendWord;
-		// MSS negotiation is only used in SYN packets
+		// MSS is always present on SYN/SYN-ACK
 		sendWord.data(7, 0) = 0x02; // Option Kind
 		sendWord.data(15, 8) = 0x04; // Option length
 		sendWord.data(31, 16) = reverse((ap_uint<16>)MSS); //0xB405; // 0x05B4 = 1460
 		sendWord.keep = 0x0F;
+		sendWord.last = 1;
+		state = META;
 #ifndef __SYNTHESIS__
 		sendWord.data(63, 32) = 0;
 #endif
-#if (WINDOW_SCALE)
-		// WSopt negotiation, only send in SYN-ACK if received with SYN as in RFC 7323 1.3
-		// std::cout << "PSEUDO NEW: " << win_shift << std::endl;
-		if (win_shift != 0)
+		if (hasSack)
 		{
+			//SACK-Permitted (RFC 2018)
+			sendWord.data(39, 32) = 0x04;
+			sendWord.data(47, 40) = 0x02;
+			if (win_shift != 0)
+			{
+				//12B layout: MSS | SACKperm | WS(3) | NOP-pad(3): WS spans words
+				sendWord.data(55, 48) = 0x03; // WS Option Kind
+				sendWord.data(63, 56) = 0x03; // WS Option length
+				sendWord.keep = 0xFF;
+				sendWord.last = 0;
+				state = HEADER_OPT_WORD2;
+			}
+			else
+			{
+				//8B layout: MSS | SACKperm | NOP NOP
+				sendWord.data(55, 48) = 0x01;
+				sendWord.data(63, 56) = 0x01;
+				sendWord.keep = 0xFF;
+			}
+		}
+#if (WINDOW_SCALE)
+		else if (win_shift != 0)
+		{
+			//8B legacy layout: MSS | WS(3) | EOL
 			sendWord.data(39, 32) = 0x03; // Option Kind
 			sendWord.data(47, 40) = 0x03; // Option length
 			sendWord.data(55, 48) = win_shift;
@@ -1315,12 +1388,48 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 			sendWord.keep = 0xFF;
 		}
 #endif
+		dataOut.write(sendWord);
+		break;
+	}
+	case HEADER_OPT_WORD2: //rest of the 12B SYN option layout
+	{
+		net_axis<WIDTH> sendWord;
+		sendWord.data = 0;
+		sendWord.data(7, 0) = win_shift; //WS shift count (option split over words)
+		sendWord.data(15, 8) = 0x01;
+		sendWord.data(23, 16) = 0x01;
+		sendWord.data(31, 24) = 0x01;
+		sendWord.keep = 0x0F;
 		sendWord.last = 1;
-
 		dataOut.write(sendWord);
 		state = META;
 		break;
-	}//HEADER_LAST
+	}
+	case HEADER_SACK_OPTION: //single SACK block on a pure ACK: NOP NOP 05 0A start
+	{
+		net_axis<WIDTH> sendWord;
+		sendWord.data(7, 0) = 0x01;
+		sendWord.data(15, 8) = 0x01;
+		sendWord.data(23, 16) = 0x05;
+		sendWord.data(31, 24) = 0x0A;
+		sendWord.data(63, 32) = reverse(sackStart);
+		sendWord.keep = 0xFF;
+		sendWord.last = 0;
+		dataOut.write(sendWord);
+		state = HEADER_SACK_WORD2;
+		break;
+	}
+	case HEADER_SACK_WORD2: //SACK block right edge
+	{
+		net_axis<WIDTH> sendWord;
+		sendWord.data = 0;
+		sendWord.data(31, 0) = reverse(sackEnd);
+		sendWord.keep = 0x0F;
+		sendWord.last = 1;
+		dataOut.write(sendWord);
+		state = META;
+		break;
+	}
 	}//switch
 }
 

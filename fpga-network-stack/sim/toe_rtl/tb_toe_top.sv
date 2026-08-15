@@ -735,6 +735,16 @@ module tb_toe_top;
     bytes_t e; e = new[0]; return e;
   endfunction
 
+  function automatic bytes_t syn_options_sack();
+    bytes_t o;
+    o = new[12];
+    o[0] = 8'h02; o[1] = 8'h04; o[2] = 8'h05; o[3] = 8'hB4;  // MSS 1460
+    o[4] = 8'h04; o[5] = 8'h02;                              // SACK permitted
+    o[6] = 8'h03; o[7] = 8'h03; o[8] = 8'h02;                // WS shift=2
+    o[9] = 8'h01; o[10] = 8'h01; o[11] = 8'h01;              // NOP padding
+    return o;
+  endfunction
+
   function automatic bytes_t syn_options(input bit with_ws);
     bytes_t o;
     if (with_ws) begin
@@ -767,6 +777,31 @@ module tb_toe_top;
       if (o[i] == 8'h01) i++;               // NOP
       else if (i+1 < o.size() && o[i+1] >= 2) i += o[i+1];
       else return 0;                        // malformed
+    end
+    return 0;
+  endfunction
+
+  // extract the first SACK block (kind 5) from packet p
+  function automatic bit get_sack_block(input bytes_t p,
+                                        output bit [31:0] sstart,
+                                        output bit [31:0] send_);
+    bytes_t o;
+    int i;
+    o = f_options(p);
+    i = 0; sstart = 0; send_ = 0;
+    while (i < o.size()) begin
+      if (o[i] == 8'h00) return 0;
+      if (o[i] == 8'h01) begin i++; continue; end
+      if (o[i] == 8'h05) begin
+        if (i+9 < o.size()) begin
+          sstart = {o[i+2], o[i+3], o[i+4], o[i+5]};
+          send_  = {o[i+6], o[i+7], o[i+8], o[i+9]};
+          return 1;
+        end
+        return 0;
+      end
+      if (i+1 < o.size() && o[i+1] >= 2) i += o[i+1];
+      else return 0;
     end
     return 0;
   endfunction
@@ -1901,6 +1936,106 @@ module tb_toe_top;
   endtask
 
 `ifdef NO_RX_BYPASS
+  // S1 regression (RFC 2018): SACK-Permitted negotiation on the handshake and
+  // one SACK block on duplicate ACKs while the single receive gap is open.
+  task automatic test_sack_rx_gen();
+    bytes_t p, opts, stream_data, segA, segB, segC;
+    bit ok, found;
+    byte unsigned val;
+    notif_t n;
+    byte unsigned rdata[$];
+    bit [15:0] sid;
+    bit [31:0] base_seq, sstart, send_;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+
+    // --- connection WITH SACK-Permitted ---
+    peer_port = 16'd41110; toe_port = 16'd80;
+    peer_seq  = 32'h8000_0000; peer_win = 16'hFFFF;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, 0, F_SYN, 16'hFFFF, syn_options_sack(), no_bytes()));
+    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 100000, 1);
+    if (err_count) return;
+    found = find_option(p, 8'h04, val);
+    tb_check(found, "SYN-ACK echoes SACK-Permitted");
+    found = find_option(p, 8'h03, val);
+    tb_check(found, "SYN-ACK still carries WS");
+    peer_ack = f_seq(p) + 1;
+    peer_seq += 1;
+    peer_send_seg(F_ACK, no_bytes());
+    base_seq = peer_seq;
+
+    stream_data = gen_payload(2000, 8'hD0);
+    segA = new[1000]; for (int i = 0; i < 1000; i++) segA[i] = stream_data[i];
+    segB = new[500];  for (int i = 0; i < 500;  i++) segB[i] = stream_data[1000+i];
+    segC = new[500];  for (int i = 0; i < 500;  i++) segC[i] = stream_data[1500+i];
+
+    // OOO segment B opens a gap -> dup ACK with SACK block [B, B+500)
+    peer_seq = base_seq + 1000;
+    peer_send_seg(F_ACK, segB);
+    expect_flags(F_ACK, "dup ACK (gap open)", p, 200000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == base_seq, "dup ACK number");
+    found = get_sack_block(p, sstart, send_);
+    tb_check(found, "dup ACK carries a SACK block");
+    if (found) begin
+      tb_check(sstart == base_seq + 1000 && send_ == base_seq + 1500,
+               $sformatf("SACK block [%0d,%0d) expected [%0d,%0d)",
+                         sstart, send_, base_seq+1000, base_seq+1500));
+    end
+
+    // contiguous OOO segment C extends the buffered range -> block grows
+    peer_seq = base_seq + 1500;
+    peer_send_seg(F_ACK, segC);
+    expect_flags(F_ACK, "dup ACK (gap extended)", p, 200000, 0);
+    if (err_count) return;
+    found = get_sack_block(p, sstart, send_);
+    tb_check(found, "second dup ACK carries a SACK block");
+    if (found) begin
+      tb_check(sstart == base_seq + 1000 && send_ == base_seq + 2000,
+               $sformatf("SACK block [%0d,%0d) expected [%0d,%0d)",
+                         sstart, send_, base_seq+1000, base_seq+2000));
+    end
+
+    // fill the gap -> combined notification, subsequent ACKs carry no SACK
+    peer_seq = base_seq;
+    peer_send_seg(F_ACK, segA);
+    wait_notif(n, 200000, ok);
+    tb_check(ok && n.length == 2000, "combined 2000B notified after gap fill");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq = base_seq + 2000;
+    expect_flags(F_ACK, "ACK after gap fill", p, 400000, 0);
+    if (err_count) return;
+    found = get_sack_block(p, sstart, send_);
+    tb_check(!found, "no SACK block once the gap is closed");
+    app_read(sid, 2000, rdata);
+    tb_check(rdata.size() == 2000, "read 2000 bytes");
+    for (int i = 0; i < 2000 && i < rdata.size(); i++)
+      if (rdata[i] != stream_data[i]) begin
+        tb_check(0, $sformatf("data mismatch at byte %0d", i));
+        break;
+      end
+
+    // --- connection WITHOUT SACK-Permitted: no SACK blocks may appear ---
+    do_passive_handshake(16'd80, 16'd41111);
+    if (err_count) return;
+    base_seq = peer_seq;
+    peer_seq = base_seq + 1000;
+    peer_send_seg(F_ACK, segB);
+    expect_flags(F_ACK, "dup ACK (no-SACK session)", p, 200000, 1);
+    if (err_count) return;
+    found = get_sack_block(p, sstart, send_);
+    tb_check(!found, "no SACK block on a session without SACK-Permitted");
+    // clean up the gap
+    peer_seq = base_seq;
+    peer_send_seg(F_ACK, gen_payload(1000, 8'h11));
+    wait_notif(n, 200000, ok);
+    tb_check(ok && n.length == 1500, "no-SACK session still reassembles");
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   // F2 regression: (A) a segment far beyond the advertised window used to be
   // accepted through a WINDOW_BITS-truncated check and aliased onto valid
   // buffer content, corrupting unread data; (B) OOO segments whose sequence
@@ -2384,6 +2519,7 @@ module tb_toe_top;
 `ifdef NO_RX_BYPASS
       "rx_ooo_overlap" : test_rx_ooo_overlap();
       "seq_window_check": test_seq_window_check();
+      "sack_rx_gen"    : test_sack_rx_gen();
 `endif
       "rto_retransmit" : test_rto_retransmit();
       "fin_retransmit" : test_fin_retransmit();

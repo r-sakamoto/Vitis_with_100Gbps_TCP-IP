@@ -134,6 +134,7 @@ struct rxSarEntry
 	ap_uint<32> head;
 	ap_uint<32> offset;
 	bool gap;
+	bool sackEnabled; //SACK permitted was negotiated on this session
 };
 
 struct rxSarReply
@@ -144,12 +145,17 @@ struct rxSarReply
 #endif
 	ap_uint<16>	windowSize;
 	ap_uint<WINDOW_BITS>	usedLength;
+	//for SACK block generation on duplicate ACKs (single gap)
+	ap_uint<32> head;
+	ap_uint<32> offset;
+	bool		gap;
+	bool		sackEnabled;
 	rxSarReply() {}
 	rxSarReply(rxSarEntry entry)
 #if !(WINDOW_SCALE)
-		:recvd(entry.recvd) {}
+		:recvd(entry.recvd), head(entry.head), offset(entry.offset), gap(entry.gap), sackEnabled(entry.sackEnabled) {}
 #else
-		:recvd(entry.recvd), win_shift(entry.win_shift) {}
+		:recvd(entry.recvd), win_shift(entry.win_shift), head(entry.head), offset(entry.offset), gap(entry.gap), sackEnabled(entry.sackEnabled) {}
 #endif
 };
 
@@ -158,6 +164,7 @@ struct rxSarRecvd
 	ap_uint<16> sessionID;
 	ap_uint<32> recvd;
 	ap_uint<4>	win_shift; //TODO name
+	bool		sackEnabled; //only valid on init
 	ap_uint<1> write;
 	ap_uint<1> init;
 	ap_uint<32> head;
@@ -174,7 +181,9 @@ struct rxSarRecvd
 	rxSarRecvd(ap_uint<16> id, ap_uint<32> recvd, ap_uint<32> head, ap_uint<32>offset, bool gap)
 				:sessionID(id), recvd(recvd), head(head), offset(offset), gap(gap), write(1), init(0) {}
 	rxSarRecvd(ap_uint<16> id, ap_uint<32> recvd, ap_uint<32> head, ap_uint<32>offset, bool gap, ap_uint<4> win_shift)
-				:sessionID(id), recvd(recvd), head(head), offset(offset), gap(gap), win_shift(win_shift), write(1), init(1) {}
+				:sessionID(id), recvd(recvd), head(head), offset(offset), gap(gap), win_shift(win_shift), sackEnabled(false), write(1), init(1) {}
+	rxSarRecvd(ap_uint<16> id, ap_uint<32> recvd, ap_uint<32> head, ap_uint<32>offset, bool gap, ap_uint<4> win_shift, bool sackEnabled)
+				:sessionID(id), recvd(recvd), head(head), offset(offset), gap(gap), win_shift(win_shift), sackEnabled(sackEnabled), write(1), init(1) {}
 };
 
 struct rxSarAppd
