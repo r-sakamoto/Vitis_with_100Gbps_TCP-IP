@@ -363,6 +363,7 @@ void rxAppWrapper(	stream<appReadRequest>&			appRxDataReq,
 					stream<appNotification>&		timer2rxApp_notification,
 					stream<ap_uint<16> >&			appRxDataRspMetadata,
 					stream<rxSarAppd>&				rxApp2rxSar_upd_req,
+					stream<event>&					rxApp2eventEng_setEvent,
 #if !(RX_DDR_BYPASS)
 					stream<mmCmd>&					rxBufferReadCmd,
 #endif
@@ -388,12 +389,12 @@ void rxAppWrapper(	stream<appReadRequest>&			appRxDataReq,
 	 // RX Application Stream Interface
 #if !(RX_DDR_BYPASS)
 	rx_app_stream_if(appRxDataReq, rxSar2rxApp_upd_rsp, appRxDataRspMetadata,
-						rxApp2rxSar_upd_req, rxAppStreamIf2memAccessBreakdown);
+						rxApp2rxSar_upd_req, rxApp2eventEng_setEvent, rxAppStreamIf2memAccessBreakdown);
 	rxAppMemAccessBreakdown(rxAppStreamIf2memAccessBreakdown, rxBufferReadCmd, rxAppDoubleAccess);
 	rxAppMemDataRead<WIDTH>(rxBufferReadData, rxDataRsp, rxAppDoubleAccess);
 #else
 	rx_app_stream_if(appRxDataReq, rxSar2rxApp_upd_rsp, appRxDataRspMetadata,
-						rxApp2rxSar_upd_req, rxBufferReadCmd);
+						rxApp2rxSar_upd_req, rxApp2eventEng_setEvent, rxBufferReadCmd);
 	rxAppMemDataRead(rxBufferReadCmd, rxBufferReadData, rxDataRsp);
 #endif
 
@@ -603,6 +604,9 @@ void toe(	// Data & Memory Interface
 	// Event Engine
 	static stream<extendedEvent>			rxEng2eventEng_setEvent("rxEng2eventEng_setEvent");
 	static stream<event>					txApp2eventEng_setEvent("txApp2eventEng_setEvent");
+	static stream<event>					rxApp2eventEng_setEvent("rxApp2eventEng_setEvent");
+	#pragma HLS stream variable=rxApp2eventEng_setEvent		depth=16
+	#pragma HLS aggregate variable=rxApp2eventEng_setEvent compact=bit
 	//static stream<event>					appStreamEventFifo("appStreamEventFifo");
 	//static stream<event>					retransmitEventFifo("retransmitEventFifo");
 	static stream<event>					timer2eventEng_setEvent("timer2eventEng_setEvent");
@@ -722,7 +726,13 @@ void toe(	// Data & Memory Interface
 	#pragma HLS stream variable=ackDelayFifoWriteCount		depth=64
 	static stream<ap_uint<1> > txEngFifoReadCount("txEngFifoReadCount");
 	#pragma HLS stream variable=txEngFifoReadCount		depth=64
-	event_engine(txApp2eventEng_setEvent, rxEng2eventEng_setEvent, timer2eventEng_setEvent, eventEng2ackDelay_event,
+	// window-update ACK events from the rx app interface are merged with the
+	// tx app events into the single low-priority event_engine input
+	static stream<event> app2eventEng_setEvent("app2eventEng_setEvent");
+	#pragma HLS stream variable=app2eventEng_setEvent		depth=64
+	#pragma HLS aggregate variable=app2eventEng_setEvent compact=bit
+	stream_merger(rxApp2eventEng_setEvent, txApp2eventEng_setEvent, app2eventEng_setEvent);
+	event_engine(app2eventEng_setEvent, rxEng2eventEng_setEvent, timer2eventEng_setEvent, eventEng2ackDelay_event,
 					ackDelayFifoReadCount, ackDelayFifoWriteCount, txEngFifoReadCount);
 	ack_delay(eventEng2ackDelay_event, eventEng2txEng_event, ackDelayFifoReadCount, ackDelayFifoWriteCount);
 
@@ -788,6 +798,7 @@ void toe(	// Data & Memory Interface
 			 	 	timer2rxApp_notification,
 			 	 	rxDataRspMeta,
 			 	 	rxApp2rxSar_upd_req,
+			 	 	rxApp2eventEng_setEvent,
 #if !(RX_DDR_BYPASS)
 			 	 	rxBufferReadCmd,
 #endif

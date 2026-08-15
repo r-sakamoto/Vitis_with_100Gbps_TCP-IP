@@ -986,8 +986,8 @@ module tb_toe_top;
     p = make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
                  peer_seq, 0, F_SYN, 16'hFFFF, syn_options(1), no_bytes());
     net_send(p);
-    // <- SYN-ACK
-    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 50000, 0);
+    // <- SYN-ACK (skip stray pure ACKs, e.g. window updates of earlier sessions)
+    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 50000, 1);
     if (err_count) return;
     tb_check(f_ack(p) == peer_seq + 1, $sformatf("SYN-ACK ack=%0d expected %0d", f_ack(p), peer_seq+1));
     tb_check(f_src_port(p) == lport, "SYN-ACK src port");
@@ -1452,7 +1452,7 @@ module tb_toe_top;
       peer_win  = 16'hFFFF;
       net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
                         peer_seq, 0, F_SYN, 16'hFFFF, syn_options(1), no_bytes()));
-      expect_flags(F_SYN | F_ACK, "SYN-ACK (ISS hunt)", p, 100000, 0);
+      expect_flags(F_SYN | F_ACK, "SYN-ACK (ISS hunt)", p, 100000, 1);
       if (err_count) return;
       iss = f_seq(p);
       off = iss[17:0];
@@ -1537,7 +1537,259 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // F4 regression: the peer's MSS option from its SYN must cap the size of
+  // retransmitted segments (session MSS = min(peer MSS, local MSS)).
+  task automatic test_mss_option();
+    bytes_t p, opts, pay;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] toe_iss, d0_seq;
+    int got, rt_bytes;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+
+    // SYN with MSS = 536
+    opts = new[8];
+    opts[0]=8'h02; opts[1]=8'h04; opts[2]=8'h02; opts[3]=8'h18;   // MSS 536
+    opts[4]=8'h03; opts[5]=8'h03; opts[6]=8'h02; opts[7]=8'h01;   // WS 2 + NOP
+    peer_port = 16'd41070; toe_port = 16'd80;
+    peer_seq  = 32'h6000_0000; peer_win = 16'hFFFF;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, 0, F_SYN, 16'hFFFF, opts, no_bytes()));
+    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 100000, 1);
+    if (err_count) return;
+    toe_iss  = f_seq(p);
+    peer_ack = toe_iss + 1;
+    peer_seq += 1;
+    peer_send_seg(F_ACK, no_bytes());
+
+    // learn session id
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    // app sends 1000B; peer never ACKs it
+    pay = gen_payload(1000, 8'h90);
+    app_send(sid, pay, rsp);
+    tb_check(rsp.error == 0, "app_send accepted");
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for data segment"); return; end
+      if (f_payload_len(p) == 1000) begin d0_seq = f_seq(p); got = 1; end
+    end
+
+    // 3 dup ACKs (ack = snd_una) -> fast retransmit, now chunked by MSS 536
+    for (int i = 0; i < 3; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, d0_seq, F_ACK, peer_win, no_bytes(), no_bytes()));
+      repeat (50) @(posedge ap_clk);
+    end
+    rt_bytes = 0;
+    while (rt_bytes < 1000) begin
+      bytes_t d;
+      int soff;
+      wait_pkt(p, 500000, ok);
+      if (!ok) begin tb_error("timeout waiting for retransmissions"); return; end
+      if (f_payload_len(p) == 0) continue;
+      tb_check(f_payload_len(p) <= 536,
+               $sformatf("rtx segment len=%0d respects peer MSS 536", f_payload_len(p)));
+      if (f_payload_len(p) > 536) return;
+      d = f_payload(p);
+      soff = f_seq(p) - d0_seq;
+      for (int i = 0; i < d.size(); i++)
+        if (d[i] !== pay[soff + i]) begin
+          tb_check(0, $sformatf("rtx payload mismatch at offset %0d", soff + i));
+          return;
+        end
+      rt_bytes += d.size();
+    end
+    tb_check(rt_bytes == 1000, "all 1000 bytes retransmitted in MSS-sized chunks");
+
+    // clean up
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq + 1000, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  // F3 regression: a FIN carrying no ACK flag must still close the
+  // connection (it previously fell into the ignored default flag case).
+  task automatic test_pure_fin_close();
+    bytes_t p;
+    bit ok;
+    notif_t n;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+    do_passive_handshake(16'd80, 16'd41060);
+    if (err_count) return;
+
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok && n.length == 8, "data notification");
+    if (!ok) return;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    // pure FIN (ACK flag clear)
+    peer_send_seg(F_FIN, no_bytes());
+    peer_seq += 1;
+    wait_notif(n, 300000, ok);
+    tb_check(ok && n.closed, "close notification for pure FIN");
+    expect_flags(F_FIN, "FIN from TOE after pure FIN", p, 400000, 1);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq, "TOE FIN acks the peer FIN");
+    peer_ack = f_seq(p) + 1;
+    peer_send_seg(F_ACK, no_bytes());
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  // F1 regression: after the application drains the receive buffer, the TOE
+  // must send a window-update ACK on its own (previously the peer could only
+  // recover from a shrunken/zero window via its persist timer - issue #21).
+  task automatic test_window_update();
+    bytes_t p, pay;
+    bit ok, got_ack;
+    notif_t n;
+    byte unsigned rdata[$];
+    bit [15:0] sid;
+    bit [15:0] w_before, w_after;
+    int nn;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+    do_passive_handshake(16'd80, 16'd41040);
+    if (err_count) return;
+
+    // peer sends 3 x 1400B; app does NOT read yet
+    for (int i = 0; i < 3; i++) begin
+      pay = gen_payload(1400, 8'h60 + i[7:0]);
+      peer_send_seg(F_ACK, pay);
+      wait_notif(n, 200000, ok);
+      tb_check(ok && n.length == 1400, $sformatf("segment %0d notified", i));
+      if (!ok) return;
+      peer_seq += 1400;
+    end
+    sid = n.sessionID;
+
+    // collect ACK covering all 4200B and note the shrunken window
+    got_ack = 0; w_before = 16'hFFFF;
+    while (!got_ack) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for ACK of 4200B"); return; end
+      if ((f_flags(p) & F_ACK) && f_ack(p) == peer_seq) begin
+        w_before = f_win(p);
+        got_ack = 1;
+      end
+    end
+    tb_check(w_before < 16'hFFFF, $sformatf("window shrunk to %0d while data unread", w_before));
+
+    // drain any remaining queued packets
+    while (net_pkts.size() > 0) void'(net_pkts.pop_front());
+
+    // app reads everything (one read per notification - required in the
+    // RX_DDR_BYPASS build where data is delivered per packet boundary)
+    // -> expect a spontaneous window-update ACK
+    for (int i = 0; i < 3; i++) begin
+      app_read(sid, 1400, rdata);
+      tb_check(rdata.size() == 1400, $sformatf("app_read %0d got 1400 bytes", i));
+    end
+    got_ack = 0;
+    nn = 0;
+    while (!got_ack && nn < 3) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) break;
+      if ((f_flags(p) & F_ACK) && f_payload_len(p) == 0 && f_win(p) > w_before) begin
+        w_after = f_win(p);
+        got_ack = 1;
+      end
+      nn++;
+    end
+    tb_check(got_ack, "window-update ACK sent after app drained the buffer");
+    if (got_ack)
+      tb_info($sformatf("window update: %0d -> %0d", w_before, w_after));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
 `ifdef NO_RX_BYPASS
+  // F2 regression: (A) a segment far beyond the advertised window used to be
+  // accepted through a WINDOW_BITS-truncated check and aliased onto valid
+  // buffer content, corrupting unread data; (B) OOO segments whose sequence
+  // numbers cross the 2^32 wrap were mis-dropped by plain 32-bit compares.
+  task automatic test_seq_window_check();
+    bytes_t p, payA, stream_data, segA, segB;
+    bit ok;
+    notif_t n;
+    byte unsigned rdata[$];
+    bit [15:0] sid;
+    bit [31:0] base_seq;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+
+    // --- subtest A: far-future segment must not alias onto buffered data ---
+    do_passive_handshake(16'd80, 16'd41050);
+    if (err_count) return;
+    base_seq = peer_seq;
+    payA = gen_payload(1000, 8'hA5);
+    peer_send_seg(F_ACK, payA);
+    wait_notif(n, 200000, ok);
+    tb_check(ok && n.length == 1000, "in-order segment notified");
+    if (!ok) return;
+    sid = n.sessionID;
+    // segment one full buffer size ahead - same physical offset as payA
+    peer_seq = base_seq + BUF_SIZE;
+    peer_send_seg(F_ACK, gen_payload(500, 8'hEE));
+    expect_flags(F_ACK, "dup ACK for out-of-window segment", p, 200000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == base_seq + 1000, "ACK covers only in-order data");
+    peer_seq = base_seq + 1000;
+    // unread data must be intact (pre-fix: first 500B overwritten with 0xEE..)
+    app_read(sid, 1000, rdata);
+    for (int i = 0; i < 1000 && i < rdata.size(); i++)
+      if (rdata[i] != payA[i]) begin
+        tb_check(0, $sformatf("buffered data corrupted at byte %0d (%h != %h)",
+                              i, rdata[i], payA[i]));
+        break;
+      end
+    tb_info("subtest A done: no aliasing of out-of-window segment");
+
+    // --- subtest B: OOO reassembly across the 2^32 sequence wrap ---
+    do_passive_handshake(16'd80, 16'd41051, 32'hFFFFFE00);
+    if (err_count) return;
+    base_seq = peer_seq;   // 0xFFFFFE01
+    stream_data = gen_payload(1500, 8'h5A);
+    segA = new[1000]; for (int i = 0; i < 1000; i++) segA[i] = stream_data[i];
+    segB = new[500];  for (int i = 0; i < 500;  i++) segB[i] = stream_data[1000+i];
+    peer_seq = base_seq + 1000;   // wraps past 2^32
+    peer_send_seg(F_ACK, segB);
+    expect_flags(F_ACK, "dup ACK (wrap OOO gap open)", p, 200000, 1);
+    if (err_count) return;
+    tb_check(f_ack(p) == base_seq, "gap-open ACK number");
+    tb_check(notif_q.size() == 0, "no notification for wrapped OOO segment");
+    peer_seq = base_seq;
+    peer_send_seg(F_ACK, segA);
+    wait_notif(n, 200000, ok);
+    tb_check(ok && n.length == 1500, "combined 1500B notified across seq wrap");
+    if (!ok) return;
+    peer_seq = base_seq + 1500;
+    app_read(n.sessionID, 1500, rdata);
+    tb_check(rdata.size() == 1500, "read 1500 bytes");
+    for (int i = 0; i < 1500 && i < rdata.size(); i++)
+      if (rdata[i] != stream_data[i]) begin
+        tb_check(0, $sformatf("wrap reassembly mismatch at byte %0d", i));
+        break;
+      end
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   // B6 regression: with a gap open, a retransmitted segment that starts at
   // recvd but OVERLAPS the buffered premature data (seq+len > offset) hit a
   // branchless path in rx_engine - no SAR update, no drop token - wedging
@@ -1867,8 +2119,12 @@ module tb_toe_top;
       "port_release"   : test_port_release();
       "opt_parser_robust": test_opt_parser_robust();
       "buffer_wrap"    : test_buffer_wrap();
+      "window_update"  : test_window_update();
+      "pure_fin_close" : test_pure_fin_close();
+      "mss_option"     : test_mss_option();
 `ifdef NO_RX_BYPASS
       "rx_ooo_overlap" : test_rx_ooo_overlap();
+      "seq_window_check": test_seq_window_check();
 `endif
       "rto_retransmit" : test_rto_retransmit();
       "fin_retransmit" : test_fin_retransmit();

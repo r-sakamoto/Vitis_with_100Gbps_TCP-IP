@@ -648,9 +648,11 @@ void drop_optional_header_fields(	hls::stream<optionalFieldsMeta>&		metaIn,
  *   3  |     3B | Window scale
  *   4  |     2B | SACK permitted (Selective Acknowledgment)
  */
+// Result is packed as {mss[19:4], windowScale[3:0]}. MSS defaults to 536
+// (RFC 1122) when the peer's SYN carries no MSS option.
 void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 												hls::stream<ap_uint<320> >&	optionalHeaderFieldsIn,
-												hls::stream<ap_uint<4> >&		windowScaleOut)
+												hls::stream<ap_uint<20> >&		parsedOptionsOut)
 {
 	#pragma HLS PIPELINE II=1
 	#pragma HLS INLINE off
@@ -662,6 +664,8 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 	// old code compared the word count against byte lengths directly)
 	static ap_uint<6> remainingBytes;
 	static ap_uint<320> fields;
+	static ap_uint<4> wsVal;
+	static ap_uint<16> mssVal;
 
 	switch (state)
 	{
@@ -672,6 +676,8 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 			dataOffsetIn.read(dataOffset);
 			optionalHeaderFieldsIn.read(fields);
 			remainingBytes = ((ap_uint<6>)dataOffset) * 4;
+			wsVal = 0;
+			mssVal = 536;
 			state = PARSE;
 		}
 		break;
@@ -683,20 +689,27 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 
 		if (remainingBytes == 0)
 		{
-			// walked the whole option list without finding window scale
-			windowScaleOut.write(0);
-			done = true;
+			done = true; //walked the whole option list
 		}
 		else
 		{
 			switch (optionKind)
 			{
 			case 0: //End of option list
-				windowScaleOut.write(0);
 				done = true;
 				break;
 			case 1: //NOP
 				optionLength = 1;
+				break;
+			case 2: //MSS (value is big-endian on the wire)
+				if (optionLength == 4 && remainingBytes >= 4)
+				{
+					mssVal = (fields(23, 16), fields(31, 24));
+				}
+				else
+				{
+					done = true; //malformed MSS option, stop parsing
+				}
 				break;
 			case 3: //Window scale
 				if (optionLength == 3 && remainingBytes >= 3)
@@ -705,13 +718,12 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 					// to 14 (issue #42: unclamped values overflow the
 					// scaled-window bit range in tx_sar_table)
 					ap_uint<4> ws = fields(19, 16);
-					windowScaleOut.write((ws > 14) ? (ap_uint<4>)14 : ws);
+					wsVal = (ws > 14) ? (ap_uint<4>)14 : ws;
 				}
 				else
 				{
-					windowScaleOut.write(0); //malformed WS option
+					done = true; //malformed WS option, stop parsing
 				}
-				done = true;
 				break;
 			default:
 				// unknown option: a valid length is >= 2 and must fit into
@@ -719,7 +731,6 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 				// would previously spin this FSM forever (len 0 -> shift by 0)
 				if (optionLength < 2 || optionLength > remainingBytes)
 				{
-					windowScaleOut.write(0);
 					done = true;
 				}
 				break;
@@ -728,6 +739,7 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 
 		if (done)
 		{
+			parsedOptionsOut.write((mssVal, wsVal));
 			state = IDLE;
 		}
 		else
@@ -740,7 +752,7 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 	}//switch
 }
 
-void merge_header_meta(hls::stream<ap_uint<4> >&			rxEng_winScaleFifo,
+void merge_header_meta(hls::stream<ap_uint<20> >&			rxEng_winScaleFifo,
 								hls::stream<rxEngineMetaData>&	rxEng_headerMetaFifo,
 								hls::stream<rxEngineMetaData>& 	rxEng_metaDataFifo)
 {
@@ -764,6 +776,7 @@ void merge_header_meta(hls::stream<ap_uint<4> >&			rxEng_winScaleFifo,
 			else
 			{
 				meta.winScale = 0;
+				meta.mss = 536; //RFC 1122 default when no MSS option present
 				rxEng_metaDataFifo.write(meta);
 			}
 		}
@@ -772,7 +785,9 @@ void merge_header_meta(hls::stream<ap_uint<4> >&			rxEng_winScaleFifo,
 		if (!rxEng_winScaleFifo.empty())
 		{
 			// std::cout << "META MERGE 1" << std::endl;
-			meta.winScale = rxEng_winScaleFifo.read();
+			ap_uint<20> parsedOptions = rxEng_winScaleFifo.read();
+			meta.winScale = parsedOptions(3, 0);
+			meta.mss = parsedOptions(19, 4);
 			rxEng_metaDataFifo.write(meta);
 			state = 0;
 		}
@@ -1054,7 +1069,10 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 			// Always read rxSar, even though not required for SYN-ACK
 			rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID));
 			// read txSar
-			if (fsm_meta.meta.ack) // Do not read for SYN (ACK+ANYTHING)
+			// (also for a pure FIN without ACK, so the FIN handler can run;
+			//  the TRANSITION state waits for the response, and the default
+			//  handler consumes it with read_nb for odd flag combinations)
+			if (fsm_meta.meta.ack || fsm_meta.meta.fin) // Do not read for SYN
 			{
 				rxEng2txSar_upd_req.write(rxTxSarQuery(fsm_meta.sessionID));
 				fsm_txSarRequest  = true;
@@ -1198,7 +1216,14 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							dropDataFifoOut.write(false);
 						}
 						// ### No gap, packet comes out-of-order
-						else if (!rxSar.gap && (fsm_meta.meta.seqNumb > rxSar.recvd) && (free_space > (fsm_meta.meta.seqNumb+fsm_meta.meta.length- rxSar.head)(WINDOW_BITS-1, 0)))
+						// Wrap-safe acceptance: the whole segment must lie inside the
+						// advertised receive window (recvd .. recvd+advertised). The old
+						// check truncated (seq+len-head) to WINDOW_BITS, so a segment
+						// arbitrarily far ahead aliased onto valid buffer content and
+						// could overwrite not-yet-read data.
+						else if (!rxSar.gap && seq_gt(fsm_meta.meta.seqNumb, rxSar.recvd)
+								&& seq_leq(fsm_meta.meta.seqNumb + fsm_meta.meta.length,
+										rxSar.recvd + (ap_uint<32>)(ap_uint<WINDOW_BITS>)(rxSar.appd - rxSar.recvd(WINDOW_BITS-1, 0) - 1)))
 						{
 							#ifndef __SYNTHESIS__
 							std::cout<<"RX_ACK: no gap ooo";
@@ -1265,12 +1290,12 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							//previously that case fell through both branches without
 							//a SAR update or a drop token, wedging rxPackageDropper
 							//and the whole RX pipeline permanently.
-							if ((fsm_meta.meta.seqNumb + fsm_meta.meta.length) >= rxSar.offset)
+							if (seq_geq(fsm_meta.meta.seqNumb + fsm_meta.meta.length, rxSar.offset))
 							{
 								//overlapping bytes are rewritten with identical data;
 								//the segment may even extend past head
 								ap_uint<32> segEnd = fsm_meta.meta.seqNumb + fsm_meta.meta.length;
-								newRecvd = (segEnd > rxSar.head) ? segEnd : rxSar.head;
+								newRecvd = seq_gt(segEnd, rxSar.head) ? segEnd : rxSar.head;
 								ap_uint<32> newAvailable = newRecvd - fsm_meta.meta.seqNumb;
 								rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, newRecvd, newRecvd, rxSar.offset, false));
 								//write to memory
@@ -1432,10 +1457,12 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 #if (WINDOW_SCALE)
 					ap_uint<4> rx_win_shift = (fsm_meta.meta.winScale == 0) ? 0 : WINDOW_SCALE_BITS;
 					ap_uint<4> tx_win_shift = fsm_meta.meta.winScale;
+					// effective segment size for this session (RFC 879)
+					ap_uint<16> session_mss = (fsm_meta.meta.mss < MSS) ? fsm_meta.meta.mss : (ap_uint<16>)MSS;
 					// Initialize rxSar, SEQ + phantom byte for recvd and head pointer, offset to 0, gap set to false
 					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, rx_win_shift));
 					// Initialize receive window
-					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, 0, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift))); //TODO maybe include count check
+					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, 0, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift, session_mss))); //TODO maybe include count check
 #else
 					// Initialize rxSar, SEQ + phantom byte, last '1' for makes sure appd is initialized
 					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, 1));
@@ -1497,8 +1524,10 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 #if (WINDOW_SCALE)
 					ap_uint<4> rx_win_shift = (fsm_meta.meta.winScale == 0) ? 0 : WINDOW_SCALE_BITS;
 					ap_uint<4> tx_win_shift = fsm_meta.meta.winScale;
+					// effective segment size for this session (RFC 879)
+					ap_uint<16> session_mss = (fsm_meta.meta.mss < MSS) ? fsm_meta.meta.mss : (ap_uint<16>)MSS;
 					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, rx_win_shift));
-					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift))); //TODO maybe include count check
+					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift, session_mss))); //TODO maybe include count check
 #else
 					//initialize rx_sar, SEQ + phantom byte, last '1' for appd init
 					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, 1));
@@ -1525,6 +1554,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				}
 			}
 			break;
+		case 4: //pure FIN without ACK (rare but legal; was silently ignored)
 		case 5: //FIN (_ACK)
 			//if (!rxSar2rxEng_upd_rsp.empty() && !stateTable2rxEng_upd_rsp.empty() && !txSar2rxEng_upd_rsp.empty())
 			if (fsm_state == LOAD)
@@ -1543,11 +1573,16 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				std::cout<<" gap:"<<rxSar.gap<<std::endl;
 				#endif
 				// std::cout<<" free_space"<<free_space<<std::endl;
-				rxEng2timer_clearRetransmitTimer.write(rxRetransmitTimerUpdate(fsm_meta.sessionID, (fsm_meta.meta.ackNumb == txSar.nextByte)));
+				// ack-number-derived decisions are only valid if the ACK flag is set
+				rxEng2timer_clearRetransmitTimer.write(rxRetransmitTimerUpdate(fsm_meta.sessionID,
+						(fsm_meta.meta.ack && fsm_meta.meta.ackNumb == txSar.nextByte)));
 				// Check state and if FIN in order, Current out of order FINs are not accepted
 				if ((tcpState == ESTABLISHED || tcpState == FIN_WAIT_1 || tcpState == FIN_WAIT_2) && (rxSar.recvd == fsm_meta.meta.seqNumb))
 				{
-					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, txSar.count, txSar.fastRetransmitted))); //TODO include count check
+					if (fsm_meta.meta.ack)
+					{
+						rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, txSar.count, txSar.fastRetransmitted))); //TODO include count check
+					}
 
 					// +1 for phantom byte, there might be data too
 					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+fsm_meta.meta.length+1, fsm_meta.meta.seqNumb+fsm_meta.meta.length+1, rxSar.offset,rxSar.gap)); //diff to ACK
@@ -1583,7 +1618,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					}
 					else //FIN_WAIT_1 || FIN_WAIT_2
 					{
-						if (fsm_meta.meta.ackNumb == txSar.nextByte) //check if final FIN is ACK'd -> LAST_ACK
+						if (fsm_meta.meta.ack && fsm_meta.meta.ackNumb == txSar.nextByte) //check if final FIN is ACK'd -> LAST_ACK
 						{
 							rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, TIME_WAIT, 1));
 							rxEng2timer_setCloseTimer.write(fsm_meta.sessionID);
@@ -2129,7 +2164,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 	static hls::stream<rxEngineMetaData>		rxEng_headerMetaFifo("rxEng_headerMetaFifo");
 	static hls::stream<ap_uint<4> >		rxEng_dataOffsetFifo("rxEng_dataOffsetFifo");
 	static hls::stream<ap_uint<320> >		rxEng_optionalFieldsFifo("rxEng_optionalFieldsFifo");
-	static hls::stream<ap_uint<4> >		rxEng_winScaleFifo("rxEng_winScaleFifo");
+	static hls::stream<ap_uint<20> >		rxEng_winScaleFifo("rxEng_winScaleFifo");
 	#pragma HLS stream variable=rxEng_headerMetaFifo depth=16
 	#pragma HLS stream variable=rxEng_dataOffsetFifo depth=2
 	#pragma HLS stream variable=rxEng_optionalFieldsFifo depth=2

@@ -50,16 +50,24 @@ dup ACKのみ送出(アプリ通知なし。内部の長さ0通知はrxAppNotifi
 
 ## テスト一覧
 
-| テスト | 内容 |
-|---|---|
-| `passive_open` | listen → 3WHS(SYN/SYN-ACK/ACK) → データ受信+app読出し+ACK確認 → 相手FINクローズ |
-| `active_open` | appからopen → SYN送出(MSS/WSオプション検証) → 3WHS → appデータ送信 → appクローズ(FIN) |
-| `rx_out_of_order` | 順序入替セグメント: bypass構成ではドロップ+dup ACKになることを確認、再送で回復 |
-| `fast_retransmit` | 3 dup ACKでfast retransmit (go-back-N) が起きseqが正しいことを確認 |
-| `rst_handling` | 非listenポートへのセグメント→RST応答、確立済セッションへのRST→appへclose通知 |
-| `zero_window` | 相手win=0広告→app送信拒否(NOSPACE)、win更新後に送信再開 |
-
-| `rto_retransmit` | ACKを返さずRTO再送(同一seqの再送)を確認。**タイマ短縮ビルド専用** |
+| テスト | 構成 | 内容 |
+|---|---|---|
+| `passive_open` | 両方 | listen → 3WHS → データ受信+app読出し+ACK確認 → 相手FINクローズ |
+| `active_open` | 両方 | appからopen → SYN送出(MSS/WSオプション検証) → 3WHS → appデータ送信 → appクローズ(FIN) |
+| `rx_out_of_order` | 両方 | OOOセグメント: bypass=1はドロップ+dup ACK、bypass=0は単一ギャップバッファリング |
+| `fast_retransmit` | 両方 | 3 dup ACKでfast retransmit (go-back-N) のseq正当性 |
+| `rst_handling` | 両方 | 非listenポート→RST応答、確立済セッションへのRST→appへclose通知 |
+| `zero_window` | 両方 | 相手win=0→app送信拒否、win更新後に再開 |
+| `port_release` | 両方 | B1回帰: セッション解体でエフェメラルポートがfreePortTableに返却(BRAM白箱プローブ) |
+| `opt_parser_robust` | 両方 | B5回帰: 不正/特殊オプション列(len=0、未知kind、WS=15)でも確立・転送可能 |
+| `buffer_wrap` | 両方 | B4回帰: 256KBバッファwrap/64KB境界をまたぐRX書込・app読出・再送読出のデータ整合 |
+| `window_update` | 両方 | F1回帰: appがバッファを読むと自発的にwindow update ACKが出る |
+| `rx_ooo_overlap` | bypass=0 | B6回帰: ギャップ充填と重複する再送でもストールせず結合通知 |
+| `seq_window_check` | bypass=0 | F2回帰: ウィンドウ外セグメント排除(バッファ別名書込み防止)+2^32 wrapまたぎOOO再構成 |
+| `pure_fin_close` | 両方 | F3回帰: ACKビットなしFINでもクローズ処理が走る |
+| `mss_option` | 両方 | F4回帰: 相手SYNのMSS(536)が再送セグメントサイズを制限する |
+| `rto_retransmit` | 両方 | RTO再送(同一seq)。**タイマ短縮ビルド専用** |
+| `fin_retransmit` | 両方 | B7回帰: FINのRTO再送でファントムデータが出ない。**タイマ短縮ビルド専用** |
 
 ## タイマについての注意(タイマ短縮ビルド)
 

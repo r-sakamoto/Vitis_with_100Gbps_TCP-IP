@@ -44,6 +44,7 @@ void rx_app_stream_if(hls::stream<appReadRequest>&		appRxDataReq,
 					  hls::stream<rxSarAppd>&			rxSar2rxApp_upd_rsp,
 					  hls::stream<ap_uint<16> >&		appRxDataRspMetadata,
 					  hls::stream<rxSarAppd>&			rxApp2rxSar_upd_req,
+					  hls::stream<event>&				rxApp2eventEng_setEvent,
 #if !(RX_DDR_BYPASS)
 					  hls::stream<mmCmd>&				rxBufferReadCmd)
 #else
@@ -88,6 +89,12 @@ void rx_app_stream_if(hls::stream<appReadRequest>&		appRxDataReq,
 #endif
 				// Update app read pointer
 				rxApp2rxSar_upd_req.write(rxSarAppd(rxSar.sessionID, rxSar.appd+rasi_readLength)); // Update me
+				// The advertised receive window is (appd - recvd - 1); it just
+				// grew by readLength, so send a window-update ACK. Without
+				// this the peer can only recover from a zero/shrunken window
+				// via its persist timer (github issue #21 stall). The delayed
+				// ACK path coalesces bursts of reads.
+				rxApp2eventEng_setEvent.write(event(ACK, rxSar.sessionID));
 				rasi_fsmState = 0;
 			}
 			break;

@@ -361,6 +361,9 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				// lengths by one). Exclude it here; when all data is resent the
 				// FIN itself is regenerated via the finSent conversion below.
 				ap_uint<WINDOW_BITS> currLength = txSar.usedLength - (txSar.finSent ? 1 : 0);
+				// per-session effective MSS (min(peer MSS, local MSS), set at
+				// connection setup); guard against uninitialized entries
+				ap_uint<16> sessionMSS = (txSar.mss == 0) ? (ap_uint<16>)MSS : txSar.mss;
 
 				meta.ackNumb = rxSar.recvd;
 				meta.seqNumb = txSar.ackd;
@@ -393,13 +396,13 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 
 				// Since we are retransmitting from txSar.ackd to txSar.not_ackd, this data is already inside the usableWindow
 				// => no check is required
-				// Only check if length is bigger than MMS
-				if (currLength > MSS)
+				// Only check if length is bigger than the session MSS
+				if (currLength > sessionMSS)
 				{
 					// We stay in this state and sent immediately another packet
-					meta.length = MSS;
-					txSar.ackd += MSS;
-					txSar.usedLength -= MSS;
+					meta.length = sessionMSS;
+					txSar.ackd += sessionMSS;
+					txSar.usedLength -= sessionMSS;
 					// TODO replace with dynamic count, remove this
 					if (ml_segmentCount == 3)
 					{

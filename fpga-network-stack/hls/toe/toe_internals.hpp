@@ -51,6 +51,13 @@ static const ap_uint<32> TIME_120s		= (120000000.0/0.0064/MAX_SESSIONS/TCP_SIM_T
 #endif
 
 
+// Modulo-2^32 TCP sequence number comparisons (RFC 793 / RFC 1982 style).
+// Valid as long as the two values are less than 2^31 apart.
+inline bool seq_lt (ap_uint<32> a, ap_uint<32> b) { return ((ap_int<32>)(ap_uint<32>)(a - b)) < 0; }
+inline bool seq_leq(ap_uint<32> a, ap_uint<32> b) { return ((ap_int<32>)(ap_uint<32>)(a - b)) <= 0; }
+inline bool seq_gt (ap_uint<32> a, ap_uint<32> b) { return ((ap_int<32>)(ap_uint<32>)(a - b)) > 0; }
+inline bool seq_geq(ap_uint<32> a, ap_uint<32> b) { return ((ap_int<32>)(ap_uint<32>)(a - b)) >= 0; }
+
 enum eventType {TX, RT, ACK, SYN, SYN_ACK, FIN, RST, ACK_NODELAY};
 /*
  * There is no explicit LISTEN state
@@ -188,6 +195,7 @@ struct txSarEntry
 	ap_uint<32> ackd;
 	ap_uint<32> not_ackd;
 	ap_uint<16> recv_window;
+	ap_uint<16> mss; //effective segment size: min(peer MSS, local MSS)
 #if (WINDOW_SCALE)
 	ap_uint<4>	win_shift;
 #endif
@@ -211,16 +219,19 @@ struct rxTxSarQuery
 #if (WINDOW_SCALE)
 	ap_uint<4>	win_shift;
 #endif
+	ap_uint<16> mss; //only valid on init
 	ap_uint<1> write;
 	ap_uint<1>	init;
 	rxTxSarQuery () {}
 	rxTxSarQuery(ap_uint<16> id)
-				:sessionID(id), ackd(0), recv_window(0), cong_window(0), count(0), fastRetransmitted(false), write(0), init(0) {}
+				:sessionID(id), ackd(0), recv_window(0), cong_window(0), count(0), fastRetransmitted(false), mss(MSS), write(0), init(0) {}
 	rxTxSarQuery(ap_uint<16> id, ap_uint<32> ackd, ap_uint<16> recv_win, ap_uint<WINDOW_BITS> cong_win, ap_uint<2> count, bool fastRetransmitted)
-				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), write(1), init(0) {}
+				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), mss(MSS), write(1), init(0) {}
 #if (WINDOW_SCALE)
 	rxTxSarQuery(ap_uint<16> id, ap_uint<32> ackd, ap_uint<16> recv_win, ap_uint<WINDOW_BITS> cong_win, ap_uint<2> count, bool fastRetransmitted, ap_uint<4> win_shift)
-				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), win_shift(win_shift), write(1), init(1) {}
+				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), win_shift(win_shift), mss(MSS), write(1), init(1) {}
+	rxTxSarQuery(ap_uint<16> id, ap_uint<32> ackd, ap_uint<16> recv_win, ap_uint<WINDOW_BITS> cong_win, ap_uint<2> count, bool fastRetransmitted, ap_uint<4> win_shift, ap_uint<16> mss)
+				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), win_shift(win_shift), mss(mss), write(1), init(1) {}
 #endif
 };
 
@@ -346,9 +357,10 @@ struct txTxSarReply
 //#if (WINDOW_SCALE)
 	ap_uint<4>	win_shift;
 //#endif
+	ap_uint<16> mss; //effective segment size: min(peer MSS, local MSS)
 	txTxSarReply() {}
 	txTxSarReply(ap_uint<32> ack, ap_uint<32> nack, ap_uint<WINDOW_BITS> usableWindow, ap_uint<WINDOW_BITS> app, ap_uint<WINDOW_BITS> usedLength, bool finReady, bool finSent)
-		:ackd(ack), not_ackd(nack), usableWindow(usableWindow), app(app), usedLength(usedLength), finReady(finReady), finSent(finSent) {}
+		:ackd(ack), not_ackd(nack), usableWindow(usableWindow), app(app), usedLength(usedLength), finReady(finReady), finSent(finSent), mss(MSS) {}
 };
 
 struct rxRetransmitTimerUpdate {

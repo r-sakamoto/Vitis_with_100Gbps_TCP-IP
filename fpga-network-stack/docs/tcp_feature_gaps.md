@@ -18,7 +18,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 
 | 機能 | 現状 | Linux | 優先度 |
 |---|---|---|---|
-| MSSオプション(受信) | **未パース**。相手のMSSを無視し、コンパイル時定数MSSで送信 (`rx_engine.cpp:687-694`) | 相手MSSとPMTUからMSSを決定 | ★★★ |
+| MSSオプション(受信) | **一部実装済** (F4, `mss_option`テスト): SYN/SYN-ACKのMSSをパースし実効MSS=min(peer,local)をセッション毎に保存(なしは536)、再送(go-back-N)チャンクに適用。**NODELAY=1のTX初送はappの書込み単位のままでMSS超過あり得る**(TXセグメンテーションはフェーズ2) | 相手MSSとPMTUからMSSを決定 | ★★(残) |
 | Window Scale(受信) | SYN時のみパース。**自側shiftは0か2の固定** (`rx_engine.cpp:1366,1429`)。相手shiftは**14超の値を無検証で格納** → `tx_sar_table.cpp:121` でビット範囲オーバーフロー(issue #42) | shift 0〜14を交渉、バッファサイズから導出 | ★★★ |
 | SACK / SACK-Permitted | **なし**(生成・解釈とも) | あり(選択再送・D-SACK) | ★★★ |
 | Timestamps (RFC 7323) | **なし** → PAWSなし、RTT計測なし | あり | ★★★ |
@@ -43,8 +43,8 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | 機能 | 現状 | Linux | 優先度 |
 |---|---|---|---|
 | 順序入替(OOO)受信 | RX_DDR_BYPASS=1 (現行ビルド)では**完全ドロップ**(`rx_engine.cpp:1249-1274`)。非bypass時も単一ギャップのみ、重複セグメントでハング可能性 (`rx_engine.cpp:1197-1230`) | 完全な再構成キュー | ★★★ |
-| RFC 793受理判定 | 汎用のシーケンス窓チェック**なし**。窓上限チェックなし(前方远方のセグメントがバッファ別名で受理され得る) | あり | ★★★ |
-| ウィンドウ更新通知 | appがバッファを読んでも**window update ACKを送らない** (`rx_app_stream_if.cpp:90`) → 相手のpersistタイマ頼み(issue #21のストールと関連) | 即時window update | ★★★ |
+| RFC 793受理判定 | **一部実装済** (F2, `seq_window_check`テスト): 非bypassのOOO受理を広告ウィンドウ内に制限(バッファ別名書込み防止)、OOO系比較をmod 2^32化(seq_lt等ヘルパ追加)。ACK側の全面的なwrap対応は未 | あり | ★(残) |
+| ウィンドウ更新通知 | **実装済** (F1, `window_update`テスト): app読出しでappdが進むとACKイベントを発行しwindow update ACKを送出 | 即時window update | 完了 |
 | ゼロウィンドウプローブ | TCP_NODELAY=1ビルドでは**probeタイマが恒久無効**(`tx_engine.cpp:166-171`)。有効時も1バイトプローブでなく全再送 | RFC 1122準拠persist | ★★ |
 | Delayed ACK | 64µs固定(Linuxの40msの約1/600)。イベント負荷で無限延期あり得る (`ack_delay.cpp`) | 40ms/クオックACK | ★ |
 | SWS回避 | 送受とも**なし**(受信側クランプはコメントアウト `tx_engine.cpp:936-940`) | あり | ★★ |
@@ -56,7 +56,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 |---|---|---|---|
 | ハーフクローズ | **不可**。相手FIN受信で即座に自FINを送りLAST_ACKへ(CLOSE_WAITスキップ, `rx_engine.cpp:1508-1512`)。FIN後にappは送信不能 | shutdown(SHUT_WR)対応 | ★★ |
 | FIN_WAIT_2 | 未使用(FIN_WAIT_1のACKで遷移しない, `rx_engine.cpp:1321-1323`)。TIME_WAIT中のACKに**RSTを返す** (`rx_engine.cpp:1334-1344`) | 準拠 | ★★ |
-| ACKなしFIN | `{rst,fin,syn,ack}`のcase分岐外で**無視**(コネクション閉じない) (`rx_engine.cpp:1539-1594`) | 処理する | ★★ |
+| ACKなしFIN | **実装済** (F3, `pure_fin_close`テスト): 純FINもFIN+ACKと同様に処理(ACK番号依存処理はACKフラグでガード) | 処理する | 完了 |
 | 同時オープン | 非対応(SYN_SENT中のSYNをパッシブオープン扱い) | 対応 | ★ |
 | TIME_WAIT | 60秒固定(2MSLでない)。TIME_WAIT中の同タプルSYN再利用不可 | 60s + 再利用(RFC 1122) | ★ |
 | listen解除 | **不可**(stop-listeningパスがコメントアウト, `rx_app_if.cpp:79-82`)。port>=32768はlistne不可、二重bind検出なし | close/bind準拠 | ★ |

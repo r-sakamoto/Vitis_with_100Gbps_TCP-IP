@@ -136,13 +136,15 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			{
 				usableWindow = minWindow - usedLength;
 			}
-			txSar2txEng_upd_rsp.write(txTxSarReply(	entry.ackd,
-													entry.not_ackd,
-													usableWindow, //minWindow,
-													entry.app,
-													usedLength,
-													entry.finReady,
-													entry.finSent));
+			txTxSarReply txEngReply(	entry.ackd,
+										entry.not_ackd,
+										usableWindow, //minWindow,
+										entry.app,
+										usedLength,
+										entry.finReady,
+										entry.finSent);
+			txEngReply.mss = entry.mss;
+			txSar2txEng_upd_rsp.write(txEngReply);
 		}
 	}
 	// TX App Stream If
@@ -168,6 +170,7 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			{
 				win_shift = tst_rxEngUpdate.win_shift;
 				tx_table[tst_rxEngUpdate.sessionID].win_shift = tst_rxEngUpdate.win_shift;
+				tx_table[tst_rxEngUpdate.sessionID].mss = tst_rxEngUpdate.mss;
 			}
 			else
 			{
