@@ -105,6 +105,7 @@ void timerWrapper(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetransmitT
 					stream<rtoUpdate>&					rtt2timer_rtoUpdate,
 					stream<ap_uint<16> >&				rxEng2timer_clearProbeTimer,
 					stream<ap_uint<16> >&				txEng2timer_setProbeTimer,
+					stream<ap_uint<16> >&				rxEng2timer_setProbeTimer,
 					stream<ap_uint<16> >&				rxEng2timer_setCloseTimer,
 					stream<ap_uint<16> >&				rxEng2timer_resetKeepalive,
 					stream<ap_uint<16> >&				stateTable2timer_releaseKeepalive,
@@ -154,8 +155,13 @@ void timerWrapper(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetransmitT
 						rtTimer2stateTable_releaseState,
 						rtTimerInt_notification,
 						rtTimer2txApp_notification);
+	static stream<ap_uint<16> > mergedSetProbeTimer("mergedSetProbeTimer");
+	#pragma HLS stream variable=mergedSetProbeTimer depth=4
+	timerCloseMerger(	txEng2timer_setProbeTimer,
+						rxEng2timer_setProbeTimer,
+						mergedSetProbeTimer);
 	probe_timer(rxEng2timer_clearProbeTimer,
-				txEng2timer_setProbeTimer,
+				mergedSetProbeTimer,
 				probeTimer2eventEng_setEvent);
 	close_timer(rxEng2timer_setCloseTimer,
 				closeTimer2stateTable_releaseState);
@@ -647,7 +653,9 @@ void toe(	// Data & Memory Interface
 	// Probe Timer
 	static stream<ap_uint<16> >					rxEng2timer_clearProbeTimer("rxEng2timer_clearProbeTimer");
 	static stream<ap_uint<16> >					txEng2timer_setProbeTimer("txEng2timer_setProbeTimer");
+	static stream<ap_uint<16> >					rxEng2timer_setProbeTimer("rxEng2timer_setProbeTimer");
 	#pragma HLS stream variable=txEng2timer_setProbeTimer depth=2
+	#pragma HLS stream variable=rxEng2timer_setProbeTimer depth=4
 	// Close Timer
 	static stream<ap_uint<16> >					rxEng2timer_setCloseTimer("rxEng2timer_setCloseTimer");
 	#pragma HLS stream variable=rxEng2timer_setCloseTimer depth=2
@@ -791,6 +799,7 @@ void toe(	// Data & Memory Interface
 					rtt2timer_rtoUpdate,
 					rxEng2timer_clearProbeTimer,
 					txEng2timer_setProbeTimer,
+					rxEng2timer_setProbeTimer,
 					rxEng2timer_setCloseTimer,
 					rxEng2timer_resetKeepalive,
 					stateTable2timer_releaseKeepalive,
@@ -836,6 +845,7 @@ void toe(	// Data & Memory Interface
 				rxEng2txSar_upd_req,
 				rxEng2timer_clearRetransmitTimer,
 				rxEng2timer_clearProbeTimer,
+				rxEng2timer_setProbeTimer,
 				rxEng2timer_setCloseTimer,
 				conEstablishedFifo, //remove this
 				rxEng2eventEng_setEvent,

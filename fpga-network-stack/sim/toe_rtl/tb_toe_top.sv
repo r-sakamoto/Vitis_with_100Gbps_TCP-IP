@@ -1510,9 +1510,16 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
     app_send(sid, pay, rsp);
     tb_check(rsp.error == 0, $sformatf("send after window update accepted (err=%0d)", rsp.error));
-    expect_flags(F_ACK, "data after window update", p, 400000, 0);
-    if (!err_count)
-      tb_check(f_payload_len(p) == 1000, "1000B data segment after window opened");
+    // skip pure ACKs (e.g. the persist-resume probe fired on the window update)
+    begin
+      bit got_data = 0;
+      while (!got_data) begin
+        wait_pkt(p, 400000, ok);
+        if (!ok) begin tb_error("timeout waiting for data after window update"); return; end
+        if (f_payload_len(p) != 0) got_data = 1;
+      end
+    end
+    tb_check(f_payload_len(p) == 1000, "1000B data segment after window opened");
     peer_win = 16'hFFFF;
     repeat (2000) @(posedge ap_clk);
   endtask
@@ -3165,6 +3172,67 @@ module tb_toe_top;
              "low ISN bits are not the fixed pre-fix 111111 pattern");
   endtask
 
+  // Z1: zero-window persist probe (RFC 1122 4.2.2.17). Requires the
+  // timer-scaled build: TIME_50ms/1000 ~= 8 ticks -> a probe (pure ACK with
+  // seq = snd_nxt - 1) every ~8k cycles while the peer advertises win=0.
+  task automatic test_zero_window_probe();
+    bytes_t p;
+    bit ok, got;
+    notif_t n;
+    bit [15:0] sid;
+    bit [31:0] snd_nxt;
+    realtime t1, t2;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd41600);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h51));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+    if (err_count) return;
+    snd_nxt = f_seq(p);
+
+    // peer closes its window
+    peer_win = 16'h0000;
+    peer_send_seg(F_ACK, no_bytes());
+
+    // first persist probe: pure ACK at seq = snd_nxt - 1
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 100000, ok);
+      if (!ok) begin tb_error("timeout waiting for 1st persist probe"); return; end
+      if (f_payload_len(p) == 0 && f_seq(p) == snd_nxt - 1) got = 1;
+    end
+    t1 = $realtime;
+    tb_info("1st persist probe received");
+    // peer still advertises zero window -> another probe ~50ms(scaled) later
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, snd_nxt, F_ACK, 16'h0000, no_bytes(), no_bytes()));
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 100000, ok);
+      if (!ok) begin tb_error("timeout waiting for 2nd persist probe"); return; end
+      if (f_payload_len(p) == 0 && f_seq(p) == snd_nxt - 1) got = 1;
+    end
+    t2 = $realtime;
+    // scaled TIME_50ms = 8 ticks ~ 8k cycles ~ 51us; allow generous margin
+    tb_check((t2 - t1) < 400_000.0, $sformatf("probe spacing %.0fns ~ 50ms(scaled)", t2 - t1));
+    tb_info("2nd persist probe received");
+
+    // window opens: at most one resume probe, then silence
+    peer_win = 16'h4000;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, snd_nxt, F_ACK, peer_win, no_bytes(), no_bytes()));
+    wait_pkt(p, 50000, ok); // optional resume probe
+    wait_pkt(p, 100000, ok);
+    tb_check(!ok, "probing stops after the window opens");
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   //---------------------------------------------------------------------------
   // Main
   //---------------------------------------------------------------------------
@@ -3222,6 +3290,7 @@ module tb_toe_top;
       "paws_drop"      : test_paws_drop();
       "time_wait_ack"  : test_time_wait_ack();
       "isn_quality"    : test_isn_quality();
+      "zero_window_probe" : test_zero_window_probe();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 

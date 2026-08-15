@@ -2,28 +2,28 @@
 Copyright (c) 2016, Xilinx, Inc.
 All rights reserved.
 
-Redistribution and use in source and binary forms, with or without modification, 
+Redistribution and use in source and binary forms, with or without modification,
 are permitted provided that the following conditions are met:
 
-1. Redistributions of source code must retain the above copyright notice, 
+1. Redistributions of source code must retain the above copyright notice,
 this list of conditions and the following disclaimer.
 
-2. Redistributions in binary form must reproduce the above copyright notice, 
-this list of conditions and the following disclaimer in the documentation 
+2. Redistributions in binary form must reproduce the above copyright notice,
+this list of conditions and the following disclaimer in the documentation
 and/or other materials provided with the distribution.
 
-3. Neither the name of the copyright holder nor the names of its contributors 
-may be used to endorse or promote products derived from this software 
+3. Neither the name of the copyright holder nor the names of its contributors
+may be used to endorse or promote products derived from this software
 without specific prior written permission.
 
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
-ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, 
-THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. 
-IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, 
-INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, 
-PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) 
-HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, 
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, 
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
 EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.// Copyright (c) 2015 Xilinx, Inc.
 ************************************************/
 
@@ -32,9 +32,19 @@ EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.// Copyright (c) 2015 Xilinx, 
 using namespace hls;
 
 /** @ingroup probe_timer
- *  Reads in the Session-ID and activates. a timer with an interval of 5 seconds. When the timer times out
- *  a RT Event is fired to the @ref tx_engine. In case of a zero-window (or too small window) an RT Event
- *  will generate a packet without payload which is the same as a probing packet.
+ *  Zero-window persist timer (RFC 1122 4.2.2.17). A session is armed when
+ *  the peer advertises a zero window (or, without TCP_NODELAY, when the TX
+ *  engine could not send). After TIME_50ms a probe event is fired:
+ *  - TCP_NODELAY: a KEEPALIVE event, i.e. a pure ACK with seq = snd_nxt - 1
+ *    that forces the peer to answer with its current window
+ *  - otherwise: a TX event that resumes transmission
+ *  A clear (window opened) fires the same event once so transmission resumes
+ *  immediately.
+ *
+ *  Structured as a single read->modify->write path so that all BRAM writes
+ *  commit in invocation order (a direct early-stage write in a branch is
+ *  otherwise overtaken by the stale write-back of a sweep in flight).
+ *	@param[in]		rxEng2timer_clearProbeTimer
  *	@param[in]		txEng2timer_setProbeTimer
  *	@param[out]		probeTimer2eventEng_setEvent
  */
@@ -52,69 +62,99 @@ void probe_timer(	stream<ap_uint<16> >&		rxEng2timer_clearProbeTimer,
 	#pragma HLS aggregate  variable=probeTimerTable compact=bit
 	#pragma HLS DEPENDENCE variable=probeTimerTable inter false
 
-	static ap_uint<16>		pt_currSessionID = 0;
-	static ap_uint<16>		pt_updSessionID = 0;
-	static ap_uint<16>		pt_prevSessionID = 0;
-	static bool				pt_WaitForWrite = false;
+	static ap_uint<16> pt_position = 0;
 
-	ap_uint<16> checkID;
-	bool		fastResume = false;
+	probe_timer_entry currEntry;
+	ap_uint<16> currID;
+	bool isSet = false;
+	bool isClear = false;
 
-	if (pt_WaitForWrite)
+	if (!txEng2timer_setProbeTimer.empty())
 	{
-		if (pt_updSessionID != pt_prevSessionID)
+		currID = txEng2timer_setProbeTimer.read();
+		isSet = true;
+	}
+	else if (!rxEng2timer_clearProbeTimer.empty())
+	{
+		currID = rxEng2timer_clearProbeTimer.read();
+		isClear = true;
+	}
+	else
+	{
+		currID = pt_position;
+		pt_position++;
+		if (pt_position >= MAX_SESSIONS)
 		{
-			probeTimerTable[pt_updSessionID].time = TIME_50ms;
-			probeTimerTable[pt_updSessionID].active = true;
-			pt_WaitForWrite = false;
+			pt_position = 0;
 		}
-		pt_prevSessionID--;
 	}
-	else if (!txEng2timer_setProbeTimer.empty())
-	{
-		txEng2timer_setProbeTimer.read(pt_updSessionID);
-		pt_WaitForWrite = true;
-	}
-	// too restrictive FIXME
-	else// if (!probeTimer2eventEng_setEvent.full()) this leads to II=2
-	{
-		//pt_prevSessionID = pt_currSessionID;
-		checkID = pt_currSessionID;
 
-		if (!rxEng2timer_clearProbeTimer.empty())
+	if (isSet || isClear)
+	{
+		//RMW-hazard guard (wrap-safe, mod MAX_SESSIONS): skip the sweep past
+		//an entry it would otherwise read before this update commits
+		ap_uint<16> dist = (currID >= pt_position)
+				? (ap_uint<16>)(currID - pt_position)
+				: (ap_uint<16>)(currID + MAX_SESSIONS - pt_position);
+		if (dist < 3)
 		{
-			rxEng2timer_clearProbeTimer.read(checkID);
-			fastResume = true;
+			pt_position += 5;
+			if (pt_position >= MAX_SESSIONS)
+			{
+				pt_position -= MAX_SESSIONS;
+			}
+		}
+	}
+
+	currEntry = probeTimerTable[currID];
+	bool doWrite = true;
+	if (isSet)
+	{
+		currEntry.time = TIME_50ms;
+		currEntry.active = true;
+	}
+	else if (isClear)
+	{
+		//window opened: resume transmission immediately (only if armed)
+		if (currEntry.active && !probeTimer2eventEng_setEvent.full())
+		{
+#if !(TCP_NODELAY)
+			probeTimer2eventEng_setEvent.write(event(TX, currID));
+#else
+			probeTimer2eventEng_setEvent.write(event(KEEPALIVE, currID));
+#endif
+		}
+		currEntry.time = 0;
+		currEntry.active = false;
+	}
+	else if (currEntry.active)
+	{
+		if (currEntry.time == 0)
+		{
+			if (!probeTimer2eventEng_setEvent.full())
+			{
+				currEntry.active = false;
+				//zero-window probe; re-armed by the rx engine as long as the
+				//peer keeps advertising a zero window
+#if !(TCP_NODELAY)
+				probeTimer2eventEng_setEvent.write(event(TX, currID));
+#else
+				probeTimer2eventEng_setEvent.write(event(KEEPALIVE, currID));
+#endif
+			}
 		}
 		else
 		{
-			pt_currSessionID++;
-			if (pt_currSessionID == MAX_SESSIONS)
-			{
-				pt_currSessionID = 0;
-			}
+			currEntry.time -= 1;
 		}
+	}
+	else
+	{
+		doWrite = false;
+	}
 
-		// Check if 0, otherwise decrement
-		if (probeTimerTable[checkID].active && !probeTimer2eventEng_setEvent.full())
-		{
-			if (probeTimerTable[checkID].time == 0 || fastResume)
-			{
-				probeTimerTable[checkID].time = 0;
-				probeTimerTable[checkID].active = false;
-				// It's not an RT, we want to resume TX
-#if !(TCP_NODELAY)
-				probeTimer2eventEng_setEvent.write(event(TX, checkID));
-#else
-				probeTimer2eventEng_setEvent.write(event(RT, checkID));
-#endif
-				fastResume = false;
-			}
-			else
-			{
-				probeTimerTable[checkID].time -= 1;
-			}
-		}
-		pt_prevSessionID = checkID;
+	if (doWrite)
+	{
+		probeTimerTable[currID] = currEntry;
 	}
 }

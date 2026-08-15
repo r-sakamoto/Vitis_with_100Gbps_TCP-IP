@@ -1087,6 +1087,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						stream<rxTxSarQuery>&					rxEng2txSar_upd_req,
 						stream<rxRetransmitTimerUpdate>&		rxEng2timer_clearRetransmitTimer,
 						stream<ap_uint<16> >&					rxEng2timer_clearProbeTimer,
+						stream<ap_uint<16> >&					rxEng2timer_setProbeTimer,
 						stream<ap_uint<16> >&					rxEng2timer_setCloseTimer,
 						stream<openStatus>&						openConStatusOut,
 						stream<event>&							rxEng2eventEng_setEvent,
@@ -1280,6 +1281,17 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						txSarUpd.peerSackEnd = newPeerSackEnd;
 						txSarUpd.peerSackValid = newPeerSackValid;
 						rxEng2txSar_upd_req.write(txSarUpd);
+					}
+					// zero-window persist (RFC 1122 4.2.2.17): arm the probe
+					// timer while the peer advertises a zero window; a window
+					// update on a pure ACK disarms it (and resumes TX)
+					if (fsm_meta.meta.winSize == 0)
+					{
+						rxEng2timer_setProbeTimer.write(fsm_meta.sessionID);
+					}
+					else if (fsm_meta.meta.ackNumb == txSar.prevAck && fsm_meta.meta.length == 0)
+					{
+						rxEng2timer_clearProbeTimer.write(fsm_meta.sessionID);
 					}
 					// pure ACK: persist the TS.Recent advance here (segments
 					// with payload carry it on their rxSar update below)
@@ -2244,6 +2256,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 				stream<rxTxSarQuery>&				rxEng2txSar_upd_req,
 				stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetransmitTimer,
 				stream<ap_uint<16> >&				rxEng2timer_clearProbeTimer,
+				stream<ap_uint<16> >&				rxEng2timer_setProbeTimer,
 				stream<ap_uint<16> >&				rxEng2timer_setCloseTimer,
 				stream<openStatus>&					openConStatusOut,
 				stream<extendedEvent>&				rxEng2eventEng_setEvent,
@@ -2421,6 +2434,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 							rxEng2txSar_upd_req,
 							rxEng2timer_clearRetransmitTimer,
 							rxEng2timer_clearProbeTimer,
+							rxEng2timer_setProbeTimer,
 							rxEng2timer_setCloseTimer,
 							openConStatusOut,
 							rxEng_fsmEventFifo,
@@ -2467,6 +2481,7 @@ template void rx_engine<DATA_WIDTH>(	stream<net_axis<DATA_WIDTH> >&					ipRxData
 				stream<rxTxSarQuery>&				rxEng2txSar_upd_req,
 				stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetransmitTimer,
 				stream<ap_uint<16> >&				rxEng2timer_clearProbeTimer,
+				stream<ap_uint<16> >&				rxEng2timer_setProbeTimer,
 				stream<ap_uint<16> >&				rxEng2timer_setCloseTimer,
 				stream<openStatus>&					openConStatusOut,
 				stream<extendedEvent>&				rxEng2eventEng_setEvent,
