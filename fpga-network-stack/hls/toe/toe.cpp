@@ -37,6 +37,7 @@
 #include "rtt_estimator/rtt_estimator.hpp"
 #include "probe_timer/probe_timer.hpp"
 #include "close_timer/close_timer.hpp"
+#include "keepalive_timer/keepalive_timer.hpp"
 #include "event_engine/event_engine.hpp"
 #include "ack_delay/ack_delay.hpp"
 #include "port_table/port_table.hpp"
@@ -70,6 +71,25 @@ void timerCloseMerger(stream<ap_uint<16> >& in1, stream<ap_uint<16> >& in2, stre
 	}
 }
 
+/** @ingroup timer
+ * Duplicates the state table's session release so that both the session
+ * lookup controller and the keepalive timer see the teardown.
+ */
+void sessionReleaseTee(	stream<ap_uint<16> >& in,
+						stream<ap_uint<16> >& out1,
+						stream<ap_uint<16> >& out2)
+{
+#pragma HLS PIPELINE II=1
+#pragma HLS INLINE off
+
+	if (!in.empty())
+	{
+		ap_uint<16> sessionID = in.read();
+		out1.write(sessionID);
+		out2.write(sessionID);
+	}
+}
+
 /** @defgroup timer Timers
  *  @ingroup tcp_module
  *  @param[in]		rxEng2timer_clearRetransmitTimer
@@ -86,6 +106,8 @@ void timerWrapper(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetransmitT
 					stream<ap_uint<16> >&				rxEng2timer_clearProbeTimer,
 					stream<ap_uint<16> >&				txEng2timer_setProbeTimer,
 					stream<ap_uint<16> >&				rxEng2timer_setCloseTimer,
+					stream<ap_uint<16> >&				rxEng2timer_resetKeepalive,
+					stream<ap_uint<16> >&				stateTable2timer_releaseKeepalive,
 					stream<ap_uint<16> >&				timer2stateTable_releaseState,
 					stream<event>&						timer2eventEng_setEvent,
 					stream<appNotification>&			rtTimer2rxApp_notification,
@@ -104,24 +126,53 @@ void timerWrapper(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetransmitT
 	#pragma HLS stream variable=rtTimer2eventEng_setEvent		depth=2
 	#pragma HLS stream variable=probeTimer2eventEng_setEvent	depth=2
 
-	// Merge Events, Order: rtTimer has to be before probeTimer
-	stream_merger(rtTimer2eventEng_setEvent, probeTimer2eventEng_setEvent, timer2eventEng_setEvent);
+	static stream<event> rtProbe2eventEng_setEvent("rtProbe2eventEng_setEvent");
+	static stream<event> kaTimer2eventEng_setEvent("kaTimer2eventEng_setEvent");
+	#pragma HLS stream variable=rtProbe2eventEng_setEvent		depth=2
+	#pragma HLS stream variable=kaTimer2eventEng_setEvent		depth=2
+
+	static stream<ap_uint<16> > closeRt2stateTable_releaseState("closeRt2stateTable_releaseState");
+	static stream<ap_uint<16> > kaTimer2stateTable_releaseState("kaTimer2stateTable_releaseState");
+	#pragma HLS stream variable=closeRt2stateTable_releaseState	depth=2
+	#pragma HLS stream variable=kaTimer2stateTable_releaseState	depth=2
+
+	static stream<appNotification> rtTimerInt_notification("rtTimerInt_notification");
+	static stream<appNotification> kaTimer2rxApp_notification("kaTimer2rxApp_notification");
+	#pragma HLS stream variable=rtTimerInt_notification			depth=2
+	#pragma HLS stream variable=kaTimer2rxApp_notification		depth=2
+	#pragma HLS aggregate variable=rtTimerInt_notification compact=bit
+	#pragma HLS aggregate variable=kaTimer2rxApp_notification compact=bit
+
+	// Merge Events, Order: rtTimer has to be before probeTimer, keepalive last
+	stream_merger(rtTimer2eventEng_setEvent, probeTimer2eventEng_setEvent, rtProbe2eventEng_setEvent);
+	stream_merger(rtProbe2eventEng_setEvent, kaTimer2eventEng_setEvent, timer2eventEng_setEvent);
 
 	retransmit_timer(	rxEng2timer_clearRetransmitTimer,
 						txEng2timer_setRetransmitTimer,
 						rtt2timer_rtoUpdate,
 						rtTimer2eventEng_setEvent,
 						rtTimer2stateTable_releaseState,
-						rtTimer2rxApp_notification,
+						rtTimerInt_notification,
 						rtTimer2txApp_notification);
 	probe_timer(rxEng2timer_clearProbeTimer,
 				txEng2timer_setProbeTimer,
 				probeTimer2eventEng_setEvent);
 	close_timer(rxEng2timer_setCloseTimer,
 				closeTimer2stateTable_releaseState);
+	keepalive_timer(	rxEng2timer_resetKeepalive,
+						stateTable2timer_releaseKeepalive,
+						kaTimer2eventEng_setEvent,
+						kaTimer2stateTable_releaseState,
+						kaTimer2rxApp_notification);
 	stream_merger(		closeTimer2stateTable_releaseState,
 						rtTimer2stateTable_releaseState,
+						closeRt2stateTable_releaseState);
+	stream_merger(		closeRt2stateTable_releaseState,
+						kaTimer2stateTable_releaseState,
 						timer2stateTable_releaseState);
+	stream_merger(		rtTimerInt_notification,
+						kaTimer2rxApp_notification,
+						rtTimer2rxApp_notification);
 }
 
 //TODO use same code as in TX Engine
@@ -620,6 +671,13 @@ void toe(	// Data & Memory Interface
 	static stream<rtoUpdate>				rtt2timer_rtoUpdate("rtt2timer_rtoUpdate");
 	#pragma HLS stream variable=rtt2timer_rtoUpdate		depth=8
 	#pragma HLS aggregate variable=rtt2timer_rtoUpdate compact=bit
+
+	static stream<ap_uint<16> >				rxEng2timer_resetKeepalive("rxEng2timer_resetKeepalive");
+	#pragma HLS stream variable=rxEng2timer_resetKeepalive	depth=4
+	static stream<ap_uint<16> >				stateTable2sLookup_releaseSessionInt("stateTable2sLookup_releaseSessionInt");
+	#pragma HLS stream variable=stateTable2sLookup_releaseSessionInt	depth=2
+	static stream<ap_uint<16> >				stateTable2timer_releaseKeepalive("stateTable2timer_releaseKeepalive");
+	#pragma HLS stream variable=stateTable2timer_releaseKeepalive	depth=2
 	//static stream<event>					appStreamEventFifo("appStreamEventFifo");
 	//static stream<event>					retransmitEventFifo("retransmitEventFifo");
 	static stream<event>					timer2eventEng_setEvent("timer2eventEng_setEvent");
@@ -697,7 +755,10 @@ void toe(	// Data & Memory Interface
 					stateTable2rxEng_upd_rsp,
 					stateTable2txApp_upd_rsp,
 					stateTable2txApp_rsp,
-					stateTable2sLookup_releaseSession);
+					stateTable2sLookup_releaseSessionInt);
+	sessionReleaseTee(	stateTable2sLookup_releaseSessionInt,
+						stateTable2sLookup_releaseSession,
+						stateTable2timer_releaseKeepalive);
 	// RX Sar Table
 	rx_sar_table(	rxEng2rxSar_upd_req,
 					rxApp2rxSar_upd_req,
@@ -731,6 +792,8 @@ void toe(	// Data & Memory Interface
 					rxEng2timer_clearProbeTimer,
 					txEng2timer_setProbeTimer,
 					rxEng2timer_setCloseTimer,
+					rxEng2timer_resetKeepalive,
+					stateTable2timer_releaseKeepalive,
 					timer2stateTable_releaseState,
 					timer2eventEng_setEvent,
 					timer2rxApp_notification,
@@ -777,6 +840,7 @@ void toe(	// Data & Memory Interface
 				conEstablishedFifo, //remove this
 				rxEng2eventEng_setEvent,
 				rxEng2rtt_ack,
+				rxEng2timer_resetKeepalive,
 #if !(RX_DDR_BYPASS)
 				rxBufferWriteCmd,
 				rxEng2rxApp_notification

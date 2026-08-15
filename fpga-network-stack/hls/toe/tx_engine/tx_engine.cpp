@@ -127,6 +127,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				break;
 			case ACK_NODELAY:
 			case ACK:
+			case KEEPALIVE:
 				txEng2rxSar_req.write(ml_curEvent.sessionID);
 				txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID));
 				break;
@@ -544,13 +545,16 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 			break;
 		case ACK:
 		case ACK_NODELAY:
+		case KEEPALIVE:
 			if (!rxSar2txEng_rsp.empty() && !txSar2txEng_upd_rsp.empty())
 			{
 				rxSar2txEng_rsp.read(rxSar);
 				txTxSarReply txSar = txSar2txEng_upd_rsp.read();
 
 				meta.ackNumb = rxSar.recvd;
-				meta.seqNumb = txSar.not_ackd; //Always send SEQ
+				// keepalive probe (RFC 1122): one below snd_nxt so the peer
+				// must answer with an ACK
+				meta.seqNumb = (ml_curEvent.type == KEEPALIVE) ? (ap_uint<32>)(txSar.not_ackd - 1) : txSar.not_ackd;
 				meta.window_size = rxSar.windowSize; //Precalcualted in rx_sar_table ((rxSar.appd - rxSar.recvd) - 1)
 				meta.length = 0;
 				meta.ack = 1;

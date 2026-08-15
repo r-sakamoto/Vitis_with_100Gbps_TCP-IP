@@ -58,7 +58,7 @@ inline bool seq_leq(ap_uint<32> a, ap_uint<32> b) { return ((ap_int<32>)(ap_uint
 inline bool seq_gt (ap_uint<32> a, ap_uint<32> b) { return ((ap_int<32>)(ap_uint<32>)(a - b)) > 0; }
 inline bool seq_geq(ap_uint<32> a, ap_uint<32> b) { return ((ap_int<32>)(ap_uint<32>)(a - b)) >= 0; }
 
-enum eventType {TX, RT, ACK, SYN, SYN_ACK, FIN, RST, ACK_NODELAY};
+enum eventType {TX, RT, ACK, SYN, SYN_ACK, FIN, RST, ACK_NODELAY, KEEPALIVE};
 /*
  * There is no explicit LISTEN state (merged into CLOSED).
  * CLOSE_WAIT and FIN_WAIT_2 are supported (half-close): on a peer FIN in

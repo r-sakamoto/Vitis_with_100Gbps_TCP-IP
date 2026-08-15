@@ -2763,6 +2763,102 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // N2: TCP keepalive (RFC 1122 4.2.3.6). Requires the timer-scaled RTL build
+  // (buildsim, TCP_STACK_SIM_TIMER_SCALE=1000): scaled KEEPALIVE_IDLE =
+  // "60s"/1000 -> 9376 ticks ~ 9.38M cycles, probes every "10s"/1000 ~ 1.56M
+  // cycles, 4 unanswered probes abort the session. Run with the 40M-cycle
+  // watchdog (selected automatically by testname).
+  task automatic test_keepalive();
+    bytes_t p;
+    bit ok, got;
+    notif_t n;
+    bit [15:0] sid;
+    bit [31:0] snd_nxt;
+    bit [35:0] ka_raw;
+    bit [31:0] ka_time;
+    realtime t_prev, t_now;
+    real d;
+    int nn;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd41300);
+    if (err_count) return;
+
+    // learn session id
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 100000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+    if (err_count) return;
+    snd_nxt = f_seq(p);
+
+    // (A) whitebox: the idle counter counts down while the session is quiet
+    // and is reloaded by any received in-window segment
+    repeat (1_500_000) @(posedge ap_clk);
+    ka_raw = dut.keepalive_timer_U0.keepaliveTimerTable_U.ram[sid];
+    ka_time = ka_raw[31:0];
+    tb_check(ka_raw[35], "keepalive entry active");
+    tb_check(ka_time > 32'd7000 && ka_time < 32'd8500,
+             $sformatf("idle counter ran down (time=%0d)", ka_time));
+    peer_send_seg(F_ACK, gen_payload(8, 8'h02));
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 2nd 8B", p, 400000, 0);
+    wait_notif(n, 100000, ok);   // consume the data notification of the 2nd 8B
+    tb_check(ok, "2nd data notification");
+    repeat (5000) @(posedge ap_clk);
+    ka_raw = dut.keepalive_timer_U0.keepaliveTimerTable_U.ram[sid];
+    ka_time = ka_raw[31:0];
+    tb_check(ka_time > 32'd9000,
+             $sformatf("idle counter reloaded by rx activity (time=%0d)", ka_time));
+    if (err_count) return;
+
+    // (B) total silence -> 4 probes: pure ACKs with seq = snd_nxt - 1
+    for (int k = 1; k <= 4; k++) begin
+      got = 0;
+      while (!got) begin
+        wait_pkt(p, (k == 1) ? 11_000_000 : 2_500_000, ok);
+        if (!ok) begin
+          tb_error($sformatf("timeout waiting for keepalive probe %0d", k));
+          return;
+        end
+        // skip stragglers (e.g. a delayed ACK at seq == snd_nxt)
+        if (f_payload_len(p) == 0 && f_seq(p) == snd_nxt - 1) got = 1;
+      end
+      t_now = $realtime;
+      tb_check((f_flags(p) & F_ACK) != 0, $sformatf("probe %0d is an ACK", k));
+      tb_check(f_ack(p) == peer_seq, $sformatf("probe %0d ack field", k));
+      if (k > 1) begin
+        d = t_now - t_prev;
+        // scaled KEEPALIVE_INTERVAL = 1564 ticks ~1.56M cycles ~= 10ms
+        // ($realtime is in ns: timescale 1ns/1ps)
+        tb_check(d > 7_000_000.0 && d < 14_000_000.0,
+                 $sformatf("probe %0d spacing %.0fns ~ 10ms(scaled)", k, d));
+      end
+      t_prev = t_now;
+      tb_info($sformatf("keepalive probe %0d seq=%0d", k, f_seq(p)));
+      // whitebox: probe counter tracks the unanswered probes
+      ka_raw = dut.keepalive_timer_U0.keepaliveTimerTable_U.ram[sid];
+      tb_check(ka_raw[34:32] == k[2:0], $sformatf("probe counter == %0d", k));
+    end
+
+    // (C) after 4 unanswered probes the session is aborted
+    wait_notif(n, 3_000_000, ok);
+    tb_check(ok, "close notification after unanswered probes");
+    if (ok) begin
+      tb_check(n.sessionID == sid, "notification session id");
+      tb_check(n.closed == 1, "notification marks session closed");
+    end
+    nn = 0;
+    while (cam_delete_count == 0 && nn < 200_000) begin @(posedge ap_clk); nn++; end
+    tb_check(cam_delete_count > 0, "CAM DELETE issued on keepalive abort");
+    // and probing stops
+    wait_pkt(p, 2_000_000, ok);
+    tb_check(!ok, "no further probes after abort");
+  endtask
+
   //---------------------------------------------------------------------------
   // Main
   //---------------------------------------------------------------------------
@@ -2815,6 +2911,7 @@ module tb_toe_top;
       "rto_retransmit" : test_rto_retransmit();
       "fin_retransmit" : test_fin_retransmit();
       "adaptive_rto"   : test_adaptive_rto();
+      "keepalive"      : test_keepalive();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 
@@ -2826,9 +2923,11 @@ module tb_toe_top;
     $finish;
   end
 
-  // global watchdog
+  // global watchdog (keepalive needs ~18M cycles of protocol silence)
   initial begin
-    #(CLK_PERIOD * 10_000_000);
+    #1;
+    if (testname == "keepalive") #(CLK_PERIOD * 40_000_000);
+    else                         #(CLK_PERIOD * 10_000_000);
     $display("[%0t] TB-ERROR: global watchdog expired", $time);
     $display("  TEST %s : FAIL (watchdog)", testname);
     $finish;

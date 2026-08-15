@@ -114,6 +114,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 				stream<openStatus>&					openConStatusOut, //TODO remove
 				stream<extendedEvent>&				rxEng2eventEng_setEvent,
 				stream<rttAck>&						rxEng2rtt_ack,
+				stream<ap_uint<16> >&				rxEng2timer_resetKeepalive,
 #if !(RX_DDR_BYPASS)
 				stream<mmCmd>&						rxBufferWriteCmd,
 				stream<appNotification>&			rxEng2rxApp_notification);

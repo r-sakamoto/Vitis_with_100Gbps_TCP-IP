@@ -1069,6 +1069,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						stream<event>&							rxEng2eventEng_setEvent,
 						stream<bool>&							dropDataFifoOut,
 						stream<rttAck>&							rxEng2rtt_ack,
+						stream<ap_uint<16> >&					rxEng2timer_resetKeepalive,
 #if !(RX_DDR_BYPASS)
 						stream<mmCmd>&							rxBufferWriteCmd,
 						stream<appNotification>&				rxEng2rxApp_notification)
@@ -1140,6 +1141,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				rxSar2rxEng_upd_rsp.read(rxSar);
 				txSar2rxEng_upd_rsp.read(txSar);
 				rxEng2timer_clearRetransmitTimer.write(rxRetransmitTimerUpdate(fsm_meta.sessionID, (fsm_meta.meta.ackNumb == txSar.nextByte)));
+				rxEng2timer_resetKeepalive.write(fsm_meta.sessionID);
 				if (tcpState == ESTABLISHED || tcpState == SYN_RECEIVED || tcpState == FIN_WAIT_1
 						|| tcpState == FIN_WAIT_2 || tcpState == CLOSE_WAIT
 						|| tcpState == CLOSING || tcpState == LAST_ACK)
@@ -1559,6 +1561,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					ap_uint<16> session_mss = (fsm_meta.meta.mss < MSS) ? fsm_meta.meta.mss : (ap_uint<16>)MSS;
 					// Initialize rxSar, SEQ + phantom byte for recvd and head pointer, offset to 0, gap set to false
 					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, rx_win_shift, (bool)fsm_meta.meta.sackPermitted));
+					rxEng2timer_resetKeepalive.write(fsm_meta.sessionID);
 					// Initialize receive window
 					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, 0, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift, session_mss))); //TODO maybe include count check
 #else
@@ -1625,6 +1628,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					// effective segment size for this session (RFC 879)
 					ap_uint<16> session_mss = (fsm_meta.meta.mss < MSS) ? fsm_meta.meta.mss : (ap_uint<16>)MSS;
 					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, rx_win_shift, (bool)fsm_meta.meta.sackPermitted));
+					rxEng2timer_resetKeepalive.write(fsm_meta.sessionID);
 					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift, session_mss))); //TODO maybe include count check
 #else
 					//initialize rx_sar, SEQ + phantom byte, last '1' for appd init
@@ -1674,6 +1678,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				// ack-number-derived decisions are only valid if the ACK flag is set
 				rxEng2timer_clearRetransmitTimer.write(rxRetransmitTimerUpdate(fsm_meta.sessionID,
 						(fsm_meta.meta.ack && fsm_meta.meta.ackNumb == txSar.nextByte)));
+				rxEng2timer_resetKeepalive.write(fsm_meta.sessionID);
 				// Check state and if FIN in order, Current out of order FINs are not accepted
 				if ((tcpState == ESTABLISHED || tcpState == FIN_WAIT_1 || tcpState == FIN_WAIT_2) && (rxSar.recvd == fsm_meta.meta.seqNumb))
 				{
@@ -2149,6 +2154,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 				stream<openStatus>&					openConStatusOut,
 				stream<extendedEvent>&				rxEng2eventEng_setEvent,
 				stream<rttAck>&						rxEng2rtt_ack,
+				stream<ap_uint<16> >&				rxEng2timer_resetKeepalive,
 #if !(RX_DDR_BYPASS)
 				stream<mmCmd>&						rxBufferWriteCmd,
 				stream<appNotification>&			rxEng2rxApp_notification)
@@ -2326,6 +2332,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 							rxEng_fsmEventFifo,
 							rxEng_fsmDropFifo,
 							rxEng2rtt_ack,
+							rxEng2timer_resetKeepalive,
 #if !(RX_DDR_BYPASS)
 							rxTcpFsm2wrAccessBreakdown,
 							rx_internalNotificationFifo);
@@ -2370,6 +2377,7 @@ template void rx_engine<DATA_WIDTH>(	stream<net_axis<DATA_WIDTH> >&					ipRxData
 				stream<openStatus>&					openConStatusOut,
 				stream<extendedEvent>&				rxEng2eventEng_setEvent,
 				stream<rttAck>&						rxEng2rtt_ack,
+				stream<ap_uint<16> >&				rxEng2timer_resetKeepalive,
 #if !(RX_DDR_BYPASS)
 				stream<mmCmd>&						rxBufferWriteCmd,
 				stream<appNotification>&			rxEng2rxApp_notification);

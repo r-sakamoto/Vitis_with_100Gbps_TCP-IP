@@ -48,7 +48,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | ゼロウィンドウプローブ | TCP_NODELAY=1ビルドでは**probeタイマが恒久無効**(`tx_engine.cpp:166-171`)。有効時も1バイトプローブでなく全再送 | RFC 1122準拠persist | ★★ |
 | Delayed ACK | 64µs固定(Linuxの40msの約1/600)。イベント負荷で無限延期あり得る (`ack_delay.cpp`) | 40ms/クオックACK | ★ |
 | SWS回避 | 送受とも**なし**(受信側クランプはコメントアウト `tx_engine.cpp:936-940`) | あり | ★★ |
-| Keepalive | **なし**(タイマ自体が存在しない) | SO_KEEPALIVE | ★★ |
+| Keepalive | **実装済** (N2, `keepalive`テスト): 新モジュール`keepalive_timer`(RFC 1122 4.2.3.6)。受信セグメントごとにアイドルタイマをリセット、60秒無通信でseq=snd_nxt-1の純ACKプローブを10秒間隔で最大4回送出、無応答なら切断(app通知closed+セッション解放)。Linuxのデフォルト(7200s/75s/9probes)より積極的な定数だがハードコード | SO_KEEPALIVE | 完了 |
 
 ## 4. コネクション管理・ステートマシン
 
