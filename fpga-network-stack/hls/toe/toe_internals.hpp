@@ -363,6 +363,35 @@ struct txTxSarReply
 		:ackd(ack), not_ackd(nack), usableWindow(usableWindow), app(app), usedLength(usedLength), finReady(finReady), finSent(finSent), mss(MSS) {}
 };
 
+/** RTT estimation (RFC 6298, Karn's algorithm - no timestamps option) */
+struct rttEvent
+{
+	ap_uint<16> sessionID;
+	ap_uint<32> seq;   //for kind==0: seq number whose ACK completes the sample
+	ap_uint<2>  kind;  //0=sample new data, 1=invalidate (retransmission), 2=init (new connection)
+	rttEvent() {}
+	rttEvent(ap_uint<16> id, ap_uint<32> seq, ap_uint<2> kind)
+			:sessionID(id), seq(seq), kind(kind) {}
+};
+
+struct rttAck
+{
+	ap_uint<16> sessionID;
+	ap_uint<32> ackNumb;
+	rttAck() {}
+	rttAck(ap_uint<16> id, ap_uint<32> ack)
+			:sessionID(id), ackNumb(ack) {}
+};
+
+struct rtoUpdate
+{
+	ap_uint<16> sessionID;
+	ap_uint<32> rto; //in retransmit-timer ticks (1 tick = MAX_SESSIONS cycles)
+	rtoUpdate() {}
+	rtoUpdate(ap_uint<16> id, ap_uint<32> rto)
+			:sessionID(id), rto(rto) {}
+};
+
 struct rxRetransmitTimerUpdate {
 	ap_uint<16> sessionID;
 	bool		stop;

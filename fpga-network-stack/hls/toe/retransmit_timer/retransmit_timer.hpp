@@ -37,6 +37,7 @@ using namespace hls;
 struct retransmitTimerEntry
 {
 	ap_uint<32>		time;
+	ap_uint<32>		rto; //smoothed RTO from rtt_estimator (0 = not yet measured -> TIME_1s)
 	ap_uint<3>		retries;
 	bool			active;
 	eventType		type;
@@ -63,6 +64,7 @@ struct mergedInput
  */
 void retransmit_timer(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetransmitTimer,
 						stream<txRetransmitTimerSet>&		txEng2timer_setRetransmitTimer,
+						stream<rtoUpdate>&					rtt2timer_rtoUpdate,
 						stream<event>&						rtTimer2eventEng_setEvent,
 						stream<ap_uint<16> >&				rtTimer2stateTable_releaseState,
 						stream<appNotification>&			rtTimer2rxApp_notification,

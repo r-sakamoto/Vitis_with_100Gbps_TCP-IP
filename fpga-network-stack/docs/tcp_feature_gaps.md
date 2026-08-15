@@ -18,7 +18,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 
 | 機能 | 現状 | Linux | 優先度 |
 |---|---|---|---|
-| MSSオプション(受信) | **一部実装済** (F4, `mss_option`テスト): SYN/SYN-ACKのMSSをパースし実効MSS=min(peer,local)をセッション毎に保存(なしは536)、再送(go-back-N)チャンクに適用。**NODELAY=1のTX初送はappの書込み単位のままでMSS超過あり得る**(TXセグメンテーションはフェーズ2) | 相手MSSとPMTUからMSSを決定 | ★★(残) |
+| MSSオプション(受信) | **実装済** (F4+P1, `mss_option`/`tx_segmentation`テスト): 実効MSS=min(peer,local)をセッション毎に保存し、初送・再送ともMSS超過書込みをDDR読出しで分割送信(バイパス複製ストリームは破棄モードで整合)。PMTUDは未 | 相手MSSとPMTUからMSSを決定 | ★(残: PMTUD) |
 | Window Scale(受信) | SYN時のみパース。**自側shiftは0か2の固定** (`rx_engine.cpp:1366,1429`)。相手shiftは**14超の値を無検証で格納** → `tx_sar_table.cpp:121` でビット範囲オーバーフロー(issue #42) | shift 0〜14を交渉、バッファサイズから導出 | ★★★ |
 | SACK / SACK-Permitted | **なし**(生成・解釈とも) | あり(選択再送・D-SACK) | ★★★ |
 | Timestamps (RFC 7323) | **なし** → PAWSなし、RTT計測なし | あり | ★★★ |
@@ -30,7 +30,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 
 | 機能 | 現状 | Linux | 優先度 |
 |---|---|---|---|
-| RTT計測 / 適応RTO | **なし**。RTOは固定テーブル 1s/5s/10s/15s/30s (`retransmit_timer.cpp:132-149`) | SRTT/RTTVARによるRFC 6298、最小RTO 200ms | ★★★ |
+| RTT計測 / 適応RTO | **実装済** (P2, `adaptive_rto`テスト): 新モジュール`rtt_estimator`がKarn方式でRTT計測、RFC 6298のSRTT/RTTVAR→RTO=clamp(SRTT+4V, 250ms, 30s)。retransmit_timerはRTO×2^retriesの指数バックオフ化。Timestampsオプション(PAWS含む)は未 | SRTT/RTTVARによるRFC 6298、最小RTO 200ms | ★(残: TSopt) |
 | 再送回数上限 | 4回再送で**RSTも送らずセッション破棄** (`retransmit_timer.cpp:166-183`) | tcp_retries2(15回)、RST送信 | ★★ |
 | 再送方式 | go-back-N(ackd以降全部)、1回のRTOで最大4セグメント (`tx_engine.cpp:382-396`) | SACKベースの選択再送 | ★★★ |
 | Fast Retransmit | dup ACK==3 ちょうどで1回のみ。**cwnd/ssthresh縮小なし**(fast recoveryなし) (`rx_engine.cpp:1277-1281`) | RFC 5681 fast recovery、partial ACK処理 | ★★★ |

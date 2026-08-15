@@ -68,10 +68,11 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				hls::stream<ap_uint<16> >&				txEng2sLookup_rev_req,
 				hls::stream<bool>&						txEng_isLookUpFifoOut,
 #if (TCP_NODELAY)
-				hls::stream<bool>&						txEng_isDDRbypass,
+				hls::stream<ap_uint<2> >&				txEng_isDDRbypass, //0=from mem, 1=bypass, 2=discard dup then mem
 #endif
 				hls::stream<fourTuple>&					txEng_tupleShortCutFifoOut,
-				hls::stream<ap_uint<1> >&				readCountFifo)
+				hls::stream<ap_uint<1> >&				readCountFifo,
+				hls::stream<rttEvent>&					txEng2rtt_event)
 {
 #pragma HLS INLINE off
 #pragma HLS pipeline II=1
@@ -82,6 +83,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 	static ap_uint<32> ml_randomValue= 0x562301af; //Random seed initialization
 
 	static ap_uint<2> ml_segmentCount = 0;
+	static ap_uint<16> ml_segOffset = 0; //progress within an oversized app write (TX segmentation)
 	static rxSarReply	rxSar;
 	static txTxSarReply	txSarReg;
 	ap_uint<WINDOW_BITS> slowstart_threshold;
@@ -149,59 +151,112 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 		// Can bypass DDR
 #if (TCP_NODELAY)
 		case TX:
-			if ((!rxSar2txEng_rsp.empty() && !txSar2txEng_upd_rsp.empty()))// || ml_sarLoaded)
+			if ((!rxSar2txEng_rsp.empty() && !txSar2txEng_upd_rsp.empty()) || ml_sarLoaded)
 			{
-				rxSar2txEng_rsp.read(rxSar);
-				txTxSarReply txSar = txSar2txEng_upd_rsp.read();
+				txTxSarReply txSar;
+				if (!ml_sarLoaded)
+				{
+					rxSar2txEng_rsp.read(rxSar);
+					txSar = txSar2txEng_upd_rsp.read();
+					ml_segOffset = 0;
+				}
+				else
+				{
+					txSar = txSarReg;
+				}
+				// per-session effective MSS (min(peer MSS, local MSS))
+				ap_uint<16> sessionMSS = (txSar.mss == 0) ? (ap_uint<16>)MSS : txSar.mss;
 
 				meta.ackNumb = rxSar.recvd;
-				meta.seqNumb = txSar.not_ackd;
+				meta.seqNumb = txSar.not_ackd + ml_segOffset;
 				meta.window_size = rxSar.windowSize; //Precalcualted in rx_sar_table ((rxSar.appd - rxSar.recvd) - 1)
 				meta.ack = 1; // ACK is always set when established
 				meta.rst = 0;
 				meta.syn = 0;
 				meta.fin = 0;
-				meta.length = ml_curEvent.length;
 
-				//this is hack, makes sure that probeTimer is never set.
-				//ProbeTimer is not used, since application checks space before transmitting
-				if (0x7FFF < ml_curEvent.length) // Ox7FFF = 32767 
+				if (ml_curEvent.length <= sessionMSS)
 				{
-					txEng2timer_setProbeTimer.write(ml_curEvent.sessionID);
+					// single segment: payload comes from the DDR-bypass
+					// duplicate stream (original fast path)
+					meta.length = ml_curEvent.length;
+
+					//this is hack, makes sure that probeTimer is never set.
+					//ProbeTimer is not used, since application checks space before transmitting
+					if (0x7FFF < ml_curEvent.length) // Ox7FFF = 32767
+					{
+						txEng2timer_setProbeTimer.write(ml_curEvent.sessionID);
+					}
+
+					txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID, txSar.not_ackd + ml_curEvent.length, 1));
+					//This state is always left
+					ml_FsmState = 0;
+
+					// Send a packet only if there is data or we want to send an empty probing message
+					if (meta.length != 0)
+					{
+						txEng_ipMetaFifoOut.write(meta.length);
+						txEng_tcpMetaFifoOut.write(meta);
+						txEng_isLookUpFifoOut.write(true);
+						txEng_isDDRbypass.write(1);
+						txEng2sLookup_rev_req.write(ml_curEvent.sessionID);
+
+						// Only set RT timer if we actually send sth
+						txEng2timer_setRetransmitTimer.write(txRetransmitTimerSet(ml_curEvent.sessionID));
+						// RTT sample: measurement completes when this data is ACKed
+						txEng2rtt_event.write(rttEvent(ml_curEvent.sessionID, txSar.not_ackd + ml_curEvent.length, 0));
+					}
 				}
-
-				//TODO some checking
-				txSar.not_ackd += ml_curEvent.length;
-
-				txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID, txSar.not_ackd, 1));
-				//This state is always left
-				ml_FsmState = 0;
-
-
-				// Send a packet only if there is data or we want to send an empty probing message
-				if (meta.length != 0)// || ml_curEvent.retransmit) //TODO retransmit boolean currently not set, should be removed
+				else
 				{
+					// app write larger than the session MSS: segment it. The
+					// payload was also written into the TX buffer (for
+					// retransmission), so read it back from DDR in MSS-sized
+					// chunks. The duplicate bypass-stream packet is discarded
+					// by read_data_arbiter (code 2 on the first segment).
+					ap_uint<16> remaining = ml_curEvent.length - ml_segOffset;
+					meta.length = (remaining > sessionMSS) ? sessionMSS : remaining;
+
+					ap_uint<32> pkgAddr;
+					pkgAddr(31, 30) = 0x00;
+					pkgAddr(29, WINDOW_BITS) = ml_curEvent.sessionID(13, 0);
+					pkgAddr(WINDOW_BITS-1, 0) = ml_curEvent.address + ml_segOffset;
+
+					if (ml_segOffset == 0)
+					{
+						txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID, txSar.not_ackd + ml_curEvent.length, 1));
+						// RTT sample: measurement completes when the whole write is ACKed
+						txEng2rtt_event.write(rttEvent(ml_curEvent.sessionID, txSar.not_ackd + ml_curEvent.length, 0));
+					}
+
+					txBufferReadCmd.write(mmCmd(pkgAddr, meta.length));
 					txEng_ipMetaFifoOut.write(meta.length);
 					txEng_tcpMetaFifoOut.write(meta);
 					txEng_isLookUpFifoOut.write(true);
-					txEng_isDDRbypass.write(true);
+					txEng_isDDRbypass.write((ml_segOffset == 0) ? (ap_uint<2>)2 : (ap_uint<2>)0);
 					txEng2sLookup_rev_req.write(ml_curEvent.sessionID);
-
-					// Only set RT timer if we actually send sth, TODO only set if we change state and sent sth
 					txEng2timer_setRetransmitTimer.write(txRetransmitTimerSet(ml_curEvent.sessionID));
+
+					ml_segOffset += meta.length;
+					if (ml_segOffset == ml_curEvent.length)
+					{
+						ml_FsmState = 0;
+					}
 				}
+				ml_sarLoaded = true;
+				txSarReg = txSar;
 
 				#ifndef __SYNTHESIS__
 				std::cout<<"TX";
 				std::cout<<std::dec<<" session id:"<<ml_curEvent.sessionID;
-				std::cout<<" seqNum:"<<txSar.not_ackd;
+				std::cout<<" seqNum:"<<meta.seqNumb;
 				std::cout<<" ackNum:"<<rxSar.recvd;
 				std::cout<<" window_size:"<<rxSar.windowSize;
 				std::cout<<" ack:"<<meta.ack;
 				std::cout<<" rst:"<<meta.rst;
 				std::cout<<" syn:"<<meta.syn;
 				std::cout<<" fin:"<<meta.fin;
-				std::cout<<" length:"<<ml_curEvent.length<<std::endl;		
+				std::cout<<" length:"<<meta.length<<std::endl;
 				#endif
 			}
 
@@ -222,6 +277,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				{
 					txSar = txSarReg;
 				}
+				// per-session effective MSS (min(peer MSS, local MSS))
+				ap_uint<16> sessionMSS = (txSar.mss == 0) ? (ap_uint<16>)MSS : txSar.mss;
 
 				//Compute our space, Advertise at least a quarter/half, otherwise 0
 				meta.ackNumb = rxSar.recvd;
@@ -247,11 +304,11 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				//precomputed in txSar Table: usableWindow = (min(recv_window, cong_windwo) < usedLength ? (min(recv_window, cong_window) - usedLength) : 0)
 				if (currLength <= txSar.usableWindow)
 				{
-					if (currLength >= MSS) //TODO change to >= MSS, use maxSegmentCount
+					if (currLength >= sessionMSS) //TODO use maxSegmentCount
 					{
 						// We stay in this state and sent immediately another packet
-						txSar.not_ackd += MSS;
-						meta.length = MSS;
+						txSar.not_ackd += sessionMSS;
+						meta.length = sessionMSS;
 					}
 					else
 					{
@@ -285,11 +342,11 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				else
 				{
 					// code duplication, but better timing..
-					if (txSar.usableWindow >= MSS)
+					if (txSar.usableWindow >= sessionMSS)
 					{
 						// We stay in this state and sent immediately another packet
-						txSar.not_ackd += MSS;
-						meta.length = MSS;
+						txSar.not_ackd += sessionMSS;
+						meta.length = sessionMSS;
 					}
 					else
 					{
@@ -355,6 +412,12 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					txSar = txSarReg;
 				}
 
+				if (!ml_sarLoaded)
+				{
+					// retransmission: the outstanding RTT sample is no longer
+					// unambiguous, discard it (Karn's algorithm)
+					txEng2rtt_event.write(rttEvent(ml_curEvent.sessionID, 0, 1));
+				}
 				// usedLength counts the FIN's phantom sequence byte once finSent
 				// is set; retransmitting it as payload emitted a bogus 1-byte
 				// data segment at the FIN's seq number (and inflated go-back-N
@@ -434,7 +497,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					txEng_tcpMetaFifoOut.write(meta);
 					txEng_isLookUpFifoOut.write(true);
 #if (TCP_NODELAY)
-					txEng_isDDRbypass.write(false);
+					txEng_isDDRbypass.write(0);
 #endif
 					txEng2sLookup_rev_req.write(ml_curEvent.sessionID);
 
@@ -511,6 +574,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					meta.seqNumb = txSar.not_ackd;
 					ml_randomValue = (ml_randomValue* 8) xor ml_randomValue;
 					txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID, txSar.not_ackd+1, 1, 1));
+					// new connection: reset the RTT estimator state
+					txEng2rtt_event.write(rttEvent(ml_curEvent.sessionID, 0, 2));
 				}
 				meta.ackNumb = 0;
 				//meta.seqNumb = txSar.not_ackd;
@@ -574,6 +639,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					meta.seqNumb = txSar.not_ackd;
 					ml_randomValue = (ml_randomValue* 8) xor ml_randomValue;
 					txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID, txSar.not_ackd+1, 1, 1));
+					// new connection: reset the RTT estimator state
+					txEng2rtt_event.write(rttEvent(ml_curEvent.sessionID, 0, 2));
 				}
 
 #if (WINDOW_SCALE)
@@ -1424,7 +1491,7 @@ void read_data_stitching(	hls::stream<bool>&			memAccessBreakdown2readPkgStitche
 template <int WIDTH>
 void read_data_arbiter(stream<net_axis<WIDTH> >&		txBufferReadData,
 #if (TCP_NODELAY)
-					stream<bool>&			txEng_isDDRbypass,
+					stream<ap_uint<2> >&	txEng_isDDRbypass, //0=from mem, 1=bypass, 2=discard dup then mem
 					stream<net_axis<WIDTH> >&		txApp2txEng_data_stream,
 #endif
 					stream<net_axis<WIDTH> >&		txEng_tcpSegOut)
@@ -1440,16 +1507,22 @@ void read_data_arbiter(stream<net_axis<WIDTH> >&		txBufferReadData,
 #if (TCP_NODELAY)
 		if (!txEng_isDDRbypass.empty())
 		{
-			bool isBypass = txEng_isDDRbypass.read();
-			if (isBypass)
+			ap_uint<2> payloadSource = txEng_isDDRbypass.read();
+			if (payloadSource == 1)
 			{
 				tps_state = 2;
+			}
+			else if (payloadSource == 2)
+			{
+				// oversized app write was segmented and is sent from memory;
+				// the duplicate bypass-stream packet must be discarded first
+				tps_state = 3;
 			}
 			else
 			{
 				tps_state = 1;
 			}
-			
+
 		}
 #else
 		tps_state = 1;
@@ -1478,6 +1551,18 @@ void read_data_arbiter(stream<net_axis<WIDTH> >&		txBufferReadData,
 			if (currWord.last)
 			{
 				tps_state = 0;
+			}
+		}
+		break;
+	case 3:
+		// discard one duplicate packet from the bypass stream, then serve the
+		// (segmented) payload from memory
+		if (!txApp2txEng_data_stream.empty())
+		{
+			net_axis<WIDTH> currWord = txApp2txEng_data_stream.read();
+			if (currWord.last)
+			{
+				tps_state = 1;
 			}
 		}
 		break;
@@ -1664,7 +1749,8 @@ void tx_engine(	stream<extendedEvent>&			eventEng2txEng_event,
 				stream<mmCmd>&					txBufferReadCmd,
 				stream<ap_uint<16> >&			txEng2sLookup_rev_req,
 				stream<net_axis<WIDTH> >&				ipTxData,
-				stream<ap_uint<1> >&			readCountFifo)
+				stream<ap_uint<1> >&			readCountFifo,
+				stream<rttEvent>&				txEng2rtt_event)
 {
 // #pragma HLS DATAFLOW
 #pragma HLS INTERFACE ap_ctrl_none port=return
@@ -1736,7 +1822,7 @@ void tx_engine(	stream<extendedEvent>&			eventEng2txEng_event,
 	static stream<bool> memAccessBreakdown2txPkgStitcher("memAccessBreakdown2txPkgStitcher");
 	#pragma HLS stream variable=memAccessBreakdown2txPkgStitcher depth=32
 	
-	static stream<bool> txEng_isDDRbypass("txEng_isDDRbypass");
+	static stream<ap_uint<2> > txEng_isDDRbypass("txEng_isDDRbypass");
 	#pragma HLS stream variable=txEng_isDDRbypass depth=32
 
 
@@ -1756,7 +1842,8 @@ void tx_engine(	stream<extendedEvent>&			eventEng2txEng_event,
 				txEng_isDDRbypass,
 #endif
 				txEng_tupleShortCutFifo,
-				readCountFifo);
+				readCountFifo,
+				txEng2rtt_event);
 
 	txEngMemAccessBreakdown(txMetaloader2memAccessBreakdown, txBufferReadCmd, memAccessBreakdown2txPkgStitcher);
 
@@ -1812,4 +1899,5 @@ template void tx_engine<DATA_WIDTH>(	stream<extendedEvent>&			eventEng2txEng_eve
 				stream<mmCmd>&					txBufferReadCmd,
 				stream<ap_uint<16> >&			txEng2sLookup_rev_req,
 				stream<net_axis<DATA_WIDTH> >&				ipTxData,
-				stream<ap_uint<1> >&			readCountFifo);
+				stream<ap_uint<1> >&			readCountFifo,
+				stream<rttEvent>&				txEng2rtt_event);

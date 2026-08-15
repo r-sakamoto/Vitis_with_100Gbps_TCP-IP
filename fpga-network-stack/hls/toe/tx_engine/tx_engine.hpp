@@ -90,4 +90,5 @@ void tx_engine(	stream<extendedEvent>&			eventEng2txEng_event,
 				stream<mmCmd>&					txBufferReadCmd,
 				stream<ap_uint<16> >&			txEng2sLookup_rev_req,
 				stream<net_axis<WIDTH> >&			ipTxData,
-				stream<ap_uint<1> >&			readCountFifo);
+				stream<ap_uint<1> >&			readCountFifo,
+				stream<rttEvent>&				txEng2rtt_event);

@@ -1575,15 +1575,22 @@ module tb_toe_top;
     peer_seq += 8;
     expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
 
-    // app sends 1000B; peer never ACKs it
+    // app sends 1000B; since P1 the initial transmission is also segmented
+    // by the session MSS (536+464); peer never ACKs it
     pay = gen_payload(1000, 8'h90);
     app_send(sid, pay, rsp);
     tb_check(rsp.error == 0, "app_send accepted");
     got = 0;
-    while (!got) begin
+    d0_seq = 0;
+    while (got < 1000) begin
       wait_pkt(p, 400000, ok);
       if (!ok) begin tb_error("timeout waiting for data segment"); return; end
-      if (f_payload_len(p) == 1000) begin d0_seq = f_seq(p); got = 1; end
+      if (f_payload_len(p) == 0) continue;
+      if (got == 0) d0_seq = f_seq(p);
+      tb_check(f_payload_len(p) <= 536,
+               $sformatf("initial segment len=%0d respects peer MSS 536", f_payload_len(p)));
+      if (f_payload_len(p) > 536) return;
+      got += f_payload_len(p);
     end
 
     // 3 dup ACKs (ack = snd_una) -> fast retransmit, now chunked by MSS 536
@@ -1616,6 +1623,98 @@ module tb_toe_top;
     // clean up
     net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
                       peer_seq, d0_seq + 1000, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  // P1 regression: an app write larger than the session MSS must be sent as
+  // multiple MSS-sized segments read back from the TX buffer (previously it
+  // went out as one oversized segment via the bypass stream).
+  task automatic test_tx_segmentation();
+    bytes_t p, opts, pay;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] toe_iss, data_base;
+    int got_bytes;
+    bytes_t d;
+    int soff;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+
+    // SYN with MSS = 536
+    opts = new[8];
+    opts[0]=8'h02; opts[1]=8'h04; opts[2]=8'h02; opts[3]=8'h18;   // MSS 536
+    opts[4]=8'h03; opts[5]=8'h03; opts[6]=8'h02; opts[7]=8'h01;   // WS 2 + NOP
+    peer_port = 16'd41080; toe_port = 16'd80;
+    peer_seq  = 32'h7000_0000; peer_win = 16'hFFFF;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, 0, F_SYN, 16'hFFFF, opts, no_bytes()));
+    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 100000, 1);
+    if (err_count) return;
+    toe_iss  = f_seq(p);
+    peer_ack = toe_iss + 1;
+    peer_seq += 1;
+    peer_send_seg(F_ACK, no_bytes());
+
+    // learn session id
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    // oversized app write: 1400B > session MSS 536 -> 536+536+328
+    data_base = toe_iss + 1;
+    pay = gen_payload(1400, 8'hB0);
+    app_send(sid, pay, rsp);
+    tb_check(rsp.error == 0, "app_send 1400B accepted");
+    got_bytes = 0;
+    while (got_bytes < 1400) begin
+      wait_pkt(p, 500000, ok);
+      if (!ok) begin tb_error("timeout collecting segmented data"); return; end
+      if (f_payload_len(p) == 0) continue;
+      tb_check(f_payload_len(p) <= 536,
+               $sformatf("segment len=%0d respects session MSS", f_payload_len(p)));
+      if (f_payload_len(p) > 536) return;
+      d = f_payload(p);
+      soff = f_seq(p) - data_base;
+      tb_check(soff == got_bytes, $sformatf("segment seq offset %0d contiguous (expect %0d)", soff, got_bytes));
+      for (int i = 0; i < d.size(); i++)
+        if (d[i] !== pay[soff + i]) begin
+          tb_check(0, $sformatf("segmented payload mismatch at offset %0d", soff + i));
+          return;
+        end
+      got_bytes += d.size();
+    end
+    tb_check(got_bytes == 1400, "all 1400 bytes sent in MSS-sized segments");
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, data_base + 1400, F_ACK, peer_win, no_bytes(), no_bytes()));
+
+    // bypass fast path must still work right after (arbiter not desynced)
+    pay = gen_payload(100, 8'hC5);
+    app_send(sid, pay, rsp);
+    tb_check(rsp.error == 0, "app_send 100B accepted");
+    got_bytes = 0;
+    while (!got_bytes) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for 100B segment"); return; end
+      if (f_payload_len(p) == 0) continue;
+      tb_check(f_payload_len(p) == 100, "single 100B bypass segment");
+      d = f_payload(p);
+      tb_check(f_seq(p) == data_base + 1400, "100B segment seq");
+      for (int i = 0; i < d.size() && i < 100; i++)
+        if (d[i] !== pay[i]) begin
+          tb_check(0, $sformatf("bypass payload mismatch at %0d", i));
+          return;
+        end
+      got_bytes = 1;
+    end
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, data_base + 1500, F_ACK, peer_win, no_bytes(), no_bytes()));
     repeat (2000) @(posedge ap_clk);
   endtask
 
@@ -1980,6 +2079,81 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // P2 regression. Requires a timer-scaled RTL build. After a few RTT
+  // samples the RTO must shrink from the initial 1s to ~RTO_MIN (250ms
+  // scaled), and consecutive RTOs must back off exponentially (RFC 6298).
+  task automatic test_adaptive_rto();
+    bytes_t p, pay;
+    bit ok, ok2;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    realtime t_data, t_rtx1, t_rtx2;
+    real d1, d2;
+    bit [31:0] seqd;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd41090);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    // three prompt data/ACK exchanges -> RTT samples -> RTO converges to RTO_MIN
+    for (int k = 0; k < 3; k++) begin
+      pay = gen_payload(100, 8'h20 + k[7:0]);
+      app_send(sid, pay, rsp);
+      tb_check(rsp.error == 0, $sformatf("app_send sample %0d accepted", k));
+      ok = 0;
+      while (!ok) begin
+        wait_pkt(p, 400000, ok2);
+        if (!ok2) begin tb_error("timeout waiting for sample data segment"); return; end
+        if (f_payload_len(p) == 100) ok = 1;
+      end
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, f_seq(p) + 100, F_ACK, peer_win, no_bytes(), no_bytes()));
+      repeat (3000) @(posedge ap_clk); // let the estimator update the RTO
+    end
+
+    // send data and stay silent: measure the RTO retransmission spacing
+    pay = gen_payload(200, 8'h55);
+    app_send(sid, pay, rsp);
+    tb_check(rsp.error == 0, "app_send probe accepted");
+    ok = 0;
+    while (!ok) begin
+      wait_pkt(p, 400000, ok2);
+      if (!ok2) begin tb_error("timeout waiting for original segment"); return; end
+      if (f_payload_len(p) == 200) begin t_data = $realtime; seqd = f_seq(p); ok = 1; end
+    end
+    ok = 0;
+    while (!ok) begin
+      wait_pkt(p, 2000000, ok2);
+      if (!ok2) begin tb_error("timeout waiting for 1st RTO retransmission"); return; end
+      if (f_payload_len(p) == 200 && f_seq(p) == seqd) begin t_rtx1 = $realtime; ok = 1; end
+    end
+    ok = 0;
+    while (!ok) begin
+      wait_pkt(p, 2000000, ok2);
+      if (!ok2) begin tb_error("timeout waiting for 2nd RTO retransmission"); return; end
+      if (f_payload_len(p) == 200 && f_seq(p) == seqd) begin t_rtx2 = $realtime; ok = 1; end
+    end
+    d1 = t_rtx1 - t_data;
+    d2 = t_rtx2 - t_rtx1;
+    // scaled RTO_MIN (250ms/1000) ~= 40 ticks -> ~256us; pre-P2 fixed 1s/1000 ~= 1ms
+    tb_info($sformatf("RTO gaps: first=%.0fns second=%.0fns", d1, d2));
+    tb_check(d1 > 100000 && d1 < 700000,
+             $sformatf("first RTO %.0fns ~ RTO_MIN (adaptive), not the fixed 1s", d1));
+    tb_check(d2 > d1 * 1.4 && d2 < d1 * 3.0,
+             $sformatf("second RTO %.0fns ~ 2x first (exponential backoff)", d2));
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, seqd + 200, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   // B7 regression. Requires a timer-scaled RTL build. After the TOE sends a
   // FIN and the peer stays silent, the RTO must retransmit the FIN itself -
   // pre-fix the RT path treated the FIN's phantom sequence byte as 1 byte of
@@ -2122,12 +2296,14 @@ module tb_toe_top;
       "window_update"  : test_window_update();
       "pure_fin_close" : test_pure_fin_close();
       "mss_option"     : test_mss_option();
+      "tx_segmentation": test_tx_segmentation();
 `ifdef NO_RX_BYPASS
       "rx_ooo_overlap" : test_rx_ooo_overlap();
       "seq_window_check": test_seq_window_check();
 `endif
       "rto_retransmit" : test_rto_retransmit();
       "fin_retransmit" : test_fin_retransmit();
+      "adaptive_rto"   : test_adaptive_rto();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 

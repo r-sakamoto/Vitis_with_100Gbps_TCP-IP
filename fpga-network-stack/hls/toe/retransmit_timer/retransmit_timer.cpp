@@ -48,6 +48,7 @@ using namespace hls;
  */
 void retransmit_timer(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetransmitTimer,
 						stream<txRetransmitTimerSet>&		txEng2timer_setRetransmitTimer,
+						stream<rtoUpdate>&					rtt2timer_rtoUpdate,
 						stream<event>&						rtTimer2eventEng_setEvent,
 						stream<ap_uint<16> >&				rtTimer2stateTable_releaseState,
 						stream<appNotification>&			rtTimer2rxApp_notification,
@@ -81,7 +82,9 @@ void retransmit_timer(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetrans
 	{
 		if (!rt_update.stop)
 		{
-			retransmitTimerTable[rt_update.sessionID].time = TIME_1s;
+			// partial ACK: restart with the measured RTO (0 = not yet measured)
+			ap_uint<32> entryRto = retransmitTimerTable[rt_update.sessionID].rto;
+			retransmitTimerTable[rt_update.sessionID].time = (entryRto == 0) ? TIME_1s : entryRto;
 		}
 		else
 		{
@@ -95,6 +98,12 @@ void retransmit_timer(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetrans
 	{
 		rxEng2timer_clearRetransmitTimer.read(rt_update);
 		rt_waitForWrite = true;
+	}
+	else if (!rtt2timer_rtoUpdate.empty())
+	{
+		// smoothed RTO from the RTT estimator (RFC 6298)
+		rtoUpdate rttUpd = rtt2timer_rtoUpdate.read();
+		retransmitTimerTable[rttUpd.sessionID].rto = rttUpd.rto;
 	}
 	else
 	{
@@ -129,24 +138,11 @@ void retransmit_timer(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetrans
 			currEntry.type = set.type;
 			if (!currEntry.active)
 			{
-				switch(currEntry.retries)
-				{
-				case 0:
-					currEntry.time = TIME_1s; //TIME_5s;
-					break;
-				case 1:
-					currEntry.time = TIME_5s; //TIME_7s;
-					break;
-				case 2:
-					currEntry.time = TIME_10s; //TIME_15s;
-					break;
-				case 3:
-					currEntry.time = TIME_15s; //TIME_20s;
-					break;
-				default:
-					currEntry.time = TIME_30s; //TIME_30s;
-					break;
-				}
+				// RFC 6298: measured RTO with exponential backoff (2^retries),
+				// clamped to RTO_MAX. rto == 0 means no RTT sample yet -> 1s.
+				ap_uint<32> baseRto = (currEntry.rto == 0) ? TIME_1s : currEntry.rto;
+				ap_uint<32> backedOff = baseRto << currEntry.retries;
+				currEntry.time = (backedOff > TIME_30s) ? TIME_30s : backedOff;
 			}
 			currEntry.active = true;
 			break;

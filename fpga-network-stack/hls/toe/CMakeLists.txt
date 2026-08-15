@@ -53,6 +53,7 @@ set(EXAMPLE_HLS_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/port_table/port_table.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/probe_timer/probe_timer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/retransmit_timer/retransmit_timer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/rtt_estimator/rtt_estimator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/rx_app_if/rx_app_if.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/rx_app_stream_if/rx_app_stream_if.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/rx_engine/rx_engine.cpp

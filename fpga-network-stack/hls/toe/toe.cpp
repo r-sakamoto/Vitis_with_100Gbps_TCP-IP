@@ -34,6 +34,7 @@
 #include "rx_sar_table/rx_sar_table.hpp"
 #include "tx_sar_table/tx_sar_table.hpp"
 #include "retransmit_timer/retransmit_timer.hpp"
+#include "rtt_estimator/rtt_estimator.hpp"
 #include "probe_timer/probe_timer.hpp"
 #include "close_timer/close_timer.hpp"
 #include "event_engine/event_engine.hpp"
@@ -81,6 +82,7 @@ void timerCloseMerger(stream<ap_uint<16> >& in1, stream<ap_uint<16> >& in2, stre
  */
 void timerWrapper(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetransmitTimer,
 					stream<txRetransmitTimerSet>&		txEng2timer_setRetransmitTimer,
+					stream<rtoUpdate>&					rtt2timer_rtoUpdate,
 					stream<ap_uint<16> >&				rxEng2timer_clearProbeTimer,
 					stream<ap_uint<16> >&				txEng2timer_setProbeTimer,
 					stream<ap_uint<16> >&				rxEng2timer_setCloseTimer,
@@ -107,6 +109,7 @@ void timerWrapper(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetransmitT
 
 	retransmit_timer(	rxEng2timer_clearRetransmitTimer,
 						txEng2timer_setRetransmitTimer,
+						rtt2timer_rtoUpdate,
 						rtTimer2eventEng_setEvent,
 						rtTimer2stateTable_releaseState,
 						rtTimer2rxApp_notification,
@@ -607,6 +610,16 @@ void toe(	// Data & Memory Interface
 	static stream<event>					rxApp2eventEng_setEvent("rxApp2eventEng_setEvent");
 	#pragma HLS stream variable=rxApp2eventEng_setEvent		depth=16
 	#pragma HLS aggregate variable=rxApp2eventEng_setEvent compact=bit
+	// RTT estimation (RFC 6298)
+	static stream<rttEvent>					txEng2rtt_event("txEng2rtt_event");
+	#pragma HLS stream variable=txEng2rtt_event		depth=8
+	#pragma HLS aggregate variable=txEng2rtt_event compact=bit
+	static stream<rttAck>					rxEng2rtt_ack("rxEng2rtt_ack");
+	#pragma HLS stream variable=rxEng2rtt_ack		depth=8
+	#pragma HLS aggregate variable=rxEng2rtt_ack compact=bit
+	static stream<rtoUpdate>				rtt2timer_rtoUpdate("rtt2timer_rtoUpdate");
+	#pragma HLS stream variable=rtt2timer_rtoUpdate		depth=8
+	#pragma HLS aggregate variable=rtt2timer_rtoUpdate compact=bit
 	//static stream<event>					appStreamEventFifo("appStreamEventFifo");
 	//static stream<event>					retransmitEventFifo("retransmitEventFifo");
 	static stream<event>					timer2eventEng_setEvent("timer2eventEng_setEvent");
@@ -710,8 +723,11 @@ void toe(	// Data & Memory Interface
 					portTable2rxApp_listen_rsp,
 					portTable2txApp_port_rsp);
 	// Timers
+	rtt_estimator(txEng2rtt_event, rxEng2rtt_ack, rtt2timer_rtoUpdate);
+
 	timerWrapper(	rxEng2timer_clearRetransmitTimer,
 					txEng2timer_setRetransmitTimer,
+					rtt2timer_rtoUpdate,
 					rxEng2timer_clearProbeTimer,
 					txEng2timer_setProbeTimer,
 					rxEng2timer_setCloseTimer,
@@ -760,6 +776,7 @@ void toe(	// Data & Memory Interface
 				rxEng2timer_setCloseTimer,
 				conEstablishedFifo, //remove this
 				rxEng2eventEng_setEvent,
+				rxEng2rtt_ack,
 #if !(RX_DDR_BYPASS)
 				rxBufferWriteCmd,
 				rxEng2rxApp_notification
@@ -785,7 +802,8 @@ void toe(	// Data & Memory Interface
 				txBufferReadCmd,
 				txEng2sLookup_rev_req,
 				ipTxData,
-				txEngFifoReadCount);
+				txEngFifoReadCount,
+				txEng2rtt_event);
 
 	/*
 	 * Application Interfaces

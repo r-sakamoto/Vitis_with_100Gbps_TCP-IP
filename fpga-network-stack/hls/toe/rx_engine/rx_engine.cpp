@@ -1032,6 +1032,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						stream<openStatus>&						openConStatusOut,
 						stream<event>&							rxEng2eventEng_setEvent,
 						stream<bool>&							dropDataFifoOut,
+						stream<rttAck>&							rxEng2rtt_ack,
 #if !(RX_DDR_BYPASS)
 						stream<mmCmd>&							rxBufferWriteCmd,
 						stream<appNotification>&				rxEng2rxApp_notification)
@@ -1118,6 +1119,8 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					{
 						// Notify probeTimer about new ACK
 						rxEng2timer_clearProbeTimer.write(fsm_meta.sessionID);
+						// Report the cumulative ACK to the RTT estimator
+						rxEng2rtt_ack.write(rttAck(fsm_meta.sessionID, fsm_meta.meta.ackNumb));
 						// Check for SlowStart & Increase Congestion Window
 						if (txSar.cong_window <= (txSar.slowstart_threshold-MSS))
 						{
@@ -2048,6 +2051,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 				stream<ap_uint<16> >&				rxEng2timer_setCloseTimer,
 				stream<openStatus>&					openConStatusOut,
 				stream<extendedEvent>&				rxEng2eventEng_setEvent,
+				stream<rttAck>&						rxEng2rtt_ack,
 #if !(RX_DDR_BYPASS)
 				stream<mmCmd>&						rxBufferWriteCmd,
 				stream<appNotification>&			rxEng2rxApp_notification)
@@ -2224,6 +2228,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 							openConStatusOut,
 							rxEng_fsmEventFifo,
 							rxEng_fsmDropFifo,
+							rxEng2rtt_ack,
 #if !(RX_DDR_BYPASS)
 							rxTcpFsm2wrAccessBreakdown,
 							rx_internalNotificationFifo);
@@ -2267,6 +2272,7 @@ template void rx_engine<DATA_WIDTH>(	stream<net_axis<DATA_WIDTH> >&					ipRxData
 				stream<ap_uint<16> >&				rxEng2timer_setCloseTimer,
 				stream<openStatus>&					openConStatusOut,
 				stream<extendedEvent>&				rxEng2eventEng_setEvent,
+				stream<rttAck>&						rxEng2rtt_ack,
 #if !(RX_DDR_BYPASS)
 				stream<mmCmd>&						rxBufferWriteCmd,
 				stream<appNotification>&			rxEng2rxApp_notification);
