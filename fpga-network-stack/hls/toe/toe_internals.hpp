@@ -144,6 +144,9 @@ struct rxSarEntry
 	bool sackEnabled; //SACK permitted was negotiated on this session
 	bool tsEnabled;   //RFC 7323 timestamps negotiated on this session
 	ap_uint<32> tsRecent; //TS.Recent: last valid peer TSval
+	//receiver SWS avoidance (RFC 1122 4.2.3.3): the advertised right window
+	//edge only advances in steps of at least one MSS
+	ap_uint<32> advEdge;
 };
 
 struct rxSarReply

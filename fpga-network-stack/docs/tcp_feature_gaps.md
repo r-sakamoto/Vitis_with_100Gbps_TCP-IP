@@ -47,7 +47,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | ウィンドウ更新通知 | **実装済** (F1, `window_update`テスト): app読出しでappdが進むとACKイベントを発行しwindow update ACKを送出 | 即時window update | 完了 |
 | ゼロウィンドウプローブ | **実装済** (Z1, `zero_window_probe`テスト): rx側がゼロウィンドウ広告でpersistタイマ(50ms)をセット、満了でseq=snd_nxt-1の純ACKプローブ送出(相手が現ウィンドウを返答)、ウィンドウ回復のACKで解除+送信再開イベント。probe_timerは統一read-modify-writeパスに書換え(書込み順序ハザード根治) | RFC 1122準拠persist | 完了 |
 | Delayed ACK | 64µs固定(Linuxの40msの約1/600)。イベント負荷で無限延期あり得る (`ack_delay.cpp`) | 40ms/クオックACK | ★ |
-| SWS回避 | 送受とも**なし**(受信側クランプはコメントアウト `tx_engine.cpp:936-940`) | あり | ★★ |
+| SWS回避 | **受信側実装済** (W1, `sws_avoidance`テスト): rx_sar_tableに影のadvertised edgeを導入、広告ウィンドウ右端は1 MSS以上の単位でのみ前進(RFC 1122 4.2.3.3)。送信側SWS(Nagle)はTCP_NODELAY=1のため対象外 | あり | 完了(受信側) |
 | Keepalive | **実装済** (N2, `keepalive`テスト): 新モジュール`keepalive_timer`(RFC 1122 4.2.3.6)。受信セグメントごとにアイドルタイマをリセット、60秒無通信でseq=snd_nxt-1の純ACKプローブを10秒間隔で最大4回送出、無応答なら切断(app通知closed+セッション解放)。Linuxのデフォルト(7200s/75s/9probes)より積極的な定数だがハードコード | SO_KEEPALIVE | 完了 |
 
 ## 4. コネクション管理・ステートマシン

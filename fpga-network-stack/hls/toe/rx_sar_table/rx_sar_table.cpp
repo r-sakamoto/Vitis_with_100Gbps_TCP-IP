@@ -52,10 +52,11 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 
 #pragma HLS PIPELINE II=1
 
-#pragma HLS bind_storage variable=rx_table type=RAM_1P impl=BRAM
+#pragma HLS bind_storage variable=rx_table type=RAM_T2P impl=BRAM
 #pragma HLS DEPENDENCE variable=rx_table inter false
 
-	// Read only access from the Tx Engine
+	// Access from the Tx Engine: read, plus a conditional advance of the
+	// SWS-avoidance advertised edge
 	if(!txEng2rxSar_req.empty())
 	{
 		ap_uint<16> addr = txEng2rxSar_req.read();
@@ -64,11 +65,27 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 
 		//Pre-calculated usedLength, windowSize to improve timing in metaLoader
 #if (WINDOW_SCALE)
-				ap_uint<WINDOW_BITS> actualWindowSize = (entry.appd - ((ap_uint<WINDOW_BITS>)entry.recvd)) - 1; // This works even for wrap around
-				reply.windowSize = actualWindowSize >> entry.win_shift;
+		ap_uint<WINDOW_BITS> actualWindowSize = (entry.appd - ((ap_uint<WINDOW_BITS>)entry.recvd)) - 1; // This works even for wrap around
 #else
-				//This works even for wrap around
-				reply.windowSize = (entry.appd - ((ap_uint<16>)entry.recvd)) - 1; // This works even for wrap around
+		ap_uint<WINDOW_BITS> actualWindowSize = (entry.appd - ((ap_uint<16>)entry.recvd)) - 1; // This works even for wrap around
+#endif
+		//receiver SWS avoidance (RFC 1122 4.2.3.3): advance the advertised
+		//right edge only in steps of at least one MSS; the edge itself never
+		//moves left, the window still shrinks naturally as recvd advances
+		ap_uint<32> newEdge = entry.recvd + actualWindowSize;
+		ap_uint<32> advEdge = entry.advEdge;
+		if (seq_geq(newEdge, advEdge + (ap_uint<32>)MSS))
+		{
+			advEdge = newEdge;
+			rx_table[addr].advEdge = newEdge;
+		}
+		ap_uint<WINDOW_BITS> advWindow = seq_lt(advEdge, entry.recvd)
+				? (ap_uint<WINDOW_BITS>)0
+				: (ap_uint<WINDOW_BITS>)(advEdge - entry.recvd);
+#if (WINDOW_SCALE)
+		reply.windowSize = advWindow >> entry.win_shift;
+#else
+		reply.windowSize = advWindow;
 #endif
 
 		rxSar2txEng_rsp.write(reply);
@@ -108,6 +125,8 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 					rx_table[in_recvd.sessionID].appd = in_recvd.recvd;
 					rx_table[in_recvd.sessionID].sackEnabled = in_recvd.sackEnabled;
 					rx_table[in_recvd.sessionID].tsEnabled = in_recvd.tsEnabled;
+					//initial advertised edge: the whole (empty) buffer
+					rx_table[in_recvd.sessionID].advEdge = in_recvd.recvd + (BUFFER_SIZE - 1);
 #if (WINDOW_SCALE)
 					rx_table[in_recvd.sessionID].win_shift = in_recvd.win_shift;
 #endif

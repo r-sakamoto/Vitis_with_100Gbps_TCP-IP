@@ -3233,6 +3233,66 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // W1: receiver SWS avoidance (RFC 1122 4.2.3.3). The advertised window
+  // right edge only advances in steps of >= 1 MSS: freeing 700B must not
+  // grow the advertised window; freeing another 800B (cumulative 1500) must
+  // grow it by exactly 1500 (>> win_shift).
+  task automatic test_sws_avoidance();
+    bytes_t p;
+    bit ok, got;
+    notif_t n;
+    byte unsigned rdata[$];
+    bit [15:0] sid;
+    bit [15:0] w0, w1, w2;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd41700);
+    if (err_count) return;
+
+    // segments sized so the app can read exactly per packet boundary
+    peer_send_seg(F_ACK, gen_payload(700, 8'h71));
+    wait_notif(n, 200000, ok); if (!ok) begin tb_error("notif 700"); return; end
+    sid = n.sessionID; peer_seq += 700;
+    peer_send_seg(F_ACK, gen_payload(800, 8'h72));
+    wait_notif(n, 200000, ok); if (!ok) begin tb_error("notif 800"); return; end
+    peer_seq += 800;
+    peer_send_seg(F_ACK, gen_payload(1000, 8'h73));
+    wait_notif(n, 200000, ok); if (!ok) begin tb_error("notif 1000"); return; end
+    peer_seq += 1000;
+
+    // ACK covering all 2500B carries the shrunken window
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for ACK of 2500B"); return; end
+      if ((f_flags(p) & F_ACK) && f_ack(p) == peer_seq) begin w0 = f_win(p); got = 1; end
+    end
+    while (net_pkts.size() > 0) void'(net_pkts.pop_front());
+
+    // free 700B: below one MSS -> the update ACK must advertise the SAME window
+    app_read(sid, 700, rdata);
+    tb_check(rdata.size() == 700, "app_read 700B");
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for update ACK (700B)"); return; end
+      if ((f_flags(p) & F_ACK) && f_payload_len(p) == 0) begin w1 = f_win(p); got = 1; end
+    end
+    tb_check(w1 == w0, $sformatf("window unchanged after 700B freed (SWS): %0d vs %0d", w1, w0));
+
+    // free another 800B: cumulative 1500 >= MSS -> edge advances by 1500
+    app_read(sid, 800, rdata);
+    tb_check(rdata.size() == 800, "app_read 800B");
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for update ACK (800B)"); return; end
+      if ((f_flags(p) & F_ACK) && f_payload_len(p) == 0 && f_win(p) != w1) begin w2 = f_win(p); got = 1; end
+    end
+    tb_check(w2 == w1 + (16'd1500 >> 2), $sformatf("window grew by 1500>>2 (%0d -> %0d)", w1, w2));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   //---------------------------------------------------------------------------
   // Main
   //---------------------------------------------------------------------------
@@ -3291,6 +3351,7 @@ module tb_toe_top;
       "time_wait_ack"  : test_time_wait_ack();
       "isn_quality"    : test_isn_quality();
       "zero_window_probe" : test_zero_window_probe();
+      "sws_avoidance"  : test_sws_avoidance();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 
