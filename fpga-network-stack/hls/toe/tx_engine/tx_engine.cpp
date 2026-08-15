@@ -420,6 +420,16 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					// unambiguous, discard it (Karn's algorithm)
 					txEng2rtt_event.write(rttEvent(ml_curEvent.sessionID, 0, 1));
 				}
+				// RFC 2018 selective retransmit: if the retransmit pointer sits
+				// inside the range the peer has already SACKed, skip over it
+				if (txSar.peerSackValid
+					&& seq_geq(txSar.ackd, txSar.peerSackStart) && seq_lt(txSar.ackd, txSar.peerSackEnd)
+					&& seq_leq(txSar.peerSackEnd, txSar.ackd + txSar.usedLength))
+				{
+					ap_uint<32> sackSkip32 = txSar.peerSackEnd - txSar.ackd;
+					txSar.ackd += sackSkip32;
+					txSar.usedLength -= sackSkip32(WINDOW_BITS-1, 0);
+				}
 				// usedLength counts the FIN's phantom sequence byte once finSent
 				// is set; retransmitting it as payload emitted a bogus 1-byte
 				// data segment at the FIN's seq number (and inflated go-back-N
@@ -462,25 +472,33 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 
 				// Since we are retransmitting from txSar.ackd to txSar.not_ackd, this data is already inside the usableWindow
 				// => no check is required
-				// Only check if length is bigger than the session MSS
-				if (currLength > sessionMSS)
+				ap_uint<WINDOW_BITS> segLen = (currLength > sessionMSS) ? (ap_uint<WINDOW_BITS>)sessionMSS : currLength;
+				bool lastSegment = (segLen == currLength);
+				// clamp the segment so it does not overlap the SACKed range;
+				// the next iteration then jumps over that range
+				if (txSar.peerSackValid && seq_gt(txSar.peerSackStart, txSar.ackd)
+					&& seq_lt(txSar.peerSackStart, txSar.ackd + segLen))
+				{
+					ap_uint<32> tillSack32 = txSar.peerSackStart - txSar.ackd;
+					segLen = tillSack32(WINDOW_BITS-1, 0);
+					lastSegment = false;
+				}
+				meta.length = segLen;
+				if (!lastSegment)
 				{
 					// We stay in this state and sent immediately another packet
-					meta.length = sessionMSS;
-					txSar.ackd += sessionMSS;
-					txSar.usedLength -= sessionMSS;
+					txSar.ackd += segLen;
+					txSar.usedLength -= segLen;
 					// TODO replace with dynamic count, remove this
 					if (ml_segmentCount == 3)
 					{
 						// Should set a probe or sth??
-						//txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID, txSar.not_ackd, 1));
 						ml_FsmState = 0;
 					}
 					ml_segmentCount++;
 				}
 				else
 				{
-					meta.length = currLength;
 					if (txSar.finSent)
 					{
 						ml_curEvent.type = FIN;

@@ -60,6 +60,9 @@ struct rxEngineMetaData
 	ap_uint<4>	winScale;
 	ap_uint<16>	mss; //peer MSS from the SYN options (536 if absent)
 	ap_uint<1>	sackPermitted; //peer offered SACK in its SYN
+	ap_uint<1>	sackValid;     //segment carried a SACK block
+	ap_uint<32>	sackStart;
+	ap_uint<32>	sackEnd;
 //#endif
 	ap_uint<16> length;
 	ap_uint<1>	ack;

@@ -20,7 +20,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 |---|---|---|---|
 | MSSオプション(受信) | **実装済** (F4+P1, `mss_option`/`tx_segmentation`テスト): 実効MSS=min(peer,local)をセッション毎に保存し、初送・再送ともMSS超過書込みをDDR読出しで分割送信(バイパス複製ストリームは破棄モードで整合)。PMTUDは未 | 相手MSSとPMTUからMSSを決定 | ★(残: PMTUD) |
 | Window Scale(受信) | SYN時のみパース。**自側shiftは0か2の固定** (`rx_engine.cpp:1366,1429`)。相手shiftは**14超の値を無検証で格納** → `tx_sar_table.cpp:121` でビット範囲オーバーフロー(issue #42) | shift 0〜14を交渉、バッファサイズから導出 | ★★★ |
-| SACK / SACK-Permitted | **生成側実装済** (S1, `sack_rx_gen`テスト): SYNで常時SACK-Permitted提示、SYN-ACKは相手提示時のみエコー。ギャップ保持中のdup ACKに単一SACKブロック[offset,head)付与(単一ギャップOOOと1対1)。**解釈+選択再送(S2)は未** | あり(選択再送・D-SACK) | ★★(残: S2) |
+| SACK / SACK-Permitted | **実装済** (S1+S2, `sack_rx_gen`/`sack_selective_rtx`テスト): 交渉+単一ブロック生成(受信側)+相手SACKの解釈と選択的再送(SACK済み範囲をスキップする2領域再送)。単一ブロックのみ(複数ブロック/D-SACKは未) | あり(選択再送・D-SACK) | ★(残: 複数ブロック) |
 | Timestamps (RFC 7323) | **なし** → PAWSなし、RTT計測なし | あり | ★★★ |
 | ECN (ECE/CWR/ECT) | **なし**。フラグは常時0固定 (`toe_internals.hpp:522`) | あり | ★ |
 | オプションパーサの正当性 | dataOffsetの単位バグ(ワード vs バイト混在, issue #43)、不正オプション列でRXパイプラインがストールし得る (`rx_engine.cpp:645-700,730-738`) | — | ★★★(バグ修正) |
@@ -32,7 +32,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 |---|---|---|---|
 | RTT計測 / 適応RTO | **実装済** (P2, `adaptive_rto`テスト): 新モジュール`rtt_estimator`がKarn方式でRTT計測、RFC 6298のSRTT/RTTVAR→RTO=clamp(SRTT+4V, 250ms, 30s)。retransmit_timerはRTO×2^retriesの指数バックオフ化。Timestampsオプション(PAWS含む)は未 | SRTT/RTTVARによるRFC 6298、最小RTO 200ms | ★(残: TSopt) |
 | 再送回数上限 | 4回再送で**RSTも送らずセッション破棄** (`retransmit_timer.cpp:166-183`) | tcp_retries2(15回)、RST送信 | ★★ |
-| 再送方式 | go-back-N(ackd以降全部)、1回のRTOで最大4セグメント (`tx_engine.cpp:382-396`) | SACKベースの選択再送 | ★★★ |
+| 再送方式 | **改善済** (S2): peer SACKブロックの範囲をスキップする選択的再送(単一ブロック)。RTOあたり最大4セグメントの上限は残る | SACKベースの選択再送 | ★(残) |
 | Fast Retransmit | **実装済** (P3, `fast_recovery`テスト): 3rd dup ACKでssthresh=max(flight/2,2MSS)・cwnd=ssthresh+3MSS、dup ACK毎に+MSS膨張、回復脱出でcwnd=ssthresh収縮。NewReno partial-ACK再送はgo-back-N再送のため実質不要 | RFC 5681 fast recovery、partial ACK処理 | 完了 |
 | 輻輳制御 | **正規化済** (P3): cwnd初期=IW10(RFC 6928, sessMSSベース)、RTO後=1×MSS(loss window)、slow start+sessMSS、輻輳回避+sessMSS/4(MSS²/cwnd近似は未)。CUBIC/ABC/pacingは未 | CUBIC(デフォルト)ほか、ABC、pacing | ★(残) |
 | dup ACK判定 | **改善済** (P3): staleACK(snd_una以前)は輻輳状態に影響しない(seq_gtガード)。ウィンドウ不変チェックは未 | RFC 5681準拠 | ★(残) |

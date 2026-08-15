@@ -215,6 +215,10 @@ struct txSarEntry
 	bool		fastRetransmitted;
 	bool		finReady;
 	bool		finSent;
+	//latest SACK block advertised by the peer (RFC 2018)
+	ap_uint<32>	peerSackStart;
+	ap_uint<32>	peerSackEnd;
+	bool		peerSackValid;
 };
 
 struct rxTxSarQuery
@@ -231,18 +235,22 @@ struct rxTxSarQuery
 	ap_uint<16> mss; //only valid on init
 	ap_uint<WINDOW_BITS> ssthresh; //only applied when writeSsthresh is set
 	ap_uint<1> writeSsthresh;
+	//peer SACK block state after this ACK (stored verbatim)
+	ap_uint<32>	peerSackStart;
+	ap_uint<32>	peerSackEnd;
+	ap_uint<1>	peerSackValid;
 	ap_uint<1> write;
 	ap_uint<1>	init;
 	rxTxSarQuery () {}
 	rxTxSarQuery(ap_uint<16> id)
-				:sessionID(id), ackd(0), recv_window(0), cong_window(0), count(0), fastRetransmitted(false), mss(MSS), ssthresh(0), writeSsthresh(0), write(0), init(0) {}
+				:sessionID(id), ackd(0), recv_window(0), cong_window(0), count(0), fastRetransmitted(false), mss(MSS), ssthresh(0), writeSsthresh(0), peerSackStart(0), peerSackEnd(0), peerSackValid(0), write(0), init(0) {}
 	rxTxSarQuery(ap_uint<16> id, ap_uint<32> ackd, ap_uint<16> recv_win, ap_uint<WINDOW_BITS> cong_win, ap_uint<2> count, bool fastRetransmitted)
-				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), mss(MSS), ssthresh(0), writeSsthresh(0), write(1), init(0) {}
+				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), mss(MSS), ssthresh(0), writeSsthresh(0), peerSackStart(0), peerSackEnd(0), peerSackValid(0), write(1), init(0) {}
 #if (WINDOW_SCALE)
 	rxTxSarQuery(ap_uint<16> id, ap_uint<32> ackd, ap_uint<16> recv_win, ap_uint<WINDOW_BITS> cong_win, ap_uint<2> count, bool fastRetransmitted, ap_uint<4> win_shift)
-				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), win_shift(win_shift), mss(MSS), ssthresh(0), writeSsthresh(0), write(1), init(1) {}
+				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), win_shift(win_shift), mss(MSS), ssthresh(0), writeSsthresh(0), peerSackStart(0), peerSackEnd(0), peerSackValid(0), write(1), init(1) {}
 	rxTxSarQuery(ap_uint<16> id, ap_uint<32> ackd, ap_uint<16> recv_win, ap_uint<WINDOW_BITS> cong_win, ap_uint<2> count, bool fastRetransmitted, ap_uint<4> win_shift, ap_uint<16> mss)
-				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), win_shift(win_shift), mss(mss), ssthresh(0), writeSsthresh(0), write(1), init(1) {}
+				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), win_shift(win_shift), mss(mss), ssthresh(0), writeSsthresh(0), peerSackStart(0), peerSackEnd(0), peerSackValid(0), write(1), init(1) {}
 #endif
 };
 
@@ -303,9 +311,12 @@ struct rxTxSarReply
 	ap_uint<2>	count;
 	bool		fastRetransmitted;
 	ap_uint<16>	mss; //effective segment size: min(peer MSS, local MSS)
+	ap_uint<32>	peerSackStart;
+	ap_uint<32>	peerSackEnd;
+	bool		peerSackValid;
 	rxTxSarReply() {}
 	rxTxSarReply(ap_uint<32> ack, ap_uint<32> next, ap_uint<WINDOW_BITS> cong_win, ap_uint<WINDOW_BITS> sstresh, ap_uint<2> count, bool fastRetransmitted)
-			:prevAck(ack), nextByte(next), cong_window(cong_win), slowstart_threshold(sstresh), count(count), fastRetransmitted(fastRetransmitted), mss(MSS) {}
+			:prevAck(ack), nextByte(next), cong_window(cong_win), slowstart_threshold(sstresh), count(count), fastRetransmitted(fastRetransmitted), mss(MSS), peerSackStart(0), peerSackEnd(0), peerSackValid(false) {}
 };
 
 struct txAppTxSarReply
@@ -370,6 +381,9 @@ struct txTxSarReply
 	ap_uint<4>	win_shift;
 //#endif
 	ap_uint<16> mss; //effective segment size: min(peer MSS, local MSS)
+	ap_uint<32>	peerSackStart;
+	ap_uint<32>	peerSackEnd;
+	bool		peerSackValid;
 	txTxSarReply() {}
 	txTxSarReply(ap_uint<32> ack, ap_uint<32> nack, ap_uint<WINDOW_BITS> usableWindow, ap_uint<WINDOW_BITS> app, ap_uint<WINDOW_BITS> usedLength, bool finReady, bool finSent)
 		:ackd(ack), not_ackd(nack), usableWindow(usableWindow), app(app), usedLength(usedLength), finReady(finReady), finSent(finSent), mss(MSS) {}

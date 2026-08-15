@@ -806,6 +806,16 @@ module tb_toe_top;
     return 0;
   endfunction
 
+  // 12-byte option list with one SACK block: NOP NOP kind=5 len=10 start end
+  function automatic bytes_t sack_opt(input bit [31:0] sstart, input bit [31:0] send_);
+    bytes_t o;
+    o = new[12];
+    o[0] = 8'h01; o[1] = 8'h01; o[2] = 8'h05; o[3] = 8'h0A;
+    o[4] = sstart[31:24]; o[5] = sstart[23:16]; o[6] = sstart[15:8]; o[7] = sstart[7:0];
+    o[8] = send_[31:24];  o[9] = send_[23:16]; o[10] = send_[15:8]; o[11] = send_[7:0];
+    return o;
+  endfunction
+
   function automatic bytes_t gen_payload(input int len, input byte unsigned seed);
     bytes_t d;
     d = new[len];
@@ -1836,6 +1846,147 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // S2 regression: SACK blocks from the peer suppress retransmission of the
+  // already-received range - selective retransmit instead of pure go-back-N.
+  task automatic test_sack_selective_rtx();
+    bytes_t p, pay;
+    bit ok, ok2;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] d0;
+    int got, rt_bytes, soff;
+    bytes_t d;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+    peer_port = 16'd41120; toe_port = 16'd80;
+    peer_seq  = 32'h9000_0000; peer_win = 16'hFFFF;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, 0, F_SYN, 16'hFFFF, syn_options_sack(), no_bytes()));
+    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 100000, 1);
+    if (err_count) return;
+    peer_ack = f_seq(p) + 1;
+    peer_seq += 1;
+    peer_send_seg(F_ACK, no_bytes());
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    // --- scenario A: first segment lost, peer SACKs [d0+1000, d0+4000) ---
+    for (int i = 0; i < 4; i++) begin
+      pay = gen_payload(1000, 8'h40 + i[7:0]);
+      app_send(sid, pay, rsp);
+      tb_check(rsp.error == 0, $sformatf("app_send A%0d accepted", i));
+    end
+    got = 0;
+    while (got < 4) begin
+      wait_pkt(p, 400000, ok2);
+      if (!ok2) begin tb_error("timeout collecting A data"); return; end
+      if (f_payload_len(p) == 1000) begin
+        if (got == 0) d0 = f_seq(p);
+        got++;
+      end
+    end
+    for (int i = 0; i < 3; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, d0, F_ACK, peer_win,
+                        sack_opt(d0 + 1000, d0 + 4000), no_bytes()));
+      repeat (100) @(posedge ap_clk);
+    end
+    rt_bytes = 0;
+    while (rt_bytes < 1000) begin
+      wait_pkt(p, 500000, ok2);
+      if (!ok2) begin tb_error("timeout waiting for selective rtx (A)"); return; end
+      if (f_payload_len(p) == 0) continue;
+      soff = f_seq(p) - d0;
+      tb_check(soff >= 0 && soff + f_payload_len(p) <= 1000,
+               $sformatf("rtx seq-off=%0d len=%0d stays outside the SACKed range",
+                         soff, f_payload_len(p)));
+      if (soff < 0 || soff + f_payload_len(p) > 1000) return;
+      rt_bytes += f_payload_len(p);
+    end
+    tb_check(rt_bytes == 1000, "exactly the missing 1000B retransmitted (A)");
+    // no further data may follow (the SACKed 3000B must not be resent)
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 200000, ok2);
+      if (!ok2) got = 1;
+      else if (f_payload_len(p) != 0) begin
+        tb_check(0, $sformatf("unexpected rtx of SACKed data at seq-off=%0d", f_seq(p) - d0));
+        return;
+      end
+    end
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 4000, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+
+    // --- scenario B: middle hole, peer SACKs [b+1000, b+3000) ---
+    // fresh connection: scenario A's recovery correctly deflated cwnd to
+    // ssthresh (2000), which would reject 4 back-to-back 1000B writes
+    begin
+      bit [31:0] b;
+      peer_port = 16'd41121;
+      peer_seq  = 32'h9100_0000; peer_win = 16'hFFFF;
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, 0, F_SYN, 16'hFFFF, syn_options_sack(), no_bytes()));
+      expect_flags(F_SYN | F_ACK, "SYN-ACK (B)", p, 100000, 1);
+      if (err_count) return;
+      peer_ack = f_seq(p) + 1;
+      peer_seq += 1;
+      peer_send_seg(F_ACK, no_bytes());
+      peer_send_seg(F_ACK, gen_payload(8, 8'h02));
+      wait_notif(n, 200000, ok);
+      tb_check(ok, "data notification (B)");
+      if (!ok) return;
+      sid = n.sessionID;
+      peer_seq += 8;
+      expect_flags(F_ACK, "ACK of 8B (B)", p, 400000, 0);
+      for (int i = 0; i < 4; i++) begin
+        pay = gen_payload(1000, 8'h80 + i[7:0]);
+        app_send(sid, pay, rsp);
+        tb_check(rsp.error == 0, $sformatf("app_send B%0d accepted", i));
+      end
+      got = 0;
+      while (got < 4) begin
+        wait_pkt(p, 400000, ok2);
+        if (!ok2) begin tb_error("timeout collecting B data"); return; end
+        if (f_payload_len(p) == 1000) begin
+          if (got == 0) b = f_seq(p);
+          got++;
+        end
+      end
+      for (int i = 0; i < 3; i++) begin
+        net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                          peer_seq, b, F_ACK, peer_win,
+                          sack_opt(b + 1000, b + 3000), no_bytes()));
+        repeat (100) @(posedge ap_clk);
+      end
+      rt_bytes = 0;
+      while (rt_bytes < 2000) begin
+        wait_pkt(p, 500000, ok2);
+        if (!ok2) begin tb_error("timeout waiting for selective rtx (B)"); return; end
+        if (f_payload_len(p) == 0) continue;
+        soff = f_seq(p) - b;
+        tb_check((soff >= 0 && soff + f_payload_len(p) <= 1000) ||
+                 (soff >= 3000 && soff + f_payload_len(p) <= 4000),
+                 $sformatf("rtx seq-off=%0d len=%0d avoids the SACKed hole",
+                           soff, f_payload_len(p)));
+        if (!((soff >= 0 && soff + f_payload_len(p) <= 1000) ||
+              (soff >= 3000 && soff + f_payload_len(p) <= 4000))) return;
+        rt_bytes += f_payload_len(p);
+      end
+      tb_check(rt_bytes == 2000, "both unSACKed regions retransmitted (B)");
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, b + 4000, F_ACK, peer_win, no_bytes(), no_bytes()));
+    end
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   // F3 regression: a FIN carrying no ACK flag must still close the
   // connection (it previously fell into the ignored default flag case).
   task automatic test_pure_fin_close();
@@ -2516,6 +2667,7 @@ module tb_toe_top;
       "mss_option"     : test_mss_option();
       "tx_segmentation": test_tx_segmentation();
       "fast_recovery"  : test_fast_recovery();
+      "sack_selective_rtx": test_sack_selective_rtx();
 `ifdef NO_RX_BYPASS
       "rx_ooo_overlap" : test_rx_ooo_overlap();
       "seq_window_check": test_seq_window_check();
