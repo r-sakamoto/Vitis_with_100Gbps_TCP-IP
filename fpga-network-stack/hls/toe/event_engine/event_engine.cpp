@@ -77,7 +77,9 @@ void event_engine(	stream<event>&				txApp2eventEng_setEvent,
 		{
 			rxEng2eventEng_setEvent.read(ev);
 			eventEng2txEng_event.write(ev);
+			#ifndef __SYNTHESIS__
 			std::cout<<"rxEng2eventEng_setEvent:"<<ev.type<<std::endl;
+			#endif
 			ee_writeCounter++;
 		}
 		else if (ee_writeCounter == ee_adReadCounter && ee_adWriteCounter == ee_txEngReadCounter)
@@ -87,14 +89,18 @@ void event_engine(	stream<event>&				txApp2eventEng_setEvent,
 			{
 				timer2eventEng_setEvent.read(ev);
 				eventEng2txEng_event.write(ev);
+				#ifndef __SYNTHESIS__
 				std::cout<<"timer2eventEng_setEvent:"<<ev.type<<std::endl;
+				#endif
 				ee_writeCounter++;
 			}
 			else if (!txApp2eventEng_setEvent.empty())
 			{
 				txApp2eventEng_setEvent.read(ev);
 				eventEng2txEng_event.write(ev);
+				#ifndef __SYNTHESIS__
 				std::cout<<"txApp2eventEng_setEvent:"<<ev.type<<std::endl;
+				#endif
 				ee_writeCounter++;
 			}
 		}

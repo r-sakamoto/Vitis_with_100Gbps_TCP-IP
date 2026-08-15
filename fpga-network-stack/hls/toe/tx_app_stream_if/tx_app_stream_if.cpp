@@ -217,9 +217,13 @@ void tasi_pkg_pusher(hls::stream<mmCmd>&					tasi_meta2pkgPushCmd,
 		if (!appTxDataIn.empty())
 		{
 			net_axis<WIDTH> currWord = appTxDataIn.read();
+         #ifndef __SYNTHESIS__
          std::cout << "HELP: ";
+         #endif
         //  printLE(std::cout, currWord);
+         #ifndef __SYNTHESIS__
          std::cout << std::endl;
+         #endif
 			txBufferWriteData.write(currWord);
 			if (currWord.last)
 			{

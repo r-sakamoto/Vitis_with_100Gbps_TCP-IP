@@ -276,7 +276,12 @@ void reverseLookupTableInterface(	stream<revLupInsert>& revTableInserts,
 		releaseTuple = reverseLookupTable[sessionID];
 		if (tupleValid[sessionID]) // if valid
 		{
-			sLookup2portTable_releasePort.write(releaseTuple.myPort);
+			// myPort is stored in network byte order (see tx_app_if / rx path
+			// inserts), but free_port_table expects host order for both the
+			// ">= 32768" ephemeral-range check and the table index. Without
+			// this swap ephemeral ports were never released (and listen ports
+			// whose swapped value is >= 32768 freed an unrelated entry).
+			sLookup2portTable_releasePort.write(reverse(releaseTuple.myPort));
 			deleteCache.write(rtlSessionUpdateRequest(releaseTuple, sessionID, DELETE, RX));
 		}
 		tupleValid[sessionID] = false;

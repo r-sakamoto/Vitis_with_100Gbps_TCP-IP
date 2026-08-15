@@ -59,7 +59,9 @@ void toe_process_ipv4(	stream<net_axis<WIDTH> >&		dataIn,
 			dataOut.write(currWord);
 			if (!metaWritten)
 			{
+				#ifndef __SYNTHESIS__
 				std::cout << std::dec << "RX length: " << header.getLength() << ", header length: " << header.getHeaderLength() << std::endl;
+				#endif
 				process2dropLengthFifo.write(header.getHeaderLength() - headerWordsDropped);
 				metaOut.write(pseudoMeta(header.getSrcAddr(), header.getDstAddr(), header.getLength() - (header.getHeaderLength()*4)));
 				metaWritten = true;
@@ -397,13 +399,17 @@ void rxCheckTCPchecksum(stream<net_axis<64> >&					dataIn,
 				if (csa_meta.length != 0)
 				{
 					validFifoOut.write(true);
+					#ifndef __SYNTHESIS__
 					std::cout<<"checksum correct"<<std::endl;
+					#endif
 				}
 			}
 			else if(csa_meta.length != 0)
 			{
 				validFifoOut.write(false);
+				#ifndef __SYNTHESIS__
 				std::cout<<"checksum not correct!!!"<<std::endl;
+				#endif
 			}
 			csa_checkChecksum = false;
 			csa_tcp_sums[0] = 0;
@@ -651,7 +657,10 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 
 	enum fsmStateType {IDLE, PARSE};
 	static fsmStateType state = IDLE;
-	static ap_uint<4> dataOffset;
+	// remaining option bytes: dataOffsetIn carries (dataOffset-5) in 32bit
+	// words (0..10), option space is therefore 0..40 bytes (issue #43: the
+	// old code compared the word count against byte lengths directly)
+	static ap_uint<6> remainingBytes;
 	static ap_uint<320> fields;
 
 	switch (state)
@@ -659,43 +668,75 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 	case IDLE:
 		if (!dataOffsetIn.empty() && !optionalHeaderFieldsIn.empty())
 		{
-			// std::cout << "PARSE IDLE" << std::endl;
+			ap_uint<4> dataOffset;
 			dataOffsetIn.read(dataOffset);
 			optionalHeaderFieldsIn.read(fields);
+			remainingBytes = ((ap_uint<6>)dataOffset) * 4;
 			state = PARSE;
 		}
 		break;
 	case PARSE:
+	{
 		ap_uint<8> optionKind = fields(7, 0);
 		ap_uint<8> optionLength = fields(15, 8);
+		bool done = false;
 
-		switch (optionKind)
+		if (remainingBytes == 0)
 		{
-		case 0: //End of option list
+			// walked the whole option list without finding window scale
 			windowScaleOut.write(0);
-			// std::cout << "PARSE EOL" << std::endl;
-			state = IDLE;
-			break;
-		case 1:
-			optionLength = 1;
-			break;
-		case 3:
-			// std::cout << "PARSE WS: " << (uint16_t)fields(19, 16) << std::endl;
-			windowScaleOut.write(fields(19, 16));
-			state = IDLE;
-			break;
-		default:
-			if (dataOffset == optionLength)
+			done = true;
+		}
+		else
+		{
+			switch (optionKind)
 			{
+			case 0: //End of option list
 				windowScaleOut.write(0);
-				// std::cout << "PARSE DONE" << std::endl;
-				state = IDLE;
-			}
-			break;
-		}//switch
-		dataOffset -= optionLength;
-		fields = (fields >> (optionLength*8));
+				done = true;
+				break;
+			case 1: //NOP
+				optionLength = 1;
+				break;
+			case 3: //Window scale
+				if (optionLength == 3 && remainingBytes >= 3)
+				{
+					// RFC 7323: shift counts larger than 14 must be clamped
+					// to 14 (issue #42: unclamped values overflow the
+					// scaled-window bit range in tx_sar_table)
+					ap_uint<4> ws = fields(19, 16);
+					windowScaleOut.write((ws > 14) ? (ap_uint<4>)14 : ws);
+				}
+				else
+				{
+					windowScaleOut.write(0); //malformed WS option
+				}
+				done = true;
+				break;
+			default:
+				// unknown option: a valid length is >= 2 and must fit into
+				// the remaining option space; anything else is malformed and
+				// would previously spin this FSM forever (len 0 -> shift by 0)
+				if (optionLength < 2 || optionLength > remainingBytes)
+				{
+					windowScaleOut.write(0);
+					done = true;
+				}
+				break;
+			}//switch
+		}
+
+		if (done)
+		{
+			state = IDLE;
+		}
+		else
+		{
+			remainingBytes -= optionLength;
+			fields = (fields >> (optionLength*8));
+		}
 		break;
+	}
 	}//switch
 }
 
@@ -769,7 +810,9 @@ void rxTcpInvalidDropper(stream<net_axis<WIDTH> >&				dataIn,
 	case GET_VALID: //Drop1
 		if (!validFifoIn.empty())
 		{
+			#ifndef __SYNTHESIS__
 			std::cout << "INVALID IN" << std::endl;
+			#endif
 			validFifoIn.read(valid);
 			if (valid)
 			{
@@ -788,7 +831,9 @@ void rxTcpInvalidDropper(stream<net_axis<WIDTH> >&				dataIn,
 			dataOut.write(currWord);
 			if (currWord.last)
 			{
+				#ifndef __SYNTHESIS__
 				std::cout << "INVALID 0" << std::endl;
+				#endif
 				rtid_state = GET_VALID;
 			}
 		}
@@ -799,7 +844,9 @@ void rxTcpInvalidDropper(stream<net_axis<WIDTH> >&				dataIn,
 			dataIn.read(currWord);
 			if (currWord.last)
 			{
+				#ifndef __SYNTHESIS__
 				std::cout << "INVALID 1" << std::endl;
+				#endif
 				rtid_state = GET_VALID;
 			}
 		}
@@ -1128,6 +1175,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						// ### No gap, packet comes in order
 						if (!rxSar.gap && (fsm_meta.meta.seqNumb == rxSar.recvd) && (free_space > fsm_meta.meta.length))
 						{
+							#ifndef __SYNTHESIS__
 							std::cout<<"RX_ACK: no gap in order";
 							std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
 							std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
@@ -1137,6 +1185,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							std::cout<<" length:"<<fsm_meta.meta.length;							
 							std::cout<<" gap:"<<rxSar.gap;
 							std::cout<<" free_space:"<<free_space<<std::endl;
+							#endif
 							//increment both head and recvd pointers
 							newRecvd = fsm_meta.meta.seqNumb+fsm_meta.meta.length;
 							newHead = fsm_meta.meta.seqNumb+fsm_meta.meta.length;
@@ -1151,6 +1200,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						// ### No gap, packet comes out-of-order
 						else if (!rxSar.gap && (fsm_meta.meta.seqNumb > rxSar.recvd) && (free_space > (fsm_meta.meta.seqNumb+fsm_meta.meta.length- rxSar.head)(WINDOW_BITS-1, 0)))
 						{
+							#ifndef __SYNTHESIS__
 							std::cout<<"RX_ACK: no gap ooo";
 							std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
 							std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
@@ -1160,6 +1210,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							std::cout<<" length:"<<fsm_meta.meta.length;							
 							std::cout<<" gap:"<<rxSar.gap;
 							std::cout<<" free_space:"<<free_space<<std::endl;
+							#endif
 							//increment head pointer, set offset to ooo sequence number
 							newHead = fsm_meta.meta.seqNumb+fsm_meta.meta.length;
 							newOffset = fsm_meta.meta.seqNumb;
@@ -1174,6 +1225,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						// ### Gap already exists, packet comes in-order after the head pointer
 						else if (rxSar.gap && (fsm_meta.meta.seqNumb == rxSar.head) && (free_space > fsm_meta.meta.length)  )
 						{
+							#ifndef __SYNTHESIS__
 							std::cout<<"RX_ACK: gap in order after head";
 							std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
 							std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
@@ -1183,6 +1235,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							std::cout<<" length:"<<fsm_meta.meta.length;		
 							std::cout<<" gap:"<<rxSar.gap;
 							std::cout<<" free_space:"<<free_space<<std::endl;
+							#endif
 							//increment head pointer
 							newHead = fsm_meta.meta.seqNumb+fsm_meta.meta.length;
 							//update head pointer
@@ -1196,6 +1249,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						// ### Gap alread exists, packet comes in-order after the recvd pointer
 						else if (rxSar.gap && (fsm_meta.meta.seqNumb == rxSar.recvd))
 						{
+							#ifndef __SYNTHESIS__
 							std::cout<<"RX_ACK: gap in order after recvd";
 							std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
 							std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
@@ -1205,19 +1259,28 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							std::cout<<" length:"<<fsm_meta.meta.length;		
 							std::cout<<" gap:"<<rxSar.gap;
 							std::cout<<" free_space:"<<free_space<<std::endl;
-							//fill the gap
-							if ((fsm_meta.meta.seqNumb + fsm_meta.meta.length) == rxSar.offset)
+							#endif
+							//fill the gap. This also covers retransmissions that
+							//OVERLAP the buffered premature data (seq+len > offset):
+							//previously that case fell through both branches without
+							//a SAR update or a drop token, wedging rxPackageDropper
+							//and the whole RX pipeline permanently.
+							if ((fsm_meta.meta.seqNumb + fsm_meta.meta.length) >= rxSar.offset)
 							{
-								newRecvd = rxSar.head;
-								rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, newRecvd, rxSar.head, rxSar.offset, false));
+								//overlapping bytes are rewritten with identical data;
+								//the segment may even extend past head
+								ap_uint<32> segEnd = fsm_meta.meta.seqNumb + fsm_meta.meta.length;
+								newRecvd = (segEnd > rxSar.head) ? segEnd : rxSar.head;
+								ap_uint<32> newAvailable = newRecvd - fsm_meta.meta.seqNumb;
+								rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, newRecvd, newRecvd, rxSar.offset, false));
 								//write to memory
 								rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
 								// Only notify about  new data available
-								rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, (rxSar.head - fsm_meta.meta.seqNumb)(WINDOW_BITS-1, 0), fsm_meta.srcIpAddress, fsm_meta.dstIpPort));
+								rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, newAvailable(WINDOW_BITS-1, 0), fsm_meta.srcIpAddress, fsm_meta.dstIpPort));
 								dropDataFifoOut.write(false);
 							}
 							//gap can not be filled
-							else if ((fsm_meta.meta.seqNumb + fsm_meta.meta.length) < rxSar.offset)
+							else
 							{
 								newRecvd = fsm_meta.meta.seqNumb + fsm_meta.meta.length;
 								rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, newRecvd, rxSar.head, rxSar.offset, rxSar.gap));
@@ -1232,6 +1295,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						else 
 						{
 							dropDataFifoOut.write(true);
+							#ifndef __SYNTHESIS__
 							std::cout<<"RX_DROP";
 							std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
 							std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
@@ -1241,6 +1305,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							std::cout<<" length:"<<fsm_meta.meta.length;		
 							std::cout<<" gap:"<<rxSar.gap;
 							std::cout<<" free_space:"<<free_space<<std::endl;
+							#endif
 						}
 
 					}
@@ -1351,6 +1416,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 			{
 				stateTable2rxEng_upd_rsp.read(tcpState);
 				rxSar2rxEng_upd_rsp.read(rxSar);
+				#ifndef __SYNTHESIS__
 				std::cout<<"RX_SYN: ";
 				std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
 				std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
@@ -1359,6 +1425,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				std::cout<<" offset:"<<rxSar.offset;
 				std::cout<<" length:"<<fsm_meta.meta.length;		
 				std::cout<<" gap:"<<rxSar.gap<<std::endl;
+				#endif
 				// std::cout<<" free_space"<<free_space<<std::endl;
 				if (tcpState == CLOSED || tcpState == SYN_SENT) // Actually this is LISTEN || SYN_SENT
 				{
@@ -1414,6 +1481,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				rxSar2rxEng_upd_rsp.read(rxSar);
 				txSar2rxEng_upd_rsp.read(txSar);
 				rxEng2timer_clearRetransmitTimer.write(rxRetransmitTimerUpdate(fsm_meta.sessionID, (fsm_meta.meta.ackNumb == txSar.nextByte)));
+				#ifndef __SYNTHESIS__
 				std::cout<<"RX_SYN_ACK: ";
 				std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
 				std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
@@ -1422,6 +1490,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				std::cout<<" offset:"<<rxSar.offset;
 				std::cout<<" length:"<<fsm_meta.meta.length;		
 				std::cout<<" gap:"<<rxSar.gap<<std::endl;
+				#endif
 				// std::cout<<" free_space"<<free_space<<std::endl;
 				if ((tcpState == SYN_SENT) && (fsm_meta.meta.ackNumb == txSar.nextByte))// && !mh_lup.created)
 				{
@@ -1463,6 +1532,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				stateTable2rxEng_upd_rsp.read(tcpState);
 				rxSar2rxEng_upd_rsp.read(rxSar);
 				txSar2rxEng_upd_rsp.read(txSar);
+				#ifndef __SYNTHESIS__
 				std::cout<<"RX_FIN: ";
 				std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
 				std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
@@ -1471,6 +1541,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				std::cout<<" offset:"<<rxSar.offset;
 				std::cout<<" length:"<<fsm_meta.meta.length;		
 				std::cout<<" gap:"<<rxSar.gap<<std::endl;
+				#endif
 				// std::cout<<" free_space"<<free_space<<std::endl;
 				rxEng2timer_clearRetransmitTimer.write(rxRetransmitTimerUpdate(fsm_meta.sessionID, (fsm_meta.meta.ackNumb == txSar.nextByte)));
 				// Check state and if FIN in order, Current out of order FINs are not accepted

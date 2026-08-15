@@ -31,6 +31,7 @@ set(TCP_STACK_NODELAY_EN 1 CACHE BOOL "Enabling TCP_NODELAY option")
 set(TCP_STACK_RX_DDR_BYPASS_EN 1 CACHE BOOL "Enabling DDR bypass on the RX path")
 set(TCP_STACK_FAST_RETRANSMIT_EN 1 CACHE BOOL "Enabling TCP fast retransmit")
 set(TCP_STACK_WINDOW_SCALING_EN 1 CACHE BOOL "Enabling TCP window scaling option")
+set(TCP_STACK_SIM_TIMER_SCALE 1 CACHE STRING "Divide protocol timers by this factor (simulation only, keep 1 for hardware)")
 
 # Find Xilinx Vitis HLS
 find_package(VitisHLS REQUIRED)

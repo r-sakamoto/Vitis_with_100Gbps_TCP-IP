@@ -128,14 +128,17 @@ void rxAppMemAccessBreakdown(stream<mmCmd> &inputMemAccess, stream<mmCmd> &outpu
 
 	static bool rxAppBreakdown = false;
 	static mmCmd rxAppTempCmd;
-	static ap_uint<16> rxAppAccLength = 0;
+	static ap_uint<WINDOW_BITS> rxAppAccLength = 0;
 
 	if (rxAppBreakdown == false) {
 		if (!inputMemAccess.empty())
  		{
 			rxAppTempCmd = inputMemAccess.read();
-			if ((rxAppTempCmd.saddr.range(15, 0) + rxAppTempCmd.bbt) > 65536) {
-				rxAppAccLength = 65536 - rxAppTempCmd.saddr;
+			// split only at the real end of the per-session circular buffer
+			// (BUFFER_SIZE = 1 << WINDOW_BITS); the old code split at a
+			// hard-coded 64KB boundary and resumed at the wrong address
+			if ((rxAppTempCmd.saddr.range(WINDOW_BITS-1, 0) + rxAppTempCmd.bbt) > BUFFER_SIZE) {
+				rxAppAccLength = BUFFER_SIZE - rxAppTempCmd.saddr.range(WINDOW_BITS-1, 0);
 				outputMemAccess.write(mmCmd(rxAppTempCmd.saddr, rxAppAccLength));
 				rxAppBreakdown = true;
 			}
@@ -146,10 +149,8 @@ void rxAppMemAccessBreakdown(stream<mmCmd> &inputMemAccess, stream<mmCmd> &outpu
 		}
 	}
 	else if (rxAppBreakdown == true) {
-		rxAppTempCmd.saddr.range(15, 0) = 0;
-		rxAppAccLength = rxAppTempCmd.bbt - rxAppAccLength;
-		outputMemAccess.write(mmCmd(rxAppTempCmd.saddr, rxAppAccLength));
-		//std::cerr << "Mem.Cmd: " << std::hex << rxAppTempCmd.saddr << " - " << rxAppTempCmd.bbt - (65536 - rxAppTempCmd.saddr) << std::endl;
+		rxAppTempCmd.saddr.range(WINDOW_BITS-1, 0) = 0;
+		outputMemAccess.write(mmCmd(rxAppTempCmd.saddr, rxAppTempCmd.bbt - rxAppAccLength));
 		rxAppBreakdown = false;
 	}
 }
@@ -241,7 +242,9 @@ void rxAppMemDataRead(	stream<net_axis<WIDTH> >&	rxBufferReadData,
 			if (temp.last == 1)													// If this is the last data word...
 				rxAppState = RXAPP_IDLE;										// Go back to the output state. Everything else is perfectly fine as is
 			rxDataRsp.write(temp);												// Finally, output the data word before changing states
+			#ifndef __SYNTHESIS__
 			std::cerr << "Mem.Data: " << std::hex << temp.data << " - " << temp.keep << " - " << temp.last << std::endl;
+			#endif
 		}
 		break;
 	case RXAPP_JOIN:															// This state performs the hand over from the 1st to the 2nd mem. access for this segment if a mem. access has occured

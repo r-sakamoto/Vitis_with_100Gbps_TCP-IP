@@ -191,6 +191,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					txEng2timer_setRetransmitTimer.write(txRetransmitTimerSet(ml_curEvent.sessionID));
 				}
 
+				#ifndef __SYNTHESIS__
 				std::cout<<"TX";
 				std::cout<<std::dec<<" session id:"<<ml_curEvent.sessionID;
 				std::cout<<" seqNum:"<<txSar.not_ackd;
@@ -201,6 +202,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				std::cout<<" syn:"<<meta.syn;
 				std::cout<<" fin:"<<meta.fin;
 				std::cout<<" length:"<<ml_curEvent.length<<std::endl;		
+				#endif
 			}
 
 			break;
@@ -209,10 +211,16 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 			// Sends everyting between txSar.not_ackd and txSar.app
 			if ((!rxSar2txEng_rsp.empty() && !txSar2txEng_upd_rsp.empty()) || ml_sarLoaded)
 			{
+				txTxSarReply txSar;
+				ap_uint<WINDOW_BITS> currLength;
 				if (!ml_sarLoaded)
 				{
 					rxSar2txEng_rsp.read(rxSar);
 					txSar2txEng_upd_rsp.read(txSar);
+				}
+				else
+				{
+					txSar = txSarReg;
 				}
 
 				//Compute our space, Advertise at least a quarter/half, otherwise 0
@@ -316,7 +324,9 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					txEng2timer_setRetransmitTimer.write(txRetransmitTimerSet(ml_curEvent.sessionID));
 				}//TODO if probe send msg length 1
 				ml_sarLoaded = true;
+				txSarReg = txSar;
 
+				#ifndef __SYNTHESIS__
 				std::cout<<"TX";
 				std::cout<<std::dec<<" session id:"<<ml_curEvent.sessionID;
 				std::cout<<" seqNum:"<<txSar.not_ackd;
@@ -327,6 +337,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				std::cout<<" syn:"<<meta.syn;
 				std::cout<<" fin:"<<meta.fin;
 				std::cout<<" length:"<<ml_curEvent.length<<std::endl;	
+				#endif
 			}
 			break;
 #endif
@@ -344,8 +355,12 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					txSar = txSarReg;
 				}
 
-				//TODO use  usedLengthWithFIN
-				ap_uint<WINDOW_BITS> currLength = txSar.usedLength; //((ap_uint<WINDOW_BITS>) txSar.not_ackd - txSar.ackd);
+				// usedLength counts the FIN's phantom sequence byte once finSent
+				// is set; retransmitting it as payload emitted a bogus 1-byte
+				// data segment at the FIN's seq number (and inflated go-back-N
+				// lengths by one). Exclude it here; when all data is resent the
+				// FIN itself is regenerated via the finSent conversion below.
+				ap_uint<WINDOW_BITS> currLength = txSar.usedLength - (txSar.finSent ? 1 : 0);
 
 				meta.ackNumb = rxSar.recvd;
 				meta.seqNumb = txSar.ackd;
@@ -426,6 +441,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				ml_sarLoaded = true;
 				txSarReg = txSar;
 
+				#ifndef __SYNTHESIS__
 				std::cout<<"RT";
 				std::cout<<std::dec<<" session id:"<<ml_curEvent.sessionID;
 				std::cout<<" seqNum:"<<txSar.not_ackd;
@@ -436,6 +452,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				std::cout<<" syn:"<<meta.syn;
 				std::cout<<" fin:"<<meta.fin;
 				std::cout<<" length:"<<ml_curEvent.length<<std::endl;	
+				#endif
 			}
 			break;
 		case ACK:
@@ -459,6 +476,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				txEng2sLookup_rev_req.write(ml_curEvent.sessionID);
 				ml_FsmState = 0;
 
+				#ifndef __SYNTHESIS__
 				std::cout<<"TX_ACK";
 				std::cout<<std::dec<<" session id:"<<ml_curEvent.sessionID;
 				std::cout<<" seqNum:"<<txSar.not_ackd;
@@ -469,6 +487,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				std::cout<<" syn:"<<meta.syn;
 				std::cout<<" fin:"<<meta.fin;
 				std::cout<<" length:"<<ml_curEvent.length<<std::endl;	
+				#endif
 			}
 			break;
 		case SYN:
@@ -511,6 +530,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				txEng2timer_setRetransmitTimer.write(txRetransmitTimerSet(ml_curEvent.sessionID, SYN));
 				ml_FsmState = 0;
 
+				#ifndef __SYNTHESIS__
 				std::cout<<"TX_SYN";
 				std::cout<<std::dec<<" session id:"<<ml_curEvent.sessionID;
 				std::cout<<" seqNum:"<<txSar.not_ackd;
@@ -521,6 +541,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				std::cout<<" syn:"<<meta.syn;
 				std::cout<<" fin:"<<meta.fin;
 				std::cout<<" length:"<<ml_curEvent.length<<std::endl;	
+				#endif
 			}
 			break;
 		case SYN_ACK:
@@ -570,6 +591,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				txEng2timer_setRetransmitTimer.write(txRetransmitTimerSet(ml_curEvent.sessionID, SYN_ACK));
 				ml_FsmState = 0;
 
+				#ifndef __SYNTHESIS__
 				std::cout<<"TX_SYN_ACK";
 				std::cout<<std::dec<<" session id:"<<ml_curEvent.sessionID;
 				std::cout<<" seqNum:"<<txSar.not_ackd;
@@ -580,6 +602,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				std::cout<<" syn:"<<meta.syn;
 				std::cout<<" fin:"<<meta.fin;
 				std::cout<<" length:"<<ml_curEvent.length<<std::endl;	
+				#endif
 			}
 			break;
 		case FIN:
@@ -646,6 +669,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 
 				ml_FsmState = 0;
 
+				#ifndef __SYNTHESIS__
 				std::cout<<"TX_FIN";
 				std::cout<<std::dec<<" session id:"<<ml_curEvent.sessionID;
 				std::cout<<" seqNum:"<<txSar.not_ackd;
@@ -656,6 +680,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				std::cout<<" syn:"<<meta.syn;
 				std::cout<<" fin:"<<meta.fin;
 				std::cout<<" length:"<<ml_curEvent.length<<std::endl;	
+				#endif
 			}
 			break;
 		case RST:
@@ -1424,7 +1449,7 @@ void read_data_arbiter(stream<net_axis<WIDTH> >&		txBufferReadData,
 			
 		}
 #else
-		tps_state = 1
+		tps_state = 1;
 #endif
 		break;
 	case 1:
@@ -1477,7 +1502,9 @@ void txEngMemAccessBreakdown(	hls::stream<mmCmd>&	inputMemAccess,
 		if (!inputMemAccess.empty())
 		{
 			inputMemAccess.read(cmd);
+			#ifndef __SYNTHESIS__
 			std::cout << "TX read cmd: " << cmd.saddr << ", " << cmd.bbt << std::endl;
+			#endif
 			if ((cmd.saddr(WINDOW_BITS-1, 0) + cmd.bbt) > BUFFER_SIZE)
 			{
 				lengthFirstAccess = BUFFER_SIZE - cmd.saddr;
@@ -1494,9 +1521,15 @@ void txEngMemAccessBreakdown(	hls::stream<mmCmd>&	inputMemAccess,
 		}
 		break;
 	case 1:
-			outputMemAccess.write(mmCmd(0, cmd.bbt - lengthFirstAccess));
+	{
+			// issue #31: the wrapped second access must continue at the start
+			// of THIS session's circular buffer, not at absolute address 0
+			ap_uint<32> pkgAddr = cmd.saddr;
+			pkgAddr(WINDOW_BITS-1, 0) = 0;
+			outputMemAccess.write(mmCmd(pkgAddr, cmd.bbt - lengthFirstAccess));
 			txEngBreakdownState = 0;
 		break;
+	}
 	}
 }
 

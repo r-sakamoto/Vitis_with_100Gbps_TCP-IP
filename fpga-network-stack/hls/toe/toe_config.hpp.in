@@ -15,6 +15,9 @@ const unsigned DATA_KEEP_BITS = ConstLog2(DATA_WIDTH/8);
 // TCP_NODELAY flag, to disable Nagle's Algorithm
 #define TCP_NODELAY ${TCP_STACK_NODELAY_EN}
 
+// Timer shrink factor for RTL simulation builds (1 = real time, hardware)
+#define TCP_SIM_TIMER_SCALE ${TCP_STACK_SIM_TIMER_SCALE}
+
 // RX_DDR_BYPASS flag, to enable DDR bypass on RX path
 #define RX_DDR_BYPASS ${TCP_STACK_RX_DDR_BYPASS_EN}
 

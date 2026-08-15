@@ -1,0 +1,1894 @@
+//=============================================================================
+// tb_toe_top.sv
+//
+// RTL testbench for the HLS-generated TCP Offload Engine (toe_top, 64-bit
+// datapath, RX_DDR_BYPASS=1 / TCP_NODELAY=1 / WINDOW_SCALE=1 / MSS=1460).
+//
+// The TB provides the complete environment the TOE needs:
+//   - session lookup CAM model        (m/s_axis_session_lup/upd_*)
+//   - TX buffer memory model          (m_axis_txwrite/txread_* + status)
+//   - RX bypass FIFO loopback         (m_axis_rxwrite_data -> s_axis_rxread_data)
+//   - application BFM tasks           (listen/open/close/read/send)
+//   - TCP peer model                  (builds/parses IPv4+TCP packets with
+//                                      checksums on s/m_axis_tcp_data)
+//
+// Timing convention: all TB processes sample handshakes at posedge using
+// pre-edge values (DUT registers use NBA) and drive TB->DUT signals with NBA.
+//
+// Test selection:  xsim ... --testplusarg TESTNAME=<name>
+//   passive_open   : listen, 3WHS (peer SYN), data RX -> app, peer FIN close
+//   active_open    : app open (SYN out), 3WHS, app TX data, app close (FIN out)
+//   rx_out_of_order: OOO segment behavior with RX_DDR_BYPASS (drop + dup ACK)
+//   fast_retransmit: 3 duplicate ACKs trigger go-back-N retransmission
+//   rst_handling   : peer RST closes session; RST sent for closed port
+//   zero_window    : peer advertises win=0, app send rejected, resumes on update
+//=============================================================================
+`timescale 1ns/1ps
+
+module tb_toe_top;
+
+  //---------------------------------------------------------------------------
+  // Configuration
+  //---------------------------------------------------------------------------
+  localparam real CLK_PERIOD = 6.4;
+  localparam int  MSS        = 1460;
+
+  // IPs in "display" order (10.0.0.2 = 32'h0A000002)
+  localparam bit [31:0] TOE_IP  = 32'h0A000002;   // 10.0.0.2
+  localparam bit [31:0] PEER_IP = 32'h0A000001;   // 10.0.0.1
+
+  // toe_top myIpAddress input is wire-order, byte0 = LSB
+  function automatic bit [31:0] ip_to_le(input bit [31:0] ip);
+    return {ip[7:0], ip[15:8], ip[23:16], ip[31:24]};
+  endfunction
+
+  typedef byte unsigned bytes_t[];
+
+  //---------------------------------------------------------------------------
+  // Clock / reset
+  //---------------------------------------------------------------------------
+  reg ap_clk = 0;
+  reg ap_rst_n = 0;
+  always #(CLK_PERIOD/2.0) ap_clk = ~ap_clk;
+
+  //---------------------------------------------------------------------------
+  // DUT signals
+  //---------------------------------------------------------------------------
+  // network in
+  reg  [63:0] s_tcp_tdata;  reg [7:0] s_tcp_tkeep, s_tcp_tstrb; reg s_tcp_tlast;
+  reg         s_tcp_tvalid; wire s_tcp_tready;
+  // network out
+  wire [63:0] m_tcp_tdata;  wire [7:0] m_tcp_tkeep, m_tcp_tstrb; wire m_tcp_tlast;
+  wire        m_tcp_tvalid; reg  m_tcp_tready;
+  // tx mem write
+  wire [71:0] txwr_cmd_tdata;  wire txwr_cmd_tvalid;  reg txwr_cmd_tready;
+  wire [63:0] txwr_tdata; wire [7:0] txwr_tkeep, txwr_tstrb; wire txwr_tlast;
+  wire        txwr_tvalid; reg txwr_tready;
+  reg  [7:0]  txwr_sts_tdata; reg txwr_sts_tvalid; wire txwr_sts_tready;
+  // tx mem read
+  wire [71:0] txrd_cmd_tdata;  wire txrd_cmd_tvalid;  reg txrd_cmd_tready;
+  reg  [63:0] txrd_tdata; reg [7:0] txrd_tkeep, txrd_tstrb; reg txrd_tlast;
+  reg         txrd_tvalid; wire txrd_tready;
+  // rx buffer data path (bypass FIFO loop or DDR memory model)
+  wire [63:0] rxwr_tdata; wire [7:0] rxwr_tkeep, rxwr_tstrb; wire rxwr_tlast;
+  wire        rxwr_tvalid; reg rxwr_tready;
+  reg  [63:0] rxrd_tdata; reg [7:0] rxrd_tkeep, rxrd_tstrb; reg rxrd_tlast;
+  reg         rxrd_tvalid; wire rxrd_tready;
+`ifdef NO_RX_BYPASS
+  // rx buffer memory command/status interface (RX_DDR_BYPASS=0 build)
+  wire [71:0] rxwr_cmd_tdata;  wire rxwr_cmd_tvalid;  reg rxwr_cmd_tready;
+  wire [71:0] rxrd_cmd_tdata;  wire rxrd_cmd_tvalid;  reg rxrd_cmd_tready;
+  reg  [7:0]  rxwr_sts_tdata;  reg  rxwr_sts_tvalid;  wire rxwr_sts_tready;
+`else
+  reg  [15:0] axis_data_count;
+  reg  [15:0] axis_max_data_count = 16'd1024;
+`endif
+  // session lookup
+  wire [95:0]  lup_req_tdata;  wire lup_req_tvalid;  reg lup_req_tready;
+  reg  [119:0] lup_rsp_tdata;  reg  lup_rsp_tvalid;  wire lup_rsp_tready;
+  wire [143:0] upd_req_tdata;  wire upd_req_tvalid;  reg upd_req_tready;
+  reg  [151:0] upd_rsp_tdata;  reg  upd_rsp_tvalid;  wire upd_rsp_tready;
+  // app interface
+  reg  [15:0] listen_req_tdata; reg listen_req_tvalid; wire listen_req_tready;
+  wire [7:0]  listen_rsp_tdata; wire listen_rsp_tvalid; reg listen_rsp_tready;
+  wire [87:0] notif_tdata; wire notif_tvalid; reg notif_tready;
+  reg  [31:0] rxreq_tdata; reg rxreq_tvalid; wire rxreq_tready;
+  wire [15:0] rxrsp_meta_tdata; wire rxrsp_meta_tvalid; reg rxrsp_meta_tready;
+  wire [63:0] rxrsp_tdata; wire [7:0] rxrsp_tkeep, rxrsp_tstrb; wire rxrsp_tlast;
+  wire        rxrsp_tvalid; reg rxrsp_tready;
+  reg  [47:0] open_req_tdata; reg open_req_tvalid; wire open_req_tready;
+  wire [71:0] open_rsp_tdata; wire open_rsp_tvalid; reg open_rsp_tready;
+  reg  [15:0] close_req_tdata; reg close_req_tvalid; wire close_req_tready;
+  reg  [31:0] txmeta_tdata; reg txmeta_tvalid; wire txmeta_tready;
+  reg  [63:0] txdata_tdata; reg [7:0] txdata_tkeep, txdata_tstrb; reg txdata_tlast;
+  reg         txdata_tvalid; wire txdata_tready;
+  wire [63:0] txrsp_tdata; wire txrsp_tvalid; reg txrsp_tready;
+  wire [15:0] regSessionCount; wire regSessionCount_ap_vld;
+
+  //---------------------------------------------------------------------------
+  // DUT
+  //---------------------------------------------------------------------------
+  toe_top dut (
+    .ap_clk(ap_clk), .ap_rst_n(ap_rst_n),
+    .s_axis_tcp_data_TDATA(s_tcp_tdata), .s_axis_tcp_data_TKEEP(s_tcp_tkeep),
+    .s_axis_tcp_data_TSTRB(s_tcp_tstrb), .s_axis_tcp_data_TLAST(s_tcp_tlast),
+    .s_axis_tcp_data_TVALID(s_tcp_tvalid), .s_axis_tcp_data_TREADY(s_tcp_tready),
+    .m_axis_tcp_data_TDATA(m_tcp_tdata), .m_axis_tcp_data_TKEEP(m_tcp_tkeep),
+    .m_axis_tcp_data_TSTRB(m_tcp_tstrb), .m_axis_tcp_data_TLAST(m_tcp_tlast),
+    .m_axis_tcp_data_TVALID(m_tcp_tvalid), .m_axis_tcp_data_TREADY(m_tcp_tready),
+    .m_axis_txwrite_cmd_TDATA(txwr_cmd_tdata), .m_axis_txwrite_cmd_TVALID(txwr_cmd_tvalid), .m_axis_txwrite_cmd_TREADY(txwr_cmd_tready),
+    .m_axis_txread_cmd_TDATA(txrd_cmd_tdata), .m_axis_txread_cmd_TVALID(txrd_cmd_tvalid), .m_axis_txread_cmd_TREADY(txrd_cmd_tready),
+    .m_axis_txwrite_data_TDATA(txwr_tdata), .m_axis_txwrite_data_TKEEP(txwr_tkeep),
+    .m_axis_txwrite_data_TSTRB(txwr_tstrb), .m_axis_txwrite_data_TLAST(txwr_tlast),
+    .m_axis_txwrite_data_TVALID(txwr_tvalid), .m_axis_txwrite_data_TREADY(txwr_tready),
+    .s_axis_txread_data_TDATA(txrd_tdata), .s_axis_txread_data_TKEEP(txrd_tkeep),
+    .s_axis_txread_data_TSTRB(txrd_tstrb), .s_axis_txread_data_TLAST(txrd_tlast),
+    .s_axis_txread_data_TVALID(txrd_tvalid), .s_axis_txread_data_TREADY(txrd_tready),
+    .s_axis_txwrite_sts_TDATA(txwr_sts_tdata), .s_axis_txwrite_sts_TVALID(txwr_sts_tvalid), .s_axis_txwrite_sts_TREADY(txwr_sts_tready),
+    .m_axis_rxwrite_data_TDATA(rxwr_tdata), .m_axis_rxwrite_data_TKEEP(rxwr_tkeep),
+    .m_axis_rxwrite_data_TSTRB(rxwr_tstrb), .m_axis_rxwrite_data_TLAST(rxwr_tlast),
+    .m_axis_rxwrite_data_TVALID(rxwr_tvalid), .m_axis_rxwrite_data_TREADY(rxwr_tready),
+    .s_axis_rxread_data_TDATA(rxrd_tdata), .s_axis_rxread_data_TKEEP(rxrd_tkeep),
+    .s_axis_rxread_data_TSTRB(rxrd_tstrb), .s_axis_rxread_data_TLAST(rxrd_tlast),
+    .s_axis_rxread_data_TVALID(rxrd_tvalid), .s_axis_rxread_data_TREADY(rxrd_tready),
+`ifdef NO_RX_BYPASS
+    .m_axis_rxwrite_cmd_TDATA(rxwr_cmd_tdata), .m_axis_rxwrite_cmd_TVALID(rxwr_cmd_tvalid), .m_axis_rxwrite_cmd_TREADY(rxwr_cmd_tready),
+    .m_axis_rxread_cmd_TDATA(rxrd_cmd_tdata), .m_axis_rxread_cmd_TVALID(rxrd_cmd_tvalid), .m_axis_rxread_cmd_TREADY(rxrd_cmd_tready),
+    .s_axis_rxwrite_sts_TDATA(rxwr_sts_tdata), .s_axis_rxwrite_sts_TVALID(rxwr_sts_tvalid), .s_axis_rxwrite_sts_TREADY(rxwr_sts_tready),
+`else
+    .axis_data_count(axis_data_count), .axis_max_data_count(axis_max_data_count),
+`endif
+    .m_axis_session_lup_req_TDATA(lup_req_tdata), .m_axis_session_lup_req_TVALID(lup_req_tvalid), .m_axis_session_lup_req_TREADY(lup_req_tready),
+    .s_axis_session_lup_rsp_TDATA(lup_rsp_tdata), .s_axis_session_lup_rsp_TVALID(lup_rsp_tvalid), .s_axis_session_lup_rsp_TREADY(lup_rsp_tready),
+    .m_axis_session_upd_req_TDATA(upd_req_tdata), .m_axis_session_upd_req_TVALID(upd_req_tvalid), .m_axis_session_upd_req_TREADY(upd_req_tready),
+    .s_axis_session_upd_rsp_TDATA(upd_rsp_tdata), .s_axis_session_upd_rsp_TVALID(upd_rsp_tvalid), .s_axis_session_upd_rsp_TREADY(upd_rsp_tready),
+    .s_axis_listen_port_req_TDATA(listen_req_tdata), .s_axis_listen_port_req_TVALID(listen_req_tvalid), .s_axis_listen_port_req_TREADY(listen_req_tready),
+    .m_axis_listen_port_rsp_TDATA(listen_rsp_tdata), .m_axis_listen_port_rsp_TVALID(listen_rsp_tvalid), .m_axis_listen_port_rsp_TREADY(listen_rsp_tready),
+    .m_axis_notification_TDATA(notif_tdata), .m_axis_notification_TVALID(notif_tvalid), .m_axis_notification_TREADY(notif_tready),
+    .s_axis_rx_data_req_TDATA(rxreq_tdata), .s_axis_rx_data_req_TVALID(rxreq_tvalid), .s_axis_rx_data_req_TREADY(rxreq_tready),
+    .m_axis_rx_data_rsp_metadata_TDATA(rxrsp_meta_tdata), .m_axis_rx_data_rsp_metadata_TVALID(rxrsp_meta_tvalid), .m_axis_rx_data_rsp_metadata_TREADY(rxrsp_meta_tready),
+    .m_axis_rx_data_rsp_TDATA(rxrsp_tdata), .m_axis_rx_data_rsp_TKEEP(rxrsp_tkeep),
+    .m_axis_rx_data_rsp_TSTRB(rxrsp_tstrb), .m_axis_rx_data_rsp_TLAST(rxrsp_tlast),
+    .m_axis_rx_data_rsp_TVALID(rxrsp_tvalid), .m_axis_rx_data_rsp_TREADY(rxrsp_tready),
+    .s_axis_open_conn_req_TDATA(open_req_tdata), .s_axis_open_conn_req_TVALID(open_req_tvalid), .s_axis_open_conn_req_TREADY(open_req_tready),
+    .m_axis_open_conn_rsp_TDATA(open_rsp_tdata), .m_axis_open_conn_rsp_TVALID(open_rsp_tvalid), .m_axis_open_conn_rsp_TREADY(open_rsp_tready),
+    .s_axis_close_conn_req_TDATA(close_req_tdata), .s_axis_close_conn_req_TVALID(close_req_tvalid), .s_axis_close_conn_req_TREADY(close_req_tready),
+    .s_axis_tx_data_req_metadata_TDATA(txmeta_tdata), .s_axis_tx_data_req_metadata_TVALID(txmeta_tvalid), .s_axis_tx_data_req_metadata_TREADY(txmeta_tready),
+    .s_axis_tx_data_req_TDATA(txdata_tdata), .s_axis_tx_data_req_TKEEP(txdata_tkeep),
+    .s_axis_tx_data_req_TSTRB(txdata_tstrb), .s_axis_tx_data_req_TLAST(txdata_tlast),
+    .s_axis_tx_data_req_TVALID(txdata_tvalid), .s_axis_tx_data_req_TREADY(txdata_tready),
+    .m_axis_tx_data_rsp_TDATA(txrsp_tdata), .m_axis_tx_data_rsp_TVALID(txrsp_tvalid), .m_axis_tx_data_rsp_TREADY(txrsp_tready),
+    .myIpAddress(ip_to_le(TOE_IP)),
+    .regSessionCount(regSessionCount), .regSessionCount_ap_vld(regSessionCount_ap_vld)
+  );
+
+  //---------------------------------------------------------------------------
+  // Bookkeeping / result
+  //---------------------------------------------------------------------------
+  int unsigned err_count = 0;
+  string       testname  = "passive_open";
+
+  task automatic tb_error(input string msg);
+    err_count++;
+    $display("[%0t] TB-ERROR: %s", $time, msg);
+  endtask
+
+  task automatic tb_info(input string msg);
+    $display("[%0t] TB-INFO : %s", $time, msg);
+  endtask
+
+  function automatic void tb_check(input bit cond, input string msg);
+    if (!cond) begin
+      err_count++;
+      $display("[%0t] TB-CHECK-FAIL: %s", $time, msg);
+    end
+    else begin
+      $display("[%0t] TB-CHECK-OK  : %s", $time, msg);
+    end
+  endfunction
+
+  //---------------------------------------------------------------------------
+  // Session lookup CAM model
+  // key = {theirPort[63:48], myPort[47:32], theirIp[31:0]} (LSB-first packing)
+  //---------------------------------------------------------------------------
+  bit [15:0] cam [bit [63:0]];
+  int cam_delete_count = 0;
+  int cam_insert_count = 0;
+
+  // lookup server
+  initial begin
+    lup_req_tready <= 1;
+    lup_rsp_tvalid <= 0;
+    forever begin
+      @(posedge ap_clk);
+      if (ap_rst_n && lup_req_tvalid && lup_req_tready) begin
+        bit [63:0] key; bit [31:0] src; bit [119:0] rsp;
+        key = lup_req_tdata[63:0];
+        src = lup_req_tdata[95:64];
+        lup_req_tready <= 0;
+        repeat (2) @(posedge ap_clk);
+        rsp = '0;
+        rsp[63:0] = key;
+        if (cam.exists(key)) begin
+          rsp[79:64] = cam[key];
+          rsp[80]    = 1'b1;
+        end
+        rsp[112:81] = src;
+        lup_rsp_tdata  <= rsp;
+        lup_rsp_tvalid <= 1;
+        do @(posedge ap_clk); while (!lup_rsp_tready);
+        lup_rsp_tvalid <= 0;
+        lup_req_tready <= 1;
+        tb_info($sformatf("CAM LOOKUP key=%h hit=%0d id=%0d", key, rsp[80], rsp[79:64]));
+      end
+    end
+  end
+
+  // update server
+  initial begin
+    upd_req_tready <= 1;
+    upd_rsp_tvalid <= 0;
+    forever begin
+      @(posedge ap_clk);
+      if (ap_rst_n && upd_req_tvalid && upd_req_tready) begin
+        bit [31:0] op, src; bit [63:0] key; bit [15:0] value; bit [151:0] rsp;
+        op    = upd_req_tdata[31:0];
+        key   = upd_req_tdata[95:32];
+        value = upd_req_tdata[111:96];
+        src   = upd_req_tdata[143:112];
+        upd_req_tready <= 0;
+        if (op == 0) begin cam[key] = value; cam_insert_count++; end   // INSERT
+        else begin
+          if (cam.exists(key)) cam.delete(key);                        // DELETE
+          cam_delete_count++;
+        end
+        repeat (2) @(posedge ap_clk);
+        rsp = '0;
+        rsp[31:0]    = op;
+        rsp[95:32]   = key;
+        rsp[111:96]  = value;
+        rsp[112]     = 1'b1;   // success
+        rsp[144:113] = src;
+        upd_rsp_tdata  <= rsp;
+        upd_rsp_tvalid <= 1;
+        do @(posedge ap_clk); while (!upd_rsp_tready);
+        upd_rsp_tvalid <= 0;
+        upd_req_tready <= 1;
+        tb_info($sformatf("CAM %s key=%h id=%0d", (op==0)?"INSERT":"DELETE", key, value));
+      end
+    end
+  end
+
+  //---------------------------------------------------------------------------
+  // TX buffer memory model (write cmd/data/status + read cmd/data)
+  // mmCmd packing: bbt[22:0], type[23], dsa[29:24], eof[30], drr[31],
+  //                saddr[63:32], tag[67:64], rsvd[71:68]
+  //---------------------------------------------------------------------------
+  byte unsigned tx_mem [longint unsigned];
+
+  typedef struct packed { bit [31:0] saddr; bit [22:0] bbt; } memcmd_t;
+  memcmd_t txwr_cmds[$];
+  memcmd_t txrd_cmds[$];
+
+  // capture commands
+  always @(posedge ap_clk) begin
+    if (ap_rst_n && txwr_cmd_tvalid && txwr_cmd_tready) begin
+      memcmd_t c;
+      c.bbt   = txwr_cmd_tdata[22:0];
+      c.saddr = txwr_cmd_tdata[63:32];
+      txwr_cmds.push_back(c);
+    end
+    if (ap_rst_n && txrd_cmd_tvalid && txrd_cmd_tready) begin
+      memcmd_t c;
+      c.bbt   = txrd_cmd_tdata[22:0];
+      c.saddr = txrd_cmd_tdata[63:32];
+      txrd_cmds.push_back(c);
+    end
+  end
+
+  // write data path + status
+  initial begin
+    txwr_cmd_tready <= 1; txrd_cmd_tready <= 1;
+    txwr_tready <= 0; txwr_sts_tvalid <= 0; txwr_sts_tdata <= 8'h80;
+    forever begin
+      memcmd_t c;
+      longint unsigned addr;
+      int unsigned remaining;
+      while (txwr_cmds.size() == 0) @(posedge ap_clk);
+      c = txwr_cmds.pop_front();
+      addr = c.saddr; remaining = c.bbt;
+      txwr_tready <= 1;
+      while (remaining > 0) begin
+        @(posedge ap_clk);
+        if (txwr_tvalid && txwr_tready) begin
+          for (int i = 0; i < 8; i++) begin
+            if (remaining > 0 && txwr_tkeep[i]) begin
+              tx_mem[addr] = txwr_tdata[8*i +: 8];
+              addr++; remaining--;
+            end
+          end
+          if (txwr_tlast) remaining = 0;
+        end
+      end
+      txwr_tready <= 0;
+      // status: okay=1 at bit7 (tag[3:0], interr, decerr, slverr, okay)
+      txwr_sts_tdata  <= 8'h80;
+      txwr_sts_tvalid <= 1;
+      do @(posedge ap_clk); while (!txwr_sts_tready);
+      txwr_sts_tvalid <= 0;
+    end
+  end
+
+  // read data path
+  initial begin
+    txrd_tvalid <= 0; txrd_tdata <= '0; txrd_tkeep <= '0; txrd_tstrb <= '0; txrd_tlast <= 0;
+    forever begin
+      memcmd_t c;
+      longint unsigned addr;
+      int unsigned remaining, nbytes;
+      bit [63:0] d; bit [7:0] k;
+      while (txrd_cmds.size() == 0) @(posedge ap_clk);
+      c = txrd_cmds.pop_front();
+      addr = c.saddr; remaining = c.bbt;
+      while (remaining > 0) begin
+        nbytes = (remaining > 8) ? 8 : remaining;
+        d = '0; k = '0;
+        for (int i = 0; i < nbytes; i++) begin
+          d[8*i +: 8] = tx_mem.exists(addr+i) ? tx_mem[addr+i] : 8'h00;
+          k[i] = 1'b1;
+        end
+        txrd_tdata  <= d;
+        txrd_tkeep  <= k;
+        txrd_tstrb  <= k;
+        txrd_tlast  <= (remaining <= 8);
+        txrd_tvalid <= 1;
+        do @(posedge ap_clk); while (!txrd_tready);
+        addr += nbytes; remaining -= nbytes;
+      end
+      txrd_tvalid <= 0; txrd_tlast <= 0;
+    end
+  end
+
+`ifdef NO_RX_BYPASS
+  //---------------------------------------------------------------------------
+  // RX buffer memory model (RX_DDR_BYPASS=0): write cmd/data/status + read
+  // cmd/data, mirroring the TX buffer model
+  //---------------------------------------------------------------------------
+  byte unsigned rx_mem [longint unsigned];
+  memcmd_t rx_wr_cmds[$];
+  memcmd_t rx_rd_cmds[$];
+
+  always @(posedge ap_clk) begin
+    if (ap_rst_n && rxwr_cmd_tvalid && rxwr_cmd_tready) begin
+      memcmd_t c;
+      c.bbt   = rxwr_cmd_tdata[22:0];
+      c.saddr = rxwr_cmd_tdata[63:32];
+      rx_wr_cmds.push_back(c);
+    end
+    if (ap_rst_n && rxrd_cmd_tvalid && rxrd_cmd_tready) begin
+      memcmd_t c;
+      c.bbt   = rxrd_cmd_tdata[22:0];
+      c.saddr = rxrd_cmd_tdata[63:32];
+      rx_rd_cmds.push_back(c);
+    end
+  end
+
+  // write data path + status
+  initial begin
+    rxwr_cmd_tready <= 1; rxrd_cmd_tready <= 1;
+    rxwr_tready <= 0; rxwr_sts_tvalid <= 0; rxwr_sts_tdata <= 8'h80;
+    forever begin
+      memcmd_t c;
+      longint unsigned addr;
+      int unsigned remaining;
+      while (rx_wr_cmds.size() == 0) @(posedge ap_clk);
+      c = rx_wr_cmds.pop_front();
+      addr = c.saddr; remaining = c.bbt;
+      rxwr_tready <= 1;
+      while (remaining > 0) begin
+        @(posedge ap_clk);
+        if (rxwr_tvalid && rxwr_tready) begin
+          for (int i = 0; i < 8; i++) begin
+            if (remaining > 0 && rxwr_tkeep[i]) begin
+              rx_mem[addr] = rxwr_tdata[8*i +: 8];
+              addr++; remaining--;
+            end
+          end
+          if (rxwr_tlast) remaining = 0;
+        end
+      end
+      rxwr_tready <= 0;
+      rxwr_sts_tdata  <= 8'h80;   // okay
+      rxwr_sts_tvalid <= 1;
+      do @(posedge ap_clk); while (!rxwr_sts_tready);
+      rxwr_sts_tvalid <= 0;
+    end
+  end
+
+  // read data path
+  initial begin
+    rxrd_tvalid <= 0; rxrd_tdata <= '0; rxrd_tkeep <= '0; rxrd_tstrb <= '0; rxrd_tlast <= 0;
+    forever begin
+      memcmd_t c;
+      longint unsigned addr;
+      int unsigned remaining, nbytes;
+      bit [63:0] d; bit [7:0] k;
+      while (rx_rd_cmds.size() == 0) @(posedge ap_clk);
+      c = rx_rd_cmds.pop_front();
+      addr = c.saddr; remaining = c.bbt;
+      while (remaining > 0) begin
+        nbytes = (remaining > 8) ? 8 : remaining;
+        d = '0; k = '0;
+        for (int i = 0; i < nbytes; i++) begin
+          d[8*i +: 8] = rx_mem.exists(addr+i) ? rx_mem[addr+i] : 8'h00;
+          k[i] = 1'b1;
+        end
+        rxrd_tdata  <= d;
+        rxrd_tkeep  <= k;
+        rxrd_tstrb  <= k;
+        rxrd_tlast  <= (remaining <= 8);
+        rxrd_tvalid <= 1;
+        do @(posedge ap_clk); while (!rxrd_tready);
+        addr += nbytes; remaining -= nbytes;
+      end
+      rxrd_tvalid <= 0; rxrd_tlast <= 0;
+    end
+  end
+
+  typedef struct packed { bit last; bit [7:0] keep; bit [63:0] data; } beat_t;
+`else
+  //---------------------------------------------------------------------------
+  // RX bypass FIFO (rxwrite_data -> rxread_data), word-count exported
+  //---------------------------------------------------------------------------
+  typedef struct packed { bit last; bit [7:0] keep; bit [63:0] data; } beat_t;
+  beat_t rx_fifo[$];
+
+  initial begin
+    rxwr_tready <= 1;
+    rxrd_tvalid <= 0; rxrd_tdata <= '0; rxrd_tkeep <= '0; rxrd_tstrb <= '0; rxrd_tlast <= 0;
+    axis_data_count <= 0;
+  end
+
+  always @(posedge ap_clk) begin
+    if (ap_rst_n) begin
+      if (rxwr_tvalid && rxwr_tready) begin
+        beat_t b;
+        b.data = rxwr_tdata; b.keep = rxwr_tkeep; b.last = rxwr_tlast;
+        rx_fifo.push_back(b);
+      end
+      if (rxrd_tvalid && rxrd_tready)
+        void'(rx_fifo.pop_front());
+      if (rx_fifo.size() > 0) begin
+        rxrd_tdata  <= rx_fifo[0].data;
+        rxrd_tkeep  <= rx_fifo[0].keep;
+        rxrd_tstrb  <= rx_fifo[0].keep;
+        rxrd_tlast  <= rx_fifo[0].last;
+        rxrd_tvalid <= 1;
+      end
+      else begin
+        rxrd_tvalid <= 0;
+      end
+      axis_data_count <= rx_fifo.size();
+    end
+  end
+`endif
+
+  //---------------------------------------------------------------------------
+  // App-side monitors: notifications / open responses / tx responses
+  //---------------------------------------------------------------------------
+  typedef struct packed {
+    bit        closed;
+    bit [15:0] dstPort;
+    bit [31:0] ipAddress;
+    bit [15:0] length;
+    bit [15:0] sessionID;
+  } notif_t;
+  notif_t notif_q[$];
+
+  typedef struct packed {
+    bit [15:0] port;
+    bit [31:0] ip;
+    bit [7:0]  success;
+    bit [15:0] sessionID;
+  } openrsp_t;
+  openrsp_t openrsp_q[$];
+
+  typedef struct packed {
+    bit [1:0]  error;
+    bit [29:0] remaining_space;
+    bit [15:0] length;
+    bit [15:0] sessionID;
+  } txrsp_t;
+  txrsp_t txrsp_q[$];
+
+  bit [15:0] rxmeta_q[$];
+  bit        listen_rsp_q[$];
+
+  initial begin
+    notif_tready <= 1; open_rsp_tready <= 1; txrsp_tready <= 1;
+    rxrsp_meta_tready <= 1; listen_rsp_tready <= 1;
+  end
+
+  always @(posedge ap_clk) begin
+    if (ap_rst_n) begin
+      if (notif_tvalid && notif_tready) begin
+        notif_t n;
+        n.sessionID = notif_tdata[15:0];
+        n.length    = notif_tdata[31:16];
+        n.ipAddress = notif_tdata[63:32];
+        n.dstPort   = notif_tdata[79:64];
+        n.closed    = notif_tdata[80];
+        notif_q.push_back(n);
+        tb_info($sformatf("APP notification: sid=%0d len=%0d ip=%h port=%0d closed=%0d",
+                          n.sessionID, n.length, n.ipAddress, n.dstPort, n.closed));
+      end
+      if (open_rsp_tvalid && open_rsp_tready) begin
+        openrsp_t o;
+        o.sessionID = open_rsp_tdata[15:0];
+        o.success   = open_rsp_tdata[23:16];
+        o.ip        = open_rsp_tdata[55:24];
+        o.port      = open_rsp_tdata[71:56];
+        openrsp_q.push_back(o);
+        tb_info($sformatf("APP openConnRsp: sid=%0d success=%0d", o.sessionID, o.success));
+      end
+      if (txrsp_tvalid && txrsp_tready) begin
+        txrsp_t t;
+        t.sessionID       = txrsp_tdata[15:0];
+        t.length          = txrsp_tdata[31:16];
+        t.remaining_space = txrsp_tdata[61:32];
+        t.error           = txrsp_tdata[63:62];
+        txrsp_q.push_back(t);
+      end
+      if (rxrsp_meta_tvalid && rxrsp_meta_tready)
+        rxmeta_q.push_back(rxrsp_meta_tdata);
+      if (listen_rsp_tvalid && listen_rsp_tready)
+        listen_rsp_q.push_back(listen_rsp_tdata[0]);
+    end
+  end
+
+  // rx data rsp collector
+  byte unsigned app_rx_bytes[$];
+  int unsigned  app_rx_pkts = 0;
+  initial rxrsp_tready <= 1;
+  always @(posedge ap_clk) begin
+    if (ap_rst_n && rxrsp_tvalid && rxrsp_tready) begin
+      for (int i = 0; i < 8; i++)
+        if (rxrsp_tkeep[i]) app_rx_bytes.push_back(rxrsp_tdata[8*i +: 8]);
+      if (rxrsp_tlast) app_rx_pkts++;
+    end
+  end
+
+  //---------------------------------------------------------------------------
+  // Network output monitor: reassemble packets from m_axis_tcp_data
+  //---------------------------------------------------------------------------
+  byte unsigned cur_pkt[$];
+  bytes_t       net_pkts[$];   // queue of complete IPv4 packets
+
+  initial m_tcp_tready <= 1;
+  always @(posedge ap_clk) begin
+    if (ap_rst_n && m_tcp_tvalid && m_tcp_tready) begin
+      for (int i = 0; i < 8; i++)
+        if (m_tcp_tkeep[i]) cur_pkt.push_back(m_tcp_tdata[8*i +: 8]);
+      if (m_tcp_tlast) begin
+        bytes_t p;
+        p = new[cur_pkt.size()];
+        foreach (cur_pkt[i]) p[i] = cur_pkt[i];
+        cur_pkt.delete();
+        net_pkts.push_back(p);
+        print_pkt("DUT->NET", p);
+        check_tcp_checksum(p);
+      end
+    end
+  end
+
+  //---------------------------------------------------------------------------
+  // Packet field helpers (p = full IPv4 packet, big-endian on wire)
+  //---------------------------------------------------------------------------
+  function automatic bit [15:0] f16(input bytes_t p, input int off);
+    return {p[off], p[off+1]};
+  endfunction
+  function automatic bit [31:0] f32(input bytes_t p, input int off);
+    return {p[off], p[off+1], p[off+2], p[off+3]};
+  endfunction
+  function automatic bit [31:0] f_src_ip (input bytes_t p); return f32(p, 12); endfunction
+  function automatic bit [31:0] f_dst_ip (input bytes_t p); return f32(p, 16); endfunction
+  function automatic bit [15:0] f_src_port(input bytes_t p); return f16(p, 20); endfunction
+  function automatic bit [15:0] f_dst_port(input bytes_t p); return f16(p, 22); endfunction
+  function automatic bit [31:0] f_seq(input bytes_t p); return f32(p, 24); endfunction
+  function automatic bit [31:0] f_ack(input bytes_t p); return f32(p, 28); endfunction
+  function automatic bit [7:0]  f_flags(input bytes_t p); return p[33]; endfunction
+  function automatic bit [15:0] f_win(input bytes_t p); return f16(p, 34); endfunction
+  function automatic int f_data_off(input bytes_t p); return (p[32] >> 4) * 4; endfunction
+  function automatic int f_payload_len(input bytes_t p);
+    return f16(p, 2) - 20 - f_data_off(p);
+  endfunction
+  function automatic bytes_t f_payload(input bytes_t p);
+    bytes_t d;
+    int off, len;
+    off = 20 + f_data_off(p);
+    len = f_payload_len(p);
+    d = new[len];
+    for (int i = 0; i < len; i++) d[i] = p[off+i];
+    return d;
+  endfunction
+  function automatic bytes_t f_options(input bytes_t p);
+    bytes_t d;
+    int len;
+    len = f_data_off(p) - 20;
+    d = new[len];
+    for (int i = 0; i < len; i++) d[i] = p[40+i];
+    return d;
+  endfunction
+
+  localparam bit [7:0] F_FIN = 8'h01, F_SYN = 8'h02, F_RST = 8'h04,
+                       F_PSH = 8'h08, F_ACK = 8'h10;
+
+  function automatic string flags_str(input bit [7:0] f);
+    string s = "";
+    if (f & F_SYN) s = {s, "SYN,"};
+    if (f & F_ACK) s = {s, "ACK,"};
+    if (f & F_FIN) s = {s, "FIN,"};
+    if (f & F_RST) s = {s, "RST,"};
+    if (f & F_PSH) s = {s, "PSH,"};
+    return s;
+  endfunction
+
+  function automatic void print_pkt(input string dir, input bytes_t p);
+    $display("[%0t] %s: %0d.%0d.%0d.%0d:%0d -> %0d.%0d.%0d.%0d:%0d [%s] seq=%0d ack=%0d win=%0d len=%0d",
+      $time, dir,
+      p[12], p[13], p[14], p[15], f_src_port(p),
+      p[16], p[17], p[18], p[19], f_dst_port(p),
+      flags_str(f_flags(p)), f_seq(p), f_ack(p), f_win(p), f_payload_len(p));
+  endfunction
+
+  //---------------------------------------------------------------------------
+  // Checksum helpers
+  //---------------------------------------------------------------------------
+  function automatic bit [15:0] csum_finish(input bit [31:0] sum);
+    bit [31:0] s = sum;
+    while (s >> 16) s = (s & 32'hFFFF) + (s >> 16);
+    return ~s[15:0];
+  endfunction
+
+  function automatic bit [15:0] ip_header_csum(input bytes_t p);
+    bit [31:0] sum = 0;
+    for (int i = 0; i < 20; i += 2)
+      if (i != 10) sum += {p[i], p[i+1]};
+    return csum_finish(sum);
+  endfunction
+
+  // TCP checksum over pseudo header + segment (checksum field skipped)
+  function automatic bit [15:0] tcp_csum(input bytes_t p);
+    bit [31:0] sum = 0;
+    int tcp_len;
+    tcp_len = f16(p, 2) - 20;
+    sum += f16(p, 12); sum += f16(p, 14);   // src ip
+    sum += f16(p, 16); sum += f16(p, 18);   // dst ip
+    sum += 16'h0006;
+    sum += tcp_len[15:0];
+    for (int i = 0; i < tcp_len; i += 2) begin
+      bit [15:0] w;
+      w[15:8] = p[20+i];
+      w[7:0]  = (i+1 < tcp_len) ? p[20+i+1] : 8'h00;
+      if (i != 16) sum += w;   // tcp offset 16..17 = checksum field
+    end
+    return csum_finish(sum);
+  endfunction
+
+  function automatic void check_tcp_checksum(input bytes_t p);
+    bit [15:0] expected = tcp_csum(p);
+    bit [15:0] actual   = f16(p, 36);
+    if (expected != actual) begin
+      err_count++;
+      $display("[%0t] TB-CHECK-FAIL: outgoing TCP checksum bad: got %h expected %h",
+               $time, actual, expected);
+    end
+  endfunction
+
+  //---------------------------------------------------------------------------
+  // Packet builder (returns full IPv4 packet)
+  //---------------------------------------------------------------------------
+  function automatic bytes_t make_tcp(
+      input bit [31:0] sip, input bit [31:0] dip,
+      input bit [15:0] sp,  input bit [15:0] dp,
+      input bit [31:0] seq, input bit [31:0] ack,
+      input bit [7:0]  flags, input bit [15:0] win,
+      input bytes_t opts, input bytes_t payload);
+    bytes_t p;
+    int optlen, hdrlen, totlen;
+    bit [15:0] cs;
+    optlen = (opts.size() + 3) / 4 * 4;
+    hdrlen = 20 + optlen;
+    totlen = 20 + hdrlen + payload.size();
+    p = new[totlen];
+    foreach (p[i]) p[i] = 8'h00;
+    // IPv4 header
+    // NOTE: concat-LHS assignment onto dynamic-array elements is broken in
+    // xsim 2022.1 (only the first element gets written) - use per-byte stores.
+    p[0] = 8'h45; p[1] = 8'h00;
+    p[2] = totlen[15:8]; p[3] = totlen[7:0];
+    p[8] = 8'h40;               // TTL
+    p[9] = 8'h06;               // TCP
+    p[12] = sip[31:24]; p[13] = sip[23:16]; p[14] = sip[15:8]; p[15] = sip[7:0];
+    p[16] = dip[31:24]; p[17] = dip[23:16]; p[18] = dip[15:8]; p[19] = dip[7:0];
+    cs = ip_header_csum(p);
+    p[10] = cs[15:8]; p[11] = cs[7:0];
+    // TCP header
+    p[20] = sp[15:8]; p[21] = sp[7:0];
+    p[22] = dp[15:8]; p[23] = dp[7:0];
+    p[24] = seq[31:24]; p[25] = seq[23:16]; p[26] = seq[15:8]; p[27] = seq[7:0];
+    p[28] = ack[31:24]; p[29] = ack[23:16]; p[30] = ack[15:8]; p[31] = ack[7:0];
+    p[32] = (hdrlen / 4) << 4;
+    p[33] = flags;
+    p[34] = win[15:8]; p[35] = win[7:0];
+    // options (pad with NOP=1)
+    for (int i = 0; i < optlen; i++)
+      p[40+i] = (i < opts.size()) ? opts[i] : 8'h01;
+    // payload
+    foreach (payload[i]) p[40+optlen+i] = payload[i];
+    cs = tcp_csum(p);
+    p[36] = cs[15:8]; p[37] = cs[7:0];
+    return p;
+  endfunction
+
+  function automatic bytes_t no_bytes();
+    bytes_t e; e = new[0]; return e;
+  endfunction
+
+  function automatic bytes_t syn_options(input bit with_ws);
+    bytes_t o;
+    if (with_ws) begin
+      o = new[8];
+      o[0] = 8'h02; o[1] = 8'h04; o[2] = 8'h05; o[3] = 8'hB4;  // MSS 1460
+      o[4] = 8'h03; o[5] = 8'h03; o[6] = 8'h02; o[7] = 8'h01;  // WS shift=2 + NOP
+    end
+    else begin
+      o = new[4];
+      o[0] = 8'h02; o[1] = 8'h04; o[2] = 8'h05; o[3] = 8'hB4;
+    end
+    return o;
+  endfunction
+
+  // scan TCP options of packet p for `kind`; returns 1 if present and its
+  // first value byte (byte at offset+2) in val (0 for 1/2-byte options)
+  function automatic bit find_option(input bytes_t p, input byte unsigned kind,
+                                     output byte unsigned val);
+    bytes_t o;
+    int i;
+    o = f_options(p);
+    i = 0; val = 0;
+    while (i < o.size()) begin
+      if (o[i] == 8'h00) return 0;          // EOL
+      if (o[i] == kind) begin
+        if (o[i] == 8'h01) begin val = 0; return 1; end
+        if (i+2 < o.size()) val = o[i+2];
+        return 1;
+      end
+      if (o[i] == 8'h01) i++;               // NOP
+      else if (i+1 < o.size() && o[i+1] >= 2) i += o[i+1];
+      else return 0;                        // malformed
+    end
+    return 0;
+  endfunction
+
+  function automatic bytes_t gen_payload(input int len, input byte unsigned seed);
+    bytes_t d;
+    d = new[len];
+    for (int i = 0; i < len; i++) d[i] = (seed + i) & 8'hFF;
+    return d;
+  endfunction
+
+  //---------------------------------------------------------------------------
+  // Network input driver
+  //---------------------------------------------------------------------------
+  task automatic net_send(input bytes_t p);
+    int nbeats;
+    nbeats = (p.size() + 7) / 8;
+    print_pkt("NET->DUT", p);
+    for (int b = 0; b < nbeats; b++) begin
+      bit [63:0] d; bit [7:0] k;
+      d = '0; k = '0;
+      for (int i = 0; i < 8; i++) begin
+        int idx;
+        idx = b*8 + i;
+        if (idx < p.size()) begin
+          d[8*i +: 8] = p[idx];
+          k[i] = 1'b1;
+        end
+      end
+      s_tcp_tdata <= d; s_tcp_tkeep <= k; s_tcp_tstrb <= k;
+      s_tcp_tlast <= (b == nbeats-1);
+      s_tcp_tvalid <= 1;
+      do @(posedge ap_clk); while (!s_tcp_tready);
+    end
+    s_tcp_tvalid <= 0; s_tcp_tlast <= 0;
+    tb_info("net_send done");
+  endtask
+
+  //---------------------------------------------------------------------------
+  // Wait / expect helpers
+  //---------------------------------------------------------------------------
+  task automatic wait_pkt(output bytes_t p, input int timeout_cycles, output bit ok);
+    int n;
+    n = 0; ok = 0;
+    while (n < timeout_cycles) begin
+      @(posedge ap_clk);
+      n++;
+      if (net_pkts.size() > 0) begin
+        p = net_pkts.pop_front();
+        ok = 1;
+        return;
+      end
+    end
+    p = no_bytes();
+  endtask
+
+  // wait for a packet with all `must` flags set; optionally skip pure ACKs
+  task automatic expect_flags(input bit [7:0] must, input string what,
+                              output bytes_t p, input int timeout_cycles,
+                              input bit skip_pure_ack);
+    bit ok;
+    forever begin
+      wait_pkt(p, timeout_cycles, ok);
+      if (!ok) begin
+        tb_error($sformatf("timeout waiting for %s", what));
+        return;
+      end
+      if ((f_flags(p) & must) == must) begin
+        tb_info($sformatf("got expected %s", what));
+        return;
+      end
+      if (skip_pure_ack && (f_flags(p) == F_ACK) && f_payload_len(p) == 0) begin
+        tb_info($sformatf("(skipping pure ACK while waiting for %s)", what));
+        continue;
+      end
+      tb_error($sformatf("expected %s, got flags=%s", what, flags_str(f_flags(p))));
+      return;
+    end
+  endtask
+
+  task automatic wait_notif(output notif_t n, input int timeout_cycles, output bit ok);
+    int cyc;
+    cyc = 0; ok = 0;
+    while (cyc < timeout_cycles) begin
+      @(posedge ap_clk);
+      cyc++;
+      if (notif_q.size() > 0) begin
+        n = notif_q.pop_front();
+        ok = 1;
+        return;
+      end
+    end
+  endtask
+
+  //---------------------------------------------------------------------------
+  // App BFM tasks
+  //---------------------------------------------------------------------------
+  task automatic app_listen(input bit [15:0] port, output bit ok);
+    int n;
+    listen_req_tdata <= port; listen_req_tvalid <= 1;
+    do @(posedge ap_clk); while (!listen_req_tready);
+    listen_req_tvalid <= 0;
+    ok = 0; n = 0;
+    while (n < 10000) begin
+      @(posedge ap_clk); n++;
+      if (listen_rsp_q.size() > 0) begin
+        ok = listen_rsp_q.pop_front();
+        return;
+      end
+    end
+    tb_error("timeout waiting for listen response");
+  endtask
+
+  task automatic app_read(input bit [15:0] sid, input int len,
+                          output byte unsigned data[$]);
+    int n, start_bytes;
+    n = 0;
+    start_bytes = app_rx_bytes.size();
+    rxreq_tdata[15:0]  <= sid;
+    rxreq_tdata[31:16] <= len[15:0];
+    rxreq_tvalid <= 1;
+    do @(posedge ap_clk); while (!rxreq_tready);
+    rxreq_tvalid <= 0;
+    while (app_rx_bytes.size() < start_bytes + len && n < 100000) begin
+      @(posedge ap_clk); n++;
+    end
+    if (app_rx_bytes.size() < start_bytes + len)
+      tb_error($sformatf("app_read timeout: wanted %0d bytes, got %0d",
+               len, app_rx_bytes.size() - start_bytes));
+    data.delete();
+    for (int i = start_bytes; i < app_rx_bytes.size(); i++)
+      data.push_back(app_rx_bytes[i]);
+  endtask
+
+  // returns response (error==0 -> data actually sent)
+  task automatic app_send(input bit [15:0] sid, input bytes_t data,
+                          output txrsp_t rsp);
+    int n;
+    n = 0;
+    txmeta_tdata[15:0]  <= sid;
+    txmeta_tdata[31:16] <= data.size();
+    txmeta_tvalid <= 1;
+    do @(posedge ap_clk); while (!txmeta_tready);
+    txmeta_tvalid <= 0;
+    while (txrsp_q.size() == 0 && n < 100000) begin
+      @(posedge ap_clk); n++;
+    end
+    if (txrsp_q.size() == 0) begin
+      tb_error("app_send: timeout waiting for txDataRsp");
+      rsp = '0; rsp.error = 2'b11;
+      return;
+    end
+    rsp = txrsp_q.pop_front();
+    if (rsp.error != 0) return;
+    begin
+      int nbeats;
+      nbeats = (data.size() + 7) / 8;
+      for (int b = 0; b < nbeats; b++) begin
+        bit [63:0] d; bit [7:0] k;
+        d = '0; k = '0;
+        for (int i = 0; i < 8; i++) begin
+          int idx;
+          idx = b*8 + i;
+          if (idx < data.size()) begin
+            d[8*i +: 8] = data[idx];
+            k[i] = 1'b1;
+          end
+        end
+        txdata_tdata <= d; txdata_tkeep <= k; txdata_tstrb <= k;
+        txdata_tlast <= (b == nbeats-1);
+        txdata_tvalid <= 1;
+        do @(posedge ap_clk); while (!txdata_tready);
+      end
+      txdata_tvalid <= 0; txdata_tlast <= 0;
+    end
+  endtask
+
+  task automatic app_open(input bit [31:0] ip_le, input bit [15:0] port);
+    open_req_tdata[31:0]  <= ip_le;
+    open_req_tdata[47:32] <= port;
+    open_req_tvalid <= 1;
+    do @(posedge ap_clk); while (!open_req_tready);
+    open_req_tvalid <= 0;
+  endtask
+
+  task automatic app_close(input bit [15:0] sid);
+    close_req_tdata <= sid; close_req_tvalid <= 1;
+    do @(posedge ap_clk); while (!close_req_tready);
+    close_req_tvalid <= 0;
+  endtask
+
+  //---------------------------------------------------------------------------
+  // Peer connection state (single connection helper for tests)
+  //---------------------------------------------------------------------------
+  bit [31:0] peer_seq;      // next seq we will send
+  bit [31:0] peer_ack;      // next expected byte from TOE (our ack)
+  bit [15:0] peer_port;
+  bit [15:0] toe_port;
+  bit [15:0] peer_win = 16'hFFFF;
+
+  task automatic peer_send_seg(input bit [7:0] flags, input bytes_t payload);
+    bytes_t p;
+    p = make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                 peer_seq, peer_ack, flags, peer_win, no_bytes(), payload);
+    net_send(p);
+  endtask
+
+  // Passive-open handshake (TOE is server). Leaves peer_seq/peer_ack set.
+  task automatic do_passive_handshake(input bit [15:0] lport, input bit [15:0] rport,
+                                      input bit [31:0] init_seq = 32'h1000_0000);
+    bytes_t p;
+    bit [31:0] toe_iss;
+    peer_port = rport; toe_port = lport;
+    peer_seq  = init_seq;
+    peer_win  = 16'hFFFF;
+    // SYN ->
+    p = make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                 peer_seq, 0, F_SYN, 16'hFFFF, syn_options(1), no_bytes());
+    net_send(p);
+    // <- SYN-ACK
+    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 50000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq + 1, $sformatf("SYN-ACK ack=%0d expected %0d", f_ack(p), peer_seq+1));
+    tb_check(f_src_port(p) == lport, "SYN-ACK src port");
+    tb_check(f_dst_port(p) == rport, "SYN-ACK dst port");
+    toe_iss  = f_seq(p);
+    peer_ack = toe_iss + 1;
+    peer_seq = peer_seq + 1;
+    // ACK ->
+    peer_send_seg(F_ACK, no_bytes());
+    tb_info($sformatf("handshake complete, TOE ISS=%0d", toe_iss));
+  endtask
+
+  //---------------------------------------------------------------------------
+  // Tests
+  //---------------------------------------------------------------------------
+  task automatic test_passive_open();
+    bytes_t p, pay;
+    bit ok;
+    notif_t n;
+    byte unsigned rdata[$];
+    bit [15:0] sid;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80) accepted");
+
+    do_passive_handshake(16'd80, 16'd41000);
+    if (err_count) return;
+
+    // --- peer sends 32B data ---
+    pay = gen_payload(32, 8'h10);
+    peer_send_seg(F_ACK, pay);
+    wait_notif(n, 100000, ok);
+    tb_check(ok, "data notification received");
+    if (!ok) return;
+    tb_check(n.length == 32, $sformatf("notification length=%0d expected 32", n.length));
+    tb_check(n.dstPort == 80, "notification dst port");
+    sid = n.sessionID;
+    peer_seq += 32;
+
+    // app reads the data
+    app_read(sid, 32, rdata);
+    tb_check(rdata.size() == 32, "app_read got 32 bytes");
+    for (int i = 0; i < 32 && i < rdata.size(); i++)
+      if (rdata[i] != pay[i]) begin
+        tb_check(0, $sformatf("payload byte %0d mismatch: %h != %h", i, rdata[i], pay[i]));
+        break;
+      end
+
+    // expect (delayed) ACK covering the data
+    expect_flags(F_ACK, "ACK of data", p, 300000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq, $sformatf("data ACK ack=%0d expected %0d", f_ack(p), peer_seq));
+
+    // --- peer closes: FIN ---
+    peer_send_seg(F_FIN | F_ACK, no_bytes());
+    peer_seq += 1;
+    // TOE notifies app of close
+    wait_notif(n, 300000, ok);
+    tb_check(ok && n.closed, "close notification");
+    // TOE sends its own FIN (possibly preceded by an ACK) - CLOSE_WAIT is skipped
+    expect_flags(F_FIN, "FIN from TOE", p, 400000, 1);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq, $sformatf("FIN ack=%0d expected %0d", f_ack(p), peer_seq));
+    peer_ack = f_seq(p) + f_payload_len(p) + 1;
+    // final ACK ->
+    peer_send_seg(F_ACK, no_bytes());
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  task automatic peer_ack_fin(input bytes_t fin_pkt);
+    bytes_t p;
+    // ACK of TOE FIN
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, f_seq(fin_pkt) + 1, F_ACK, peer_win,
+                      no_bytes(), no_bytes()));
+    // our FIN
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, f_seq(fin_pkt) + 1, F_FIN | F_ACK, peer_win,
+                      no_bytes(), no_bytes()));
+    peer_seq += 1;
+    // TOE should ACK our FIN (goes to TIME_WAIT)
+    expect_flags(F_ACK, "ACK of peer FIN (TIME_WAIT)", p, 400000, 0);
+    if (!err_count)
+      tb_check(f_ack(p) == peer_seq, $sformatf("TIME_WAIT ack=%0d expected %0d", f_ack(p), peer_seq));
+  endtask
+
+  task automatic test_active_open();
+    bytes_t p, pay;
+    bit ok;
+    bit [31:0] toe_iss;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    openrsp_t orsp;
+    int n;
+
+    // app initiates connection to PEER_IP:60000
+    // (openConnReq takes the IP in display/big-endian order, the port in host order)
+    app_open(PEER_IP, 16'd60000);
+    // <- SYN
+    expect_flags(F_SYN, "SYN", p, 100000, 0);
+    if (err_count) return;
+    tb_check((f_flags(p) & F_ACK) == 0, "SYN has no ACK flag");
+    tb_check(f_dst_ip(p) == PEER_IP, $sformatf("SYN dst ip %h expected %h", f_dst_ip(p), PEER_IP));
+    tb_check(f_dst_port(p) == 16'd60000, $sformatf("SYN dst port %0d expected 60000", f_dst_port(p)));
+    // check options: MSS + window scale expected
+    begin
+      bytes_t o;
+      bit seen_mss, seen_ws;
+      int i;
+      o = f_options(p);
+      seen_mss = 0; seen_ws = 0; i = 0;
+      while (i < o.size()) begin
+        if (o[i] == 8'h00) break;
+        else if (o[i] == 8'h01) i++;
+        else if (o[i] == 8'h02) begin
+          seen_mss = 1;
+          tb_check({o[i+2], o[i+3]} == MSS[15:0], "SYN MSS option value");
+          i += 4;
+        end
+        else if (o[i] == 8'h03) begin seen_ws = 1; i += 3; end
+        else i += (i+1 < o.size() && o[i+1] > 0) ? o[i+1] : 1;
+      end
+      tb_check(seen_mss, "SYN carries MSS option");
+      tb_check(seen_ws, "SYN carries window-scale option");
+    end
+    toe_iss   = f_seq(p);
+    toe_port  = f_src_port(p);
+    peer_port = 16'd60000;
+    peer_seq  = 32'h2000_0000;
+    peer_ack  = toe_iss + 1;
+    peer_win  = 16'hFFFF;
+    // SYN-ACK ->
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, peer_ack, F_SYN | F_ACK, 16'hFFFF,
+                      syn_options(1), no_bytes()));
+    peer_seq += 1;
+    // <- ACK
+    expect_flags(F_ACK, "final ACK of 3WHS", p, 100000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq, "3WHS ACK number");
+    // open response to app
+    n = 0;
+    while (openrsp_q.size() == 0 && n < 50000) begin @(posedge ap_clk); n++; end
+    tb_check(openrsp_q.size() > 0, "openConnRsp received");
+    if (openrsp_q.size() == 0) return;
+    orsp = openrsp_q.pop_front();
+    tb_check(orsp.success != 0, "openConnRsp success");
+    sid = orsp.sessionID;
+
+    // --- app sends 64B ---
+    pay = gen_payload(64, 8'hA0);
+    app_send(sid, pay, rsp);
+    tb_check(rsp.error == 0, $sformatf("app_send accepted (err=%0d)", rsp.error));
+    expect_flags(F_ACK, "data segment", p, 300000, 0);
+    if (err_count) return;
+    tb_check(f_payload_len(p) == 64, $sformatf("data len=%0d expected 64", f_payload_len(p)));
+    tb_check(f_seq(p) == peer_ack, "data seq");
+    begin
+      bytes_t d;
+      d = f_payload(p);
+      for (int i = 0; i < 64 && i < d.size(); i++)
+        if (d[i] != pay[i]) begin
+          tb_check(0, $sformatf("tx payload byte %0d mismatch %h != %h", i, d[i], pay[i]));
+          break;
+        end
+    end
+    peer_ack += 64;
+    peer_send_seg(F_ACK, no_bytes());
+
+    // --- app closes ---
+    app_close(sid);
+    expect_flags(F_FIN, "FIN after app close", p, 300000, 1);
+    if (err_count) return;
+    tb_check(f_seq(p) == peer_ack, "FIN seq");
+    peer_ack_fin(p);
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  task automatic test_rx_out_of_order();
+    bytes_t p, payA, payB;
+    bit ok;
+    notif_t n;
+    byte unsigned rdata[$];
+    bit [15:0] sid;
+    bit [31:0] base_seq;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+    do_passive_handshake(16'd80, 16'd41001);
+    if (err_count) return;
+    base_seq = peer_seq;
+
+    payA = gen_payload(1000, 8'h20);
+    payB = gen_payload(500, 8'h60);
+
+`ifdef NO_RX_BYPASS
+    // --- RX_DDR_BYPASS=0: single-gap OOO buffering ---
+    // send segment B first (seq skips 1000 bytes) -> buffered as premature
+    // data in DDR; dup-ACK sent; the internal length-0 notification is
+    // filtered by rxAppNotificationDelayer, so the app sees nothing yet
+    peer_seq = base_seq + 1000;
+    peer_send_seg(F_ACK, payB);
+    expect_flags(F_ACK, "dup ACK for OOO segment", p, 100000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == base_seq, $sformatf("dup ACK ack=%0d expected %0d (gap open)", f_ack(p), base_seq));
+    tb_check(notif_q.size() == 0, "no app notification for buffered OOO segment");
+
+    // segment A fills the gap exactly -> one notification covering A+B (1500B)
+    peer_seq = base_seq;
+    peer_send_seg(F_ACK, payA);
+    wait_notif(n, 100000, ok);
+    tb_check(ok && n.length == 1500, $sformatf("gap-fill notified len=%0d expected 1500", n.length));
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq = base_seq + 1500;
+
+    app_read(sid, 1500, rdata);
+    tb_check(rdata.size() == 1500, "app_read got 1500 bytes");
+    for (int i = 0; i < 1000 && i < rdata.size(); i++)
+      if (rdata[i] != payA[i]) begin tb_check(0, "segment A payload mismatch"); break; end
+    for (int i = 0; i < 500 && (1000+i) < rdata.size(); i++)
+      if (rdata[1000+i] != payB[i]) begin tb_check(0, "segment B payload mismatch"); break; end
+`else
+    // --- RX_DDR_BYPASS=1: OOO segments are dropped ---
+    // send segment B first (seq skips 1000 bytes) -> dropped in bypass mode
+    peer_seq = base_seq + 1000;
+    peer_send_seg(F_ACK, payB);
+    // expect immediate dup-ACK with ack == base_seq (nothing accepted)
+    expect_flags(F_ACK, "dup ACK for OOO segment", p, 100000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == base_seq, $sformatf("dup ACK ack=%0d expected %0d (OOO dropped)", f_ack(p), base_seq));
+    tb_check(notif_q.size() == 0, "no app notification for OOO segment");
+
+    // now send segment A in order -> accepted
+    peer_seq = base_seq;
+    peer_send_seg(F_ACK, payA);
+    wait_notif(n, 100000, ok);
+    tb_check(ok && n.length == 1000, "in-order segment A notified");
+    if (!ok) return;
+    sid = n.sessionID;
+
+    // resend segment B, now in order -> accepted
+    peer_seq = base_seq + 1000;
+    peer_send_seg(F_ACK, payB);
+    wait_notif(n, 100000, ok);
+    tb_check(ok && n.length == 500, "retransmitted segment B notified");
+    peer_seq = base_seq + 1500;
+
+    app_read(sid, 1000, rdata);
+    for (int i = 0; i < 1000 && i < rdata.size(); i++)
+      if (rdata[i] != payA[i]) begin tb_check(0, "segment A payload mismatch"); break; end
+    app_read(sid, 500, rdata);
+    for (int i = 0; i < 500 && i < rdata.size(); i++)
+      if (rdata[i] != payB[i]) begin tb_check(0, "segment B payload mismatch"); break; end
+`endif
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  task automatic test_fast_retransmit();
+    bytes_t p, pay;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] d0_seq, d0_end;
+    int got;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd41002);
+    if (err_count) return;
+
+    // learn session id: peer sends 8B first
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 100000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+
+    // app sends 5 x 1000B
+    for (int i = 0; i < 5; i++) begin
+      pay = gen_payload(1000, 8'h30 + i[7:0]);
+      app_send(sid, pay, rsp);
+      tb_check(rsp.error == 0, $sformatf("app_send %0d accepted", i));
+    end
+    // collect the 5 data segments (skip delayed ACK of the 8B)
+    got = 0; d0_seq = 0;
+    while (got < 5) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout collecting data segments"); return; end
+      if (f_payload_len(p) == 1000) begin
+        if (got == 0) d0_seq = f_seq(p);
+        got++;
+      end
+    end
+    d0_end = d0_seq + 1000;
+
+    // 1 regular ACK for first segment, then 3 duplicate ACKs
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_end, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (100) @(posedge ap_clk);
+    for (int i = 0; i < 3; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, d0_end, F_ACK, peer_win, no_bytes(), no_bytes()));
+      repeat (50) @(posedge ap_clk);
+    end
+
+    // expect fast retransmission starting at d0_end (go-back-N)
+    got = 0;
+    while (got == 0) begin
+      wait_pkt(p, 500000, ok);
+      if (!ok) begin tb_error("timeout waiting for fast retransmit"); return; end
+      if (f_payload_len(p) > 0) begin
+        tb_check(f_seq(p) == d0_end,
+          $sformatf("fast-rtx seq=%0d expected %0d", f_seq(p), d0_end));
+        got = 1;
+      end
+    end
+    // ACK everything to clean up
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq + 5000, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  task automatic test_rst_handling();
+    bytes_t p;
+    bit ok;
+    notif_t n;
+
+    // 1) data segment to a port nobody listens on -> RST from TOE
+    net_send(make_tcp(PEER_IP, TOE_IP, 16'd50000, 16'd12345,
+                      32'h0300_0000, 32'h0, F_ACK, 16'hFFFF,
+                      no_bytes(), gen_payload(4, 8'h55)));
+    expect_flags(F_RST, "RST for closed port", p, 100000, 0);
+    if (err_count) return;
+
+    // 2) established session + RST with seq == recvd -> session closed, app notified
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd41003);
+    if (err_count) return;
+    peer_send_seg(F_RST, no_bytes());
+    wait_notif(n, 300000, ok);
+    tb_check(ok && n.closed, "app notified of RST close");
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  task automatic test_zero_window();
+    bytes_t p, pay;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd41004);
+    if (err_count) return;
+
+    // learn session id
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 100000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+
+    // consume the delayed ACK of the 8B data
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    // peer advertises zero window
+    peer_win = 16'h0000;
+    peer_send_seg(F_ACK, no_bytes());
+    repeat (5000) @(posedge ap_clk);
+
+    // app tries to send -> must be rejected (no window)
+    pay = gen_payload(1000, 8'h77);
+    app_send(sid, pay, rsp);
+    tb_check(rsp.error != 0, $sformatf("send with zero window rejected (err=%0d)", rsp.error));
+    begin
+      wait_pkt(p, 30000, ok);
+      if (ok && f_payload_len(p) > 0)
+        tb_check(0, "TOE sent data despite zero window");
+    end
+
+    // window update
+    peer_win = 16'h4000;
+    peer_send_seg(F_ACK, no_bytes());
+    repeat (2000) @(posedge ap_clk);
+    app_send(sid, pay, rsp);
+    tb_check(rsp.error == 0, $sformatf("send after window update accepted (err=%0d)", rsp.error));
+    expect_flags(F_ACK, "data after window update", p, 400000, 0);
+    if (!err_count)
+      tb_check(f_payload_len(p) == 1000, "1000B data segment after window opened");
+    peer_win = 16'hFFFF;
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  // B4 regression (issue #31 + rxAppMemAccessBreakdown 64KB bug): memory
+  // accesses that wrap the per-session 256KB circular buffer (or merely cross
+  // a 64KB boundary on the legacy rx-app read splitter) must return correct
+  // data.
+  localparam int BUF_SIZE = 1 << 18;   // WINDOW_BITS = 18
+
+  task automatic wrap_rx_subtest(input bit [15:0] rport, input bit [31:0] init_seq,
+                                 input int dlen, input string what);
+    bytes_t pay;
+    bit ok;
+    notif_t n;
+    byte unsigned rdata[$];
+    do_passive_handshake(16'd80, rport, init_seq);
+    if (err_count) return;
+    pay = gen_payload(dlen, 8'h33);
+    peer_send_seg(F_ACK, pay);
+    wait_notif(n, 100000, ok);
+    tb_check(ok && n.length == dlen[15:0], {what, ": data notification"});
+    if (!ok) return;
+    peer_seq += dlen;
+    app_read(n.sessionID, dlen, rdata);
+    tb_check(rdata.size() == dlen, {what, ": read length"});
+    for (int i = 0; i < dlen && i < rdata.size(); i++)
+      if (rdata[i] != pay[i]) begin
+        tb_check(0, $sformatf("%s: payload mismatch at byte %0d (%h != %h)",
+                              what, i, rdata[i], pay[i]));
+        break;
+      end
+    tb_info({what, ": data verified"});
+  endtask
+
+  task automatic test_buffer_wrap();
+    bytes_t p;
+    bit ok, found;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    int tries;
+    bit [31:0] iss;
+    bit [17:0] off;
+    byte unsigned sent[$];
+    bit [31:0] data_base;
+    int got, rt_bytes;
+    bytes_t pay;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+
+`ifdef NO_RX_BYPASS
+    // --- RX side: peer seq crossing the 256KB buffer wrap ---
+    wrap_rx_subtest(16'd42000, 32'h0003FF69, 400, "rx 256KB wrap");
+    if (err_count) return;
+    // --- RX side: crossing only a 64KB boundary (legacy splitter bug) ---
+    wrap_rx_subtest(16'd42001, 32'h0000FF00, 400, "rx 64KB crossing");
+    if (err_count) return;
+`endif
+
+    // --- TX side: find a connection whose TOE ISS lands just below the
+    // 256KB boundary, then trigger go-back-N retransmission across the wrap ---
+    tries = 0; found = 0;
+    while (tries < 400 && !found) begin
+      peer_port = 16'd43000 + tries[15:0];
+      toe_port  = 16'd80;
+      peer_seq  = 32'h5000_0000 + tries * 32'd100;
+      peer_ack  = 0;
+      peer_win  = 16'hFFFF;
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, 0, F_SYN, 16'hFFFF, syn_options(1), no_bytes()));
+      expect_flags(F_SYN | F_ACK, "SYN-ACK (ISS hunt)", p, 100000, 0);
+      if (err_count) return;
+      iss = f_seq(p);
+      off = iss[17:0];
+      peer_ack = iss + 1;
+      peer_seq += 1;
+      if (off > (BUF_SIZE - 5000) && off < (BUF_SIZE - 2000)) begin
+        peer_send_seg(F_ACK, no_bytes());   // establish
+        found = 1;
+      end
+      else begin
+        peer_send_seg(F_RST, no_bytes());   // abort, free the session
+        repeat (300) @(posedge ap_clk);
+      end
+      tries++;
+    end
+    tb_check(found, $sformatf("found ISS near buffer boundary after %0d tries", tries));
+    if (!found) return;
+    tb_info($sformatf("using ISS=%0d (offset %0d, %0d bytes below wrap)",
+                      iss, off, BUF_SIZE - off));
+    notif_q.delete();   // drop close notifications from aborted tries
+
+    // learn session id: peer sends 8B
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 100000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+
+    // app sends 4x1400B; payload stream crosses the buffer boundary
+    data_base = iss + 1;
+    sent.delete();
+    for (int i = 0; i < 4; i++) begin
+      pay = gen_payload(1400, 8'h50 + i[7:0]);
+      app_send(sid, pay, rsp);
+      tb_check(rsp.error == 0, $sformatf("app_send %0d accepted", i));
+      foreach (pay[j]) sent.push_back(pay[j]);
+    end
+    // collect the 4 original data segments
+    got = 0;
+    while (got < 4) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout collecting data segments"); return; end
+      if (f_payload_len(p) == 1400) got++;
+    end
+
+    // ACK first segment, then 3 dup ACKs -> fast retransmit replays from
+    // ackd across the buffer wrap (DDR read gets split)
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, data_base + 1400, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (100) @(posedge ap_clk);
+    for (int i = 0; i < 3; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, data_base + 1400, F_ACK, peer_win, no_bytes(), no_bytes()));
+      repeat (50) @(posedge ap_clk);
+    end
+
+    // verify every retransmitted byte against the original stream
+    rt_bytes = 0;
+    while (rt_bytes < 4200) begin
+      bytes_t d;
+      int soff;
+      wait_pkt(p, 500000, ok);
+      if (!ok) begin tb_error("timeout waiting for retransmissions"); return; end
+      if (f_payload_len(p) == 0) continue;
+      d = f_payload(p);
+      soff = f_seq(p) - data_base;
+      tb_check(soff >= 0 && soff + d.size() <= 5600, "rtx segment within sent range");
+      for (int i = 0; i < d.size(); i++)
+        if (d[i] !== sent[soff + i]) begin
+          tb_check(0, $sformatf("rtx payload mismatch at stream offset %0d (%h != %h)",
+                                soff + i, d[i], sent[soff + i]));
+          return;
+        end
+      tb_info($sformatf("rtx segment seq-off=%0d len=%0d verified", soff, d.size()));
+      rt_bytes += d.size();
+    end
+
+    // clean up: ACK everything
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, data_base + 5600, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+`ifdef NO_RX_BYPASS
+  // B6 regression: with a gap open, a retransmitted segment that starts at
+  // recvd but OVERLAPS the buffered premature data (seq+len > offset) hit a
+  // branchless path in rx_engine - no SAR update, no drop token - wedging
+  // rxPackageDropper and the whole RX data path permanently.
+  task automatic test_rx_ooo_overlap();
+    bytes_t p, stream_data, segA, segB, segC;
+    bit ok;
+    notif_t n;
+    byte unsigned rdata[$];
+    bit [15:0] sid;
+    bit [31:0] base_seq;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+    do_passive_handshake(16'd80, 16'd41020);
+    if (err_count) return;
+    base_seq = peer_seq;
+
+    // consistent byte stream: A' = S[0:1200), B = S[1000:1500)
+    stream_data = gen_payload(1500, 8'h70);
+    segA = new[1200]; for (int i = 0; i < 1200; i++) segA[i] = stream_data[i];
+    segB = new[500];  for (int i = 0; i < 500;  i++) segB[i] = stream_data[1000+i];
+
+    // open a gap: B at base+1000
+    peer_seq = base_seq + 1000;
+    peer_send_seg(F_ACK, segB);
+    expect_flags(F_ACK, "dup ACK (gap open)", p, 100000, 0);
+    if (err_count) return;
+
+    // overlapping retransmission: A' at base, len 1200 (> offset by 200)
+    peer_seq = base_seq;
+    peer_send_seg(F_ACK, segA);
+    wait_notif(n, 200000, ok);
+    tb_check(ok && n.length == 1500, $sformatf("overlap fill notified len=%0d expected 1500",
+                                               ok ? n.length : 16'd0));
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq = base_seq + 1500;
+
+    app_read(sid, 1500, rdata);
+    tb_check(rdata.size() == 1500, "read 1500 bytes");
+    for (int i = 0; i < 1500 && i < rdata.size(); i++)
+      if (rdata[i] != stream_data[i]) begin
+        tb_check(0, $sformatf("stream mismatch at byte %0d (%h != %h)",
+                              i, rdata[i], stream_data[i]));
+        break;
+      end
+
+    // RX path must still be alive: one more in-order segment
+    segC = gen_payload(100, 8'hC0);
+    peer_send_seg(F_ACK, segC);
+    wait_notif(n, 200000, ok);
+    tb_check(ok && n.length == 100, "rx path alive after overlap handling");
+    repeat (2000) @(posedge ap_clk);
+  endtask
+`endif
+
+  // B5 regression (issues #42/#43): the SYN option parser must survive
+  // malformed / exotic option lists and clamp window-scale shifts > 14.
+  // Pre-fix RTL deadlocks the whole RX path on a zero-length unknown option.
+  task automatic test_opt_parser_robust();
+    bytes_t p, opts;
+    bit ok, found;
+    byte unsigned val;
+    notif_t n;
+    bit ws_expected;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+
+    // --- conn 1: SYN with malformed option (kind 254, length 0) ---
+    // pre-fix: option parser spins forever -> no SYN-ACK ever
+    opts = new[4];
+    opts[0] = 8'hFE; opts[1] = 8'h00; opts[2] = 8'h00; opts[3] = 8'h00;
+    peer_port = 16'd41010; toe_port = 16'd80;
+    peer_seq  = 32'h4000_0000; peer_win = 16'hFFFF;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, 0, F_SYN, 16'hFFFF, opts, no_bytes()));
+    expect_flags(F_SYN | F_ACK, "SYN-ACK for malformed-option SYN", p, 100000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq + 1, "SYN-ACK ack number (conn 1)");
+    found = find_option(p, 8'h03, val);
+    tb_check(!found, "no WS option echoed when peer WS was unparseable");
+    peer_ack = f_seq(p) + 1;
+    peer_seq += 1;
+    peer_send_seg(F_ACK, no_bytes());
+    // session must be functional: send 8B, expect notification
+    peer_send_seg(F_ACK, gen_payload(8, 8'h11));
+    wait_notif(n, 100000, ok);
+    tb_check(ok && n.length == 8, "conn 1 delivers data after malformed options");
+    peer_seq += 8;
+
+    // --- conn 2: exotic but legal list: MSS, unknown kind 253 len 4, NOP, WS=14 ---
+    opts = new[12];
+    opts[0]=8'h02; opts[1]=8'h04; opts[2]=8'h05; opts[3]=8'hB4;   // MSS 1460
+    opts[4]=8'hFD; opts[5]=8'h04; opts[6]=8'hAA; opts[7]=8'hBB;   // unknown, len 4
+    opts[8]=8'h01;                                                // NOP
+    opts[9]=8'h03; opts[10]=8'h03; opts[11]=8'h0E;                // WS shift=14
+    peer_port = 16'd41011;
+    peer_seq  = 32'h4100_0000;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, 0, F_SYN, 16'hFFFF, opts, no_bytes()));
+    expect_flags(F_SYN | F_ACK, "SYN-ACK for exotic-option SYN", p, 100000, 0);
+    if (err_count) return;
+    found = find_option(p, 8'h03, val);
+    tb_check(found, "WS option present after skipping unknown option");
+    peer_ack = f_seq(p) + 1;
+    peer_seq += 1;
+    peer_send_seg(F_ACK, no_bytes());
+
+    // --- conn 3: out-of-range WS shift 15 (must be clamped, not corrupt state) ---
+    opts = new[8];
+    opts[0]=8'h02; opts[1]=8'h04; opts[2]=8'h05; opts[3]=8'hB4;   // MSS 1460
+    opts[4]=8'h03; opts[5]=8'h03; opts[6]=8'h0F; opts[7]=8'h01;   // WS shift=15 + NOP
+    peer_port = 16'd41012;
+    peer_seq  = 32'h4200_0000;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, 0, F_SYN, 16'hFFFF, opts, no_bytes()));
+    expect_flags(F_SYN | F_ACK, "SYN-ACK for WS=15 SYN", p, 100000, 0);
+    if (err_count) return;
+    found = find_option(p, 8'h03, val);
+    tb_check(found, "WS option echoed for WS=15 SYN");
+    peer_ack = f_seq(p) + 1;
+    peer_seq += 1;
+    peer_send_seg(F_ACK, no_bytes());
+    peer_send_seg(F_ACK, gen_payload(16, 8'h22));
+    wait_notif(n, 100000, ok);
+    tb_check(ok && n.length == 16, "conn 3 delivers data with clamped WS");
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  // B1 regression: an actively-opened session's ephemeral port must be
+  // returned to free_port_table when the session is torn down (peer RST ->
+  // CLOSED -> releaseSession -> port release). Uses a hierarchical probe into
+  // the freePortTable BRAM. Fails on RTL built before the endianness fix in
+  // session_lookup_controller.cpp (reverseLookupTableInterface).
+  task automatic test_port_release();
+    bytes_t p;
+    bit ok;
+    notif_t n;
+    int nn;
+    bit [15:0] eph_port;
+    int unsigned free_idx;
+    bit [31:0] toe_iss;
+
+    app_open(PEER_IP, 16'd60000);
+    expect_flags(F_SYN, "SYN", p, 100000, 0);
+    if (err_count) return;
+    eph_port = f_src_port(p);
+    tb_check(eph_port >= 16'd32768, $sformatf("ephemeral port %0d in 32768..65535", eph_port));
+    free_idx = eph_port & 16'h7FFF;
+    tb_check(dut.free_port_table_U0.freePortTable_U.ram[free_idx] === 1'b1,
+             "freePortTable entry marked used after allocation");
+
+    toe_iss   = f_seq(p);
+    toe_port  = eph_port;
+    peer_port = 16'd60000;
+    peer_seq  = 32'h3000_0000;
+    peer_ack  = toe_iss + 1;
+    peer_win  = 16'hFFFF;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, peer_ack, F_SYN | F_ACK, 16'hFFFF,
+                      syn_options(1), no_bytes()));
+    peer_seq += 1;
+    expect_flags(F_ACK, "final ACK of 3WHS", p, 100000, 0);
+    if (err_count) return;
+    nn = 0;
+    while (openrsp_q.size() == 0 && nn < 50000) begin @(posedge ap_clk); nn++; end
+    tb_check(openrsp_q.size() > 0, "openConnRsp received");
+    if (openrsp_q.size()) void'(openrsp_q.pop_front());
+
+    // peer resets the connection -> immediate teardown (no TIME_WAIT)
+    peer_send_seg(F_RST, no_bytes());
+    wait_notif(n, 300000, ok);
+    tb_check(ok && n.closed, "app notified of RST close");
+
+    nn = 0;
+    while (dut.free_port_table_U0.freePortTable_U.ram[free_idx] !== 1'b0 && nn < 200000) begin
+      @(posedge ap_clk); nn++;
+    end
+    tb_check(dut.free_port_table_U0.freePortTable_U.ram[free_idx] === 1'b0,
+             $sformatf("ephemeral port %0d released in freePortTable", eph_port));
+    nn = 0;
+    while (cam_delete_count == 0 && nn < 50000) begin
+      @(posedge ap_clk); nn++;
+    end
+    tb_check(cam_delete_count > 0, "CAM DELETE issued on session teardown");
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  // B7 regression. Requires a timer-scaled RTL build. After the TOE sends a
+  // FIN and the peer stays silent, the RTO must retransmit the FIN itself -
+  // pre-fix the RT path treated the FIN's phantom sequence byte as 1 byte of
+  // data and emitted a bogus 1-byte data segment at the FIN's seq number.
+  task automatic test_fin_retransmit();
+    bytes_t p;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    bit [31:0] fin_seq;
+    int got;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd41030);
+    if (err_count) return;
+
+    // learn session id
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 100000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    // app closes; peer neither ACKs the FIN nor responds
+    app_close(sid);
+    expect_flags(F_FIN, "original FIN", p, 300000, 1);
+    if (err_count) return;
+    fin_seq = f_seq(p);
+    tb_check(f_payload_len(p) == 0, "FIN carries no payload");
+
+    // wait for the retransmission (scaled RTO1 ~157k cycles); any data
+    // segment before it is the phantom-byte bug
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 1000000, ok);
+      if (!ok) begin tb_error("timeout waiting for FIN retransmission"); return; end
+      if (f_payload_len(p) != 0) begin
+        tb_check(0, $sformatf("bogus %0d-byte data segment at seq=%0d before FIN rtx",
+                              f_payload_len(p), f_seq(p)));
+        return;
+      end
+      if (f_flags(p) & F_FIN) begin
+        tb_check(f_seq(p) == fin_seq, $sformatf("FIN rtx seq=%0d expected %0d", f_seq(p), fin_seq));
+        got = 1;
+      end
+      // pure ACKs are ignored
+    end
+
+    // ACK the FIN to clean up
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, fin_seq + 1, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  // Requires the timer-scaled RTL build (buildsim, TCP_STACK_SIM_TIMER_SCALE=1000):
+  // first RTO = "1s"/1000 ~= 157k cycles. With the normal build this test
+  // would need ~156M cycles and will just time out.
+  task automatic test_rto_retransmit();
+    bytes_t p, pay;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] d_seq;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd41005);
+    if (err_count) return;
+
+    // learn session id
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 100000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    // consume delayed ACK of the 8B
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    // app sends 500B; peer does NOT acknowledge
+    pay = gen_payload(500, 8'h44);
+    app_send(sid, pay, rsp);
+    tb_check(rsp.error == 0, "app_send accepted");
+    expect_flags(F_ACK, "original data segment", p, 300000, 0);
+    if (err_count) return;
+    tb_check(f_payload_len(p) == 500, "original segment length");
+    d_seq = f_seq(p);
+
+    // wait for RTO retransmission (scaled RTO1 ~157k cycles)
+    expect_flags(F_ACK, "RTO retransmission", p, 1000000, 0);
+    if (err_count) return;
+    tb_check(f_payload_len(p) == 500, "retransmitted segment length");
+    tb_check(f_seq(p) == d_seq, $sformatf("rtx seq=%0d expected %0d", f_seq(p), d_seq));
+
+    // now ACK it - connection should recover
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d_seq + 500, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  //---------------------------------------------------------------------------
+  // Main
+  //---------------------------------------------------------------------------
+  initial begin
+    s_tcp_tvalid <= 0; s_tcp_tdata <= '0; s_tcp_tkeep <= '0; s_tcp_tstrb <= '0; s_tcp_tlast <= 0;
+    listen_req_tvalid <= 0; rxreq_tvalid <= 0; open_req_tvalid <= 0; close_req_tvalid <= 0;
+    txmeta_tvalid <= 0; txdata_tvalid <= 0; txdata_tlast <= 0;
+    txdata_tdata <= '0; txdata_tkeep <= '0; txdata_tstrb <= '0;
+
+    if (!$value$plusargs("TESTNAME=%s", testname))
+      testname = "passive_open";
+
+    if ($test$plusargs("DUMP")) begin
+      $dumpfile("tb_toe_top.vcd");
+      $dumpvars(1, tb_toe_top);
+    end
+
+    // reset
+    ap_rst_n = 0;
+    repeat (100) @(posedge ap_clk);
+    ap_rst_n = 1;
+    repeat (100) @(posedge ap_clk);
+
+    $display("=====================================================");
+    $display("  TOE RTL TB - running test: %s", testname);
+    $display("=====================================================");
+
+    case (testname)
+      "passive_open"   : test_passive_open();
+      "active_open"    : test_active_open();
+      "rx_out_of_order": test_rx_out_of_order();
+      "fast_retransmit": test_fast_retransmit();
+      "rst_handling"   : test_rst_handling();
+      "zero_window"    : test_zero_window();
+      "port_release"   : test_port_release();
+      "opt_parser_robust": test_opt_parser_robust();
+      "buffer_wrap"    : test_buffer_wrap();
+`ifdef NO_RX_BYPASS
+      "rx_ooo_overlap" : test_rx_ooo_overlap();
+`endif
+      "rto_retransmit" : test_rto_retransmit();
+      "fin_retransmit" : test_fin_retransmit();
+      default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
+    endcase
+
+    repeat (100) @(posedge ap_clk);
+    $display("=====================================================");
+    if (err_count == 0) $display("  TEST %s : PASS", testname);
+    else                $display("  TEST %s : FAIL (%0d errors)", testname, err_count);
+    $display("=====================================================");
+    $finish;
+  end
+
+  // global watchdog
+  initial begin
+    #(CLK_PERIOD * 10_000_000);
+    $display("[%0t] TB-ERROR: global watchdog expired", $time);
+    $display("  TEST %s : FAIL (watchdog)", testname);
+    $finish;
+  end
+
+endmodule

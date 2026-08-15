@@ -130,7 +130,9 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			}
 #endif
 			ap_uint<WINDOW_BITS> usableWindow = 0;
-			if (minWindow < usedLength)
+			// was inverted (minWindow < usedLength), yielding 0 whenever window
+			// was actually available and an underflowed value when oversubscribed
+			if (minWindow > usedLength)
 			{
 				usableWindow = minWindow - usedLength;
 			}
