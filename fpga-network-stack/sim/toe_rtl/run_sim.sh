@@ -28,7 +28,7 @@ if [ -n "${NO_RX_BYPASS}" ]; then
 fi
 RTL_DIR=${RTL_DIR:-${REPO_ROOT}/build10g/hls/toe/toe_prj/solution1/syn/verilog}
 
-ALL_TESTS="passive_open active_open rx_out_of_order fast_retransmit rst_handling zero_window port_release opt_parser_robust buffer_wrap window_update pure_fin_close mss_option tx_segmentation fast_recovery sack_selective_rtx half_close"
+ALL_TESTS="passive_open active_open rx_out_of_order fast_retransmit rst_handling zero_window port_release opt_parser_robust buffer_wrap window_update pure_fin_close mss_option tx_segmentation fast_recovery sack_selective_rtx half_close ts_negotiate paws_drop"
 # tests that only exist in the RX_DDR_BYPASS=0 build
 if [ -n "${NO_RX_BYPASS}" ]; then
     ALL_TESTS="${ALL_TESTS} rx_ooo_overlap seq_window_check sack_rx_gen"

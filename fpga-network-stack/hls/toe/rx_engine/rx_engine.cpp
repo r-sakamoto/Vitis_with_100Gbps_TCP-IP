@@ -646,12 +646,13 @@ void drop_optional_header_fields(	hls::stream<optionalFieldsMeta>&		metaIn,
  *   3  |     3B | Window scale
  *   4  |     2B | SACK permitted (Selective Acknowledgment)
  */
-// Result is packed as {sackEnd[85:54], sackStart[53:22], sackValid[21],
-// sackPermitted[20], mss[19:4], windowScale[3:0]}. MSS defaults to 536
-// (RFC 1122) when the peer's SYN carries no MSS option.
+// Result is packed as {tsEcr[150:119], tsVal[118:87], tsValid[86],
+// sackEnd[85:54], sackStart[53:22], sackValid[21], sackPermitted[20],
+// mss[19:4], windowScale[3:0]}. MSS defaults to 536 (RFC 1122) when the
+// peer's SYN carries no MSS option.
 void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 												hls::stream<ap_uint<320> >&	optionalHeaderFieldsIn,
-												hls::stream<ap_uint<86> >&		parsedOptionsOut)
+												hls::stream<ap_uint<151> >&		parsedOptionsOut)
 {
 	#pragma HLS PIPELINE II=1
 	#pragma HLS INLINE off
@@ -669,6 +670,9 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 	static ap_uint<1> sackVal;
 	static ap_uint<32> sackStartVal;
 	static ap_uint<32> sackEndVal;
+	static ap_uint<1> tsValidVal;
+	static ap_uint<32> tsValVal;
+	static ap_uint<32> tsEcrVal;
 
 	switch (state)
 	{
@@ -685,6 +689,9 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 			sackVal = 0;
 			sackStartVal = 0;
 			sackEndVal = 0;
+			tsValidVal = 0;
+			tsValVal = 0;
+			tsEcrVal = 0;
 			state = PARSE;
 		}
 		break;
@@ -731,6 +738,18 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 					done = true; //malformed SACK option, stop parsing
 				}
 				break;
+			case 8: //Timestamps (RFC 7323), TSval + TSecr big-endian on the wire
+				if (optionLength == 10 && remainingBytes >= 10)
+				{
+					tsValidVal = 1;
+					tsValVal = (fields(23, 16), fields(31, 24), fields(39, 32), fields(47, 40));
+					tsEcrVal = (fields(55, 48), fields(63, 56), fields(71, 64), fields(79, 72));
+				}
+				else
+				{
+					done = true; //malformed timestamps option, stop parsing
+				}
+				break;
 			case 4: //SACK permitted
 				if (optionLength == 2 && remainingBytes >= 2)
 				{
@@ -769,7 +788,7 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 
 		if (done)
 		{
-			parsedOptionsOut.write((sackEndVal, sackStartVal, sackVal, sackPermVal, mssVal, wsVal));
+			parsedOptionsOut.write((tsEcrVal, tsValVal, tsValidVal, sackEndVal, sackStartVal, sackVal, sackPermVal, mssVal, wsVal));
 			state = IDLE;
 		}
 		else
@@ -782,7 +801,7 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 	}//switch
 }
 
-void merge_header_meta(hls::stream<ap_uint<86> >&			rxEng_winScaleFifo,
+void merge_header_meta(hls::stream<ap_uint<151> >&			rxEng_winScaleFifo,
 								hls::stream<rxEngineMetaData>&	rxEng_headerMetaFifo,
 								hls::stream<rxEngineMetaData>& 	rxEng_metaDataFifo)
 {
@@ -809,6 +828,7 @@ void merge_header_meta(hls::stream<ap_uint<86> >&			rxEng_winScaleFifo,
 				meta.mss = 536; //RFC 1122 default when no MSS option present
 				meta.sackPermitted = 0;
 				meta.sackValid = 0;
+				meta.tsValid = 0;
 				rxEng_metaDataFifo.write(meta);
 			}
 		}
@@ -817,13 +837,16 @@ void merge_header_meta(hls::stream<ap_uint<86> >&			rxEng_winScaleFifo,
 		if (!rxEng_winScaleFifo.empty())
 		{
 			// std::cout << "META MERGE 1" << std::endl;
-			ap_uint<86> parsedOptions = rxEng_winScaleFifo.read();
+			ap_uint<151> parsedOptions = rxEng_winScaleFifo.read();
 			meta.winScale = parsedOptions(3, 0);
 			meta.mss = parsedOptions(19, 4);
 			meta.sackPermitted = parsedOptions[20];
 			meta.sackValid = parsedOptions[21];
 			meta.sackStart = parsedOptions(53, 22);
 			meta.sackEnd = parsedOptions(85, 54);
+			meta.tsValid = parsedOptions[86];
+			meta.tsVal = parsedOptions(118, 87);
+			meta.tsEcr = parsedOptions(150, 119);
 			rxEng_metaDataFifo.write(meta);
 			state = 0;
 		}
@@ -1140,6 +1163,31 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				stateTable2rxEng_upd_rsp.read(tcpState);
 				rxSar2rxEng_upd_rsp.read(rxSar);
 				txSar2rxEng_upd_rsp.read(txSar);
+				// RFC 7323 PAWS: a segment whose timestamp is older than
+				// TS.Recent is a duplicate from a previous sequence-number
+				// wrap; drop it and answer with a duplicate ACK (5.3 R2)
+				bool pawsReject = rxSar.tsEnabled && fsm_meta.meta.tsValid
+						&& seq_lt(fsm_meta.meta.tsVal, rxSar.tsRecent)
+						&& (tcpState == ESTABLISHED || tcpState == SYN_RECEIVED || tcpState == FIN_WAIT_1
+							|| tcpState == FIN_WAIT_2 || tcpState == CLOSE_WAIT
+							|| tcpState == CLOSING || tcpState == LAST_ACK);
+				// RFC 7323 TS.Recent update rule: fresh timestamp on a segment
+				// that covers (or precedes) the left window edge
+				bool tsUpdate = rxSar.tsEnabled && fsm_meta.meta.tsValid && !pawsReject
+						&& seq_geq(fsm_meta.meta.tsVal, rxSar.tsRecent)
+						&& seq_leq(fsm_meta.meta.seqNumb, rxSar.recvd);
+				if (pawsReject)
+				{
+					if (fsm_meta.meta.length != 0)
+					{
+						dropDataFifoOut.write(true);
+					}
+					rxEng2eventEng_setEvent.write(event(ACK_NODELAY, fsm_meta.sessionID));
+					rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, tcpState, 1));
+				}
+				else
+				{
+				// (indentation of the original block below is left unchanged)
 				rxEng2timer_clearRetransmitTimer.write(rxRetransmitTimerUpdate(fsm_meta.sessionID, (fsm_meta.meta.ackNumb == txSar.nextByte)));
 				rxEng2timer_resetKeepalive.write(fsm_meta.sessionID);
 				if (tcpState == ESTABLISHED || tcpState == SYN_RECEIVED || tcpState == FIN_WAIT_1
@@ -1233,6 +1281,15 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						txSarUpd.peerSackValid = newPeerSackValid;
 						rxEng2txSar_upd_req.write(txSarUpd);
 					}
+					// pure ACK: persist the TS.Recent advance here (segments
+					// with payload carry it on their rxSar update below)
+					if (tsUpdate && fsm_meta.meta.length == 0)
+					{
+						rxSarRecvd tsOnlyUpd(fsm_meta.sessionID);
+						tsOnlyUpd.tsWrite = 1;
+						tsOnlyUpd.tsRecent = fsm_meta.meta.tsVal;
+						rxEng2rxSar_upd_req.write(tsOnlyUpd);
+					}
 
 // 					// Check if packet contains payload
 // 					if (fsm_meta.meta.length != 0)
@@ -1305,7 +1362,10 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							newRecvd = fsm_meta.meta.seqNumb+fsm_meta.meta.length;
 							newHead = fsm_meta.meta.seqNumb+fsm_meta.meta.length;
 							//update head and recvd pointers
-							rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, newRecvd, newHead, rxSar.offset, rxSar.gap));
+							rxSarRecvd sarUpd0(fsm_meta.sessionID, newRecvd, newHead, rxSar.offset, rxSar.gap);
+							sarUpd0.tsWrite = tsUpdate;
+							sarUpd0.tsRecent = fsm_meta.meta.tsVal;
+							rxEng2rxSar_upd_req.write(sarUpd0);
 							//write to memory
 							rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
 							// Notify app length bytes available
@@ -1394,7 +1454,10 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 								ap_uint<32> segEnd = fsm_meta.meta.seqNumb + fsm_meta.meta.length;
 								newRecvd = seq_gt(segEnd, rxSar.head) ? segEnd : rxSar.head;
 								ap_uint<32> newAvailable = newRecvd - fsm_meta.meta.seqNumb;
-								rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, newRecvd, newRecvd, rxSar.offset, false));
+								rxSarRecvd sarUpd1(fsm_meta.sessionID, newRecvd, newRecvd, rxSar.offset, false);
+								sarUpd1.tsWrite = tsUpdate;
+								sarUpd1.tsRecent = fsm_meta.meta.tsVal;
+								rxEng2rxSar_upd_req.write(sarUpd1);
 								//write to memory
 								rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
 								// Only notify about  new data available
@@ -1405,7 +1468,10 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							else
 							{
 								newRecvd = fsm_meta.meta.seqNumb + fsm_meta.meta.length;
-								rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, newRecvd, rxSar.head, rxSar.offset, rxSar.gap));
+								rxSarRecvd sarUpd2(fsm_meta.sessionID, newRecvd, rxSar.head, rxSar.offset, rxSar.gap);
+								sarUpd2.tsWrite = tsUpdate;
+								sarUpd2.tsRecent = fsm_meta.meta.tsVal;
+								rxEng2rxSar_upd_req.write(sarUpd2);
 								//write to memory
 								rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
 								// Only notify about  new data available
@@ -1443,7 +1509,10 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						// Check if segment in order and if enough free space is available
 						if ((fsm_meta.meta.seqNumb == rxSar.recvd) && ((rxbuffer_max_data_count - rxbuffer_data_count) > 375))
 						{
-							rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, newRecvd, newHead, rxSar.offset, rxSar.gap));
+							rxSarRecvd sarUpd3(fsm_meta.sessionID, newRecvd, newHead, rxSar.offset, rxSar.gap);
+							sarUpd3.tsWrite = tsUpdate;
+							sarUpd3.tsRecent = fsm_meta.meta.tsVal;
+							rxEng2rxSar_upd_req.write(sarUpd3);
 							// Build memory address
 							ap_uint<32> pkgAddr;
 							pkgAddr(31, 30) = 0x0;
@@ -1532,6 +1601,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					}
 					rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, tcpState, 1));
 				}
+				} //end PAWS else
 				//fsm_state = LOAD;
 			}
 			break;
@@ -1560,7 +1630,12 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					// effective segment size for this session (RFC 879)
 					ap_uint<16> session_mss = (fsm_meta.meta.mss < MSS) ? fsm_meta.meta.mss : (ap_uint<16>)MSS;
 					// Initialize rxSar, SEQ + phantom byte for recvd and head pointer, offset to 0, gap set to false
-					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, rx_win_shift, (bool)fsm_meta.meta.sackPermitted));
+					rxSarRecvd sarInit(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, rx_win_shift, (bool)fsm_meta.meta.sackPermitted);
+					// RFC 7323: timestamps are on iff both sides sent the option
+					sarInit.tsEnabled = TCP_TS_OPTION && fsm_meta.meta.tsValid;
+					sarInit.tsWrite = sarInit.tsEnabled;
+					sarInit.tsRecent = fsm_meta.meta.tsVal;
+					rxEng2rxSar_upd_req.write(sarInit);
 					rxEng2timer_resetKeepalive.write(fsm_meta.sessionID);
 					// Initialize receive window
 					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, 0, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift, session_mss))); //TODO maybe include count check
@@ -1627,7 +1702,12 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					ap_uint<4> tx_win_shift = fsm_meta.meta.winScale;
 					// effective segment size for this session (RFC 879)
 					ap_uint<16> session_mss = (fsm_meta.meta.mss < MSS) ? fsm_meta.meta.mss : (ap_uint<16>)MSS;
-					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, rx_win_shift, (bool)fsm_meta.meta.sackPermitted));
+					rxSarRecvd sarInit(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, rx_win_shift, (bool)fsm_meta.meta.sackPermitted);
+					// RFC 7323: timestamps are on iff both sides sent the option
+					sarInit.tsEnabled = TCP_TS_OPTION && fsm_meta.meta.tsValid;
+					sarInit.tsWrite = sarInit.tsEnabled;
+					sarInit.tsRecent = fsm_meta.meta.tsVal;
+					rxEng2rxSar_upd_req.write(sarInit);
 					rxEng2timer_resetKeepalive.write(fsm_meta.sessionID);
 					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift, session_mss))); //TODO maybe include count check
 #else
@@ -1688,7 +1768,10 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					}
 
 					// +1 for phantom byte, there might be data too
-					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+fsm_meta.meta.length+1, fsm_meta.meta.seqNumb+fsm_meta.meta.length+1, rxSar.offset,rxSar.gap)); //diff to ACK
+					rxSarRecvd finUpd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+fsm_meta.meta.length+1, fsm_meta.meta.seqNumb+fsm_meta.meta.length+1, rxSar.offset, rxSar.gap); //diff to ACK
+					finUpd.tsWrite = rxSar.tsEnabled && fsm_meta.meta.tsValid && seq_geq(fsm_meta.meta.tsVal, rxSar.tsRecent);
+					finUpd.tsRecent = fsm_meta.meta.tsVal;
+					rxEng2rxSar_upd_req.write(finUpd);
 
 					// Clear the probe timer
 					rxEng2timer_clearProbeTimer.write(fsm_meta.sessionID);
@@ -2271,7 +2354,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 	static hls::stream<rxEngineMetaData>		rxEng_headerMetaFifo("rxEng_headerMetaFifo");
 	static hls::stream<ap_uint<4> >		rxEng_dataOffsetFifo("rxEng_dataOffsetFifo");
 	static hls::stream<ap_uint<320> >		rxEng_optionalFieldsFifo("rxEng_optionalFieldsFifo");
-	static hls::stream<ap_uint<86> >		rxEng_winScaleFifo("rxEng_winScaleFifo");
+	static hls::stream<ap_uint<151> >		rxEng_winScaleFifo("rxEng_winScaleFifo");
 	#pragma HLS stream variable=rxEng_headerMetaFifo depth=16
 	#pragma HLS stream variable=rxEng_dataOffsetFifo depth=2
 	#pragma HLS stream variable=rxEng_optionalFieldsFifo depth=2

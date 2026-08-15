@@ -114,9 +114,20 @@ void retransmit_timer(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetrans
 			txEng2timer_setRetransmitTimer.read(set);
 			currID = set.sessionID;
 			operationSwitch = 1;
-			if (set.sessionID-3 < rt_position && rt_position <= set.sessionID)
+			//RMW-hazard guard, wrap-safe: the naive sessionID-3 comparison
+			//never fires for IDs 0..2, losing timer writes to those sessions
 			{
-				rt_position += 5;
+				ap_uint<16> setDist = (set.sessionID >= rt_position)
+						? (ap_uint<16>)(set.sessionID - rt_position)
+						: (ap_uint<16>)(set.sessionID + MAX_SESSIONS - rt_position);
+				if (setDist < 3)
+				{
+					rt_position += 5;
+					if (rt_position >= MAX_SESSIONS)
+					{
+						rt_position -= MAX_SESSIONS;
+					}
+				}
 			}
 		}
 		else

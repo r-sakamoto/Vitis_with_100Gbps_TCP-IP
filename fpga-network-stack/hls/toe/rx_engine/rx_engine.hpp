@@ -63,6 +63,9 @@ struct rxEngineMetaData
 	ap_uint<1>	sackValid;     //segment carried a SACK block
 	ap_uint<32>	sackStart;
 	ap_uint<32>	sackEnd;
+	ap_uint<1>	tsValid; //segment carried a timestamps option (RFC 7323)
+	ap_uint<32>	tsVal;
+	ap_uint<32>	tsEcr;
 //#endif
 	ap_uint<16> length;
 	ap_uint<1>	ack;

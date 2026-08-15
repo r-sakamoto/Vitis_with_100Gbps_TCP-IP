@@ -816,6 +816,56 @@ module tb_toe_top;
     return o;
   endfunction
 
+  // 20-byte SYN option list with timestamps:
+  // MSS | SACKperm | TS(kind8 len10 tsval tsecr=0) | WS shift=2 | NOP
+  function automatic bytes_t ts_syn_options(input bit [31:0] tsval);
+    bytes_t o;
+    o = new[20];
+    o[0] = 8'h02; o[1] = 8'h04; o[2] = 8'h05; o[3] = 8'hB4;   // MSS 1460
+    o[4] = 8'h04; o[5] = 8'h02;                               // SACK permitted
+    o[6] = 8'h08; o[7] = 8'h0A;                               // TS kind/len
+    o[8]  = tsval[31:24]; o[9]  = tsval[23:16]; o[10] = tsval[15:8]; o[11] = tsval[7:0];
+    o[12] = 8'h00; o[13] = 8'h00; o[14] = 8'h00; o[15] = 8'h00; // TSecr = 0
+    o[16] = 8'h03; o[17] = 8'h03; o[18] = 8'h02;              // WS shift=2
+    o[19] = 8'h01;                                            // NOP pad
+    return o;
+  endfunction
+
+  // 12-byte option list: NOP NOP TS(kind8 len10 tsval tsecr)
+  function automatic bytes_t ts_opt(input bit [31:0] tsval, input bit [31:0] tsecr);
+    bytes_t o;
+    o = new[12];
+    o[0] = 8'h01; o[1] = 8'h01; o[2] = 8'h08; o[3] = 8'h0A;
+    o[4] = tsval[31:24]; o[5] = tsval[23:16]; o[6] = tsval[15:8]; o[7] = tsval[7:0];
+    o[8] = tsecr[31:24]; o[9] = tsecr[23:16]; o[10] = tsecr[15:8]; o[11] = tsecr[7:0];
+    return o;
+  endfunction
+
+  // extract the timestamps option (kind 8) from packet p
+  function automatic bit get_ts_option(input bytes_t p,
+                                       output bit [31:0] tsval,
+                                       output bit [31:0] tsecr);
+    bytes_t o;
+    int i;
+    o = f_options(p);
+    i = 0; tsval = 0; tsecr = 0;
+    while (i < o.size()) begin
+      if (o[i] == 8'h00) return 0;
+      if (o[i] == 8'h01) begin i++; continue; end
+      if (o[i] == 8'h08) begin
+        if (i+9 < o.size()) begin
+          tsval = {o[i+2], o[i+3], o[i+4], o[i+5]};
+          tsecr = {o[i+6], o[i+7], o[i+8], o[i+9]};
+          return 1;
+        end
+        return 0;
+      end
+      if (i+1 < o.size() && o[i+1] >= 2) i += o[i+1];
+      else return 0;
+    end
+    return 0;
+  endfunction
+
   function automatic bytes_t gen_payload(input int len, input byte unsigned seed);
     bytes_t d;
     d = new[len];
@@ -1043,6 +1093,38 @@ module tb_toe_top;
     // ACK ->
     peer_send_seg(F_ACK, no_bytes());
     tb_info($sformatf("handshake complete, TOE ISS=%0d", toe_iss));
+  endtask
+
+  // passive handshake with RFC 7323 timestamps; peer_tsval is the TSval the
+  // peer used on its SYN (subsequent segments should use larger values)
+  task automatic do_ts_handshake(input bit [15:0] lport, input bit [15:0] rport,
+                                 input bit [31:0] init_seq, input bit [31:0] peer_tsval,
+                                 output bit [31:0] toe_tsval);
+    bytes_t p;
+    bit [31:0] toe_iss, tv, te;
+    bit ok;
+    peer_port = rport; toe_port = lport;
+    peer_seq  = init_seq;
+    peer_win  = 16'hFFFF;
+    p = make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                 peer_seq, 0, F_SYN, 16'hFFFF, ts_syn_options(peer_tsval), no_bytes());
+    net_send(p);
+    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 50000, 1);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq + 1, $sformatf("SYN-ACK ack=%0d expected %0d", f_ack(p), peer_seq+1));
+    ok = get_ts_option(p, tv, te);
+    tb_check(ok, "SYN-ACK carries a timestamps option");
+    if (ok) begin
+      tb_check(te == peer_tsval, $sformatf("SYN-ACK TSecr=%0d expected %0d", te, peer_tsval));
+    end
+    toe_tsval = tv;
+    toe_iss  = f_seq(p);
+    peer_ack = toe_iss + 1;
+    peer_seq = peer_seq + 1;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, peer_ack, F_ACK, peer_win,
+                      ts_opt(peer_tsval + 1, toe_tsval), no_bytes()));
+    tb_info($sformatf("TS handshake complete, TOE ISS=%0d TSval=%0d", toe_iss, toe_tsval));
   endtask
 
   //---------------------------------------------------------------------------
@@ -2859,6 +2941,134 @@ module tb_toe_top;
     tb_check(!ok, "no further probes after abort");
   endtask
 
+  // T1: RFC 7323 timestamps negotiation, echo and payload realignment.
+  // Verifies: TS on SYN-ACK with correct TSecr, TS on pure ACKs and data
+  // segments (dataOffset 8), TSecr always echoes the newest peer TSval, and
+  // that payload behind the 12B option is intact (the TX body is shifted by
+  // 4 bytes in the header builder) for aligned and unaligned lengths.
+  task automatic test_ts_negotiate();
+    bytes_t p, pay;
+    bit ok, got;
+    notif_t n;
+    bit [15:0] sid;
+    bit [31:0] toe_ts, tv, te;
+    bit [31:0] peer_tsclock;
+    txrsp_t rsp;
+    int lens[3];
+
+    app_listen(16'd80, ok);
+    peer_tsclock = 32'd10_000;
+    do_ts_handshake(16'd80, 16'd41400, 32'h3000_0000, peer_tsclock, toe_ts);
+    if (err_count) return;
+
+    // 8B data with a fresh timestamp -> delivered, ACK echoes the new TSval
+    peer_tsclock += 10;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, peer_ack, F_ACK, peer_win,
+                      ts_opt(peer_tsclock, toe_ts), gen_payload(8, 8'h11)));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq, "ACK number");
+    ok = get_ts_option(p, tv, te);
+    tb_check(ok, "ACK carries timestamps");
+    if (ok) tb_check(te == peer_tsclock, $sformatf("ACK TSecr=%0d expected %0d", te, peer_tsclock));
+    toe_ts = tv;
+
+    // TOE data segments: 100B (unaligned tail), 4B (fits the merged word)
+    // and 8B; each must arrive with TS option and undamaged payload
+    lens[0] = 100; lens[1] = 4; lens[2] = 8;
+    for (int k = 0; k < 3; k++) begin
+      pay = gen_payload(lens[k], 8'h40 + k[7:0]);
+      app_send(sid, pay, rsp);
+      tb_check(rsp.error == 0, $sformatf("app_send %0dB accepted", lens[k]));
+      got = 0;
+      while (!got) begin
+        wait_pkt(p, 400000, ok);
+        if (!ok) begin tb_error($sformatf("timeout waiting for %0dB data", lens[k])); return; end
+        if (f_payload_len(p) == lens[k]) got = 1;
+      end
+      ok = get_ts_option(p, tv, te);
+      tb_check(ok, $sformatf("%0dB data segment carries timestamps", lens[k]));
+      if (ok) tb_check(te == peer_tsclock, $sformatf("data TSecr=%0d expected %0d", te, peer_tsclock));
+      tb_check(f_options(p).size() == 12, "data segment option length 12B");
+      begin
+        bytes_t rx = f_payload(p);
+        bit match = 1;
+        foreach (pay[i]) if (rx[i] !== pay[i]) match = 0;
+        tb_check(match, $sformatf("%0dB payload intact behind TS option", lens[k]));
+      end
+      // ACK the data with a fresh peer timestamp
+      peer_tsclock += 5;
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, f_seq(p) + lens[k], F_ACK, peer_win,
+                        ts_opt(peer_tsclock, tv), no_bytes()));
+      repeat (2000) @(posedge ap_clk);
+    end
+  endtask
+
+  // T1: RFC 7323 PAWS - a segment with a timestamp older than TS.Recent is
+  // dropped (no data delivery, no rcv_nxt advance) and answered with a
+  // duplicate ACK whose TSecr still reflects the newest valid peer TSval.
+  task automatic test_paws_drop();
+    bytes_t p;
+    bit ok, got;
+    notif_t n;
+    bit [15:0] sid;
+    bit [31:0] toe_ts, tv, te;
+    txrsp_t rsp;
+
+    app_listen(16'd80, ok);
+    do_ts_handshake(16'd80, 16'd41410, 32'h3100_0000, 32'd50_000, toe_ts);
+    if (err_count) return;
+
+    // establish TS.Recent = 50_010 with a first data segment
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, peer_ack, F_ACK, peer_win,
+                      ts_opt(32'd50_010, toe_ts), gen_payload(8, 8'h21)));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "first data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of first 8B", p, 400000, 0);
+    if (err_count) return;
+    ok = get_ts_option(p, tv, te);
+    toe_ts = tv;
+
+    // in-order segment with an OLD timestamp -> PAWS reject:
+    // no notification, duplicate ACK without rcv_nxt advance
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, peer_ack, F_ACK, peer_win,
+                      ts_opt(32'd1_000, toe_ts), gen_payload(8, 8'h22)));
+    expect_flags(F_ACK, "duplicate ACK on PAWS reject", p, 400000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq, $sformatf("PAWS dup-ACK ack=%0d (rcv_nxt not advanced)", f_ack(p)));
+    ok = get_ts_option(p, tv, te);
+    tb_check(ok, "PAWS dup-ACK carries timestamps");
+    if (ok) tb_check(te == 32'd50_010, $sformatf("TSecr=%0d still the last valid TSval", te));
+    wait_notif(n, 100000, ok);
+    tb_check(!ok, "no data notification for the PAWS-rejected segment");
+
+    // same bytes with a fresh timestamp -> accepted
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, peer_ack, F_ACK, peer_win,
+                      ts_opt(32'd50_020, toe_ts), gen_payload(8, 8'h22)));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "fresh-timestamp segment delivered");
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of retried 8B", p, 400000, 0);
+    if (!err_count) begin
+      tb_check(f_ack(p) == peer_seq, "rcv_nxt advanced after valid segment");
+      ok = get_ts_option(p, tv, te);
+      if (ok) tb_check(te == 32'd50_020, "TS.Recent advanced to the fresh TSval");
+    end
+  endtask
+
   //---------------------------------------------------------------------------
   // Main
   //---------------------------------------------------------------------------
@@ -2912,6 +3122,8 @@ module tb_toe_top;
       "fin_retransmit" : test_fin_retransmit();
       "adaptive_rto"   : test_adaptive_rto();
       "keepalive"      : test_keepalive();
+      "ts_negotiate"   : test_ts_negotiate();
+      "paws_drop"      : test_paws_drop();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 

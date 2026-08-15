@@ -90,19 +90,28 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 	else if(!rxEng2rxSar_upd_req.empty())
 	{
 		rxSarRecvd in_recvd = rxEng2rxSar_upd_req.read();
-		if (in_recvd.write)
+		if (in_recvd.write || in_recvd.tsWrite)
 		{
-			rx_table[in_recvd.sessionID].recvd = in_recvd.recvd;
-			rx_table[in_recvd.sessionID].head = in_recvd.head;
-			rx_table[in_recvd.sessionID].offset = in_recvd.offset;
-			rx_table[in_recvd.sessionID].gap = in_recvd.gap;
-			if (in_recvd.init)
+			if (in_recvd.tsWrite)
 			{
-				rx_table[in_recvd.sessionID].appd = in_recvd.recvd;
-				rx_table[in_recvd.sessionID].sackEnabled = in_recvd.sackEnabled;
+				//RFC 7323: advance TS.Recent (also possible on pure ACKs)
+				rx_table[in_recvd.sessionID].tsRecent = in_recvd.tsRecent;
+			}
+			if (in_recvd.write)
+			{
+				rx_table[in_recvd.sessionID].recvd = in_recvd.recvd;
+				rx_table[in_recvd.sessionID].head = in_recvd.head;
+				rx_table[in_recvd.sessionID].offset = in_recvd.offset;
+				rx_table[in_recvd.sessionID].gap = in_recvd.gap;
+				if (in_recvd.init)
+				{
+					rx_table[in_recvd.sessionID].appd = in_recvd.recvd;
+					rx_table[in_recvd.sessionID].sackEnabled = in_recvd.sackEnabled;
+					rx_table[in_recvd.sessionID].tsEnabled = in_recvd.tsEnabled;
 #if (WINDOW_SCALE)
-				rx_table[in_recvd.sessionID].win_shift = in_recvd.win_shift;
+					rx_table[in_recvd.sessionID].win_shift = in_recvd.win_shift;
 #endif
+				}
 			}
 		}
 		else

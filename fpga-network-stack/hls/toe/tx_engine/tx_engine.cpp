@@ -165,8 +165,13 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				{
 					txSar = txSarReg;
 				}
-				// per-session effective MSS (min(peer MSS, local MSS))
+				// per-session effective MSS (min(peer MSS, local MSS));
+				// the 12B timestamps option eats into the payload budget
 				ap_uint<16> sessionMSS = (txSar.mss == 0) ? (ap_uint<16>)MSS : txSar.mss;
+				if (rxSar.tsEnabled)
+				{
+					sessionMSS -= 12;
+				}
 
 				meta.ackNumb = rxSar.recvd;
 				meta.seqNumb = txSar.not_ackd + ml_segOffset;
@@ -176,6 +181,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 0;
 				meta.fin = 0;
 				meta.sack = 0;
+				meta.ts = rxSar.tsEnabled;
+				meta.tsEcr = rxSar.tsRecent;
 
 				if (ml_curEvent.length <= sessionMSS)
 				{
@@ -197,7 +204,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					// Send a packet only if there is data or we want to send an empty probing message
 					if (meta.length != 0)
 					{
-						txEng_ipMetaFifoOut.write(meta.length);
+						txEng_ipMetaFifoOut.write(meta.length + (meta.ts ? 12 : 0));
 						txEng_tcpMetaFifoOut.write(meta);
 						txEng_isLookUpFifoOut.write(true);
 						txEng_isDDRbypass.write(1);
@@ -232,7 +239,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					}
 
 					txBufferReadCmd.write(mmCmd(pkgAddr, meta.length));
-					txEng_ipMetaFifoOut.write(meta.length);
+					txEng_ipMetaFifoOut.write(meta.length + (meta.ts ? 12 : 0));
 					txEng_tcpMetaFifoOut.write(meta);
 					txEng_isLookUpFifoOut.write(true);
 					txEng_isDDRbypass.write((ml_segOffset == 0) ? (ap_uint<2>)2 : (ap_uint<2>)0);
@@ -279,8 +286,13 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				{
 					txSar = txSarReg;
 				}
-				// per-session effective MSS (min(peer MSS, local MSS))
+				// per-session effective MSS (min(peer MSS, local MSS));
+				// the 12B timestamps option eats into the payload budget
 				ap_uint<16> sessionMSS = (txSar.mss == 0) ? (ap_uint<16>)MSS : txSar.mss;
+				if (rxSar.tsEnabled)
+				{
+					sessionMSS -= 12;
+				}
 
 				//Compute our space, Advertise at least a quarter/half, otherwise 0
 				meta.ackNumb = rxSar.recvd;
@@ -291,6 +303,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 0;
 				meta.fin = 0;
 				meta.sack = 0;
+				meta.ts = rxSar.tsEnabled;
+				meta.tsEcr = rxSar.tsRecent;
 				meta.length = 0;
 
 				currLength = (txSar.app - ((ap_uint<WINDOW_BITS>)txSar.not_ackd));
@@ -375,7 +389,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				// Send a packet only if there is data or we want to send an empty probing message
 				if (meta.length != 0)// || ml_curEvent.retransmit) //TODO retransmit boolean currently not set, should be removed
 				{
-					txEng_ipMetaFifoOut.write(meta.length);
+					txEng_ipMetaFifoOut.write(meta.length + (meta.ts ? 12 : 0));
 					txEng_tcpMetaFifoOut.write(meta);
 					txEng_isLookUpFifoOut.write(true);
 					txEng2sLookup_rev_req.write(ml_curEvent.sessionID);
@@ -438,8 +452,13 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				// FIN itself is regenerated via the finSent conversion below.
 				ap_uint<WINDOW_BITS> currLength = txSar.usedLength - (txSar.finSent ? 1 : 0);
 				// per-session effective MSS (min(peer MSS, local MSS), set at
-				// connection setup); guard against uninitialized entries
+				// connection setup); guard against uninitialized entries.
+				// The 12B timestamps option eats into the payload budget.
 				ap_uint<16> sessionMSS = (txSar.mss == 0) ? (ap_uint<16>)MSS : txSar.mss;
+				if (rxSar.tsEnabled)
+				{
+					sessionMSS -= 12;
+				}
 
 				meta.ackNumb = rxSar.recvd;
 				meta.seqNumb = txSar.ackd;
@@ -449,6 +468,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 0;
 				meta.fin = 0;
 				meta.sack = 0;
+				meta.ts = rxSar.tsEnabled;
+				meta.tsEcr = rxSar.tsRecent;
 
 				// Construct address before modifying txSar.ackd
 				ap_uint<32> pkgAddr;
@@ -515,7 +536,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				if (meta.length != 0)
 				{
 					txBufferReadCmd.write(mmCmd(pkgAddr, meta.length));
-					txEng_ipMetaFifoOut.write(meta.length);
+					txEng_ipMetaFifoOut.write(meta.length + (meta.ts ? 12 : 0));
 					txEng_tcpMetaFifoOut.write(meta);
 					txEng_isLookUpFifoOut.write(true);
 #if (TCP_NODELAY)
@@ -562,6 +583,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 0;
 				meta.fin = 0;
 				meta.sack = 0;
+				meta.ts = rxSar.tsEnabled;
+				meta.tsEcr = rxSar.tsRecent;
 				// RFC 2018: advertise the buffered out-of-order range as a
 				// single SACK block while a receive gap is open
 				if (rxSar.gap && rxSar.sackEnabled)
@@ -571,7 +594,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					meta.sackEnd = rxSar.head;
 				}
 				//ipMeta carries the option length for header-only segments
-				txEng_ipMetaFifoOut.write(meta.sack ? (ap_uint<16>)12 : meta.length);
+				txEng_ipMetaFifoOut.write((ap_uint<16>)((meta.sack ? 12 : 0) + (meta.ts ? 12 : 0)));
 				txEng_tcpMetaFifoOut.write(meta);
 				txEng_isLookUpFifoOut.write(true);
 				txEng2sLookup_rev_req.write(ml_curEvent.sessionID);
@@ -621,10 +644,23 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 1;
 				meta.fin = 0;
 				meta.sack = 1; // offer SACK-Permitted (RFC 2018)
+				meta.ts = 0;
 #if (WINDOW_SCALE)
 				meta.length = 12; // MSS(4) + SACKperm(2) + WS(3) + padding(3)
 				meta.win_shift = WINDOW_SCALE_BITS;
 #endif
+				if (TCP_TS_OPTION)
+				{
+					// offer RFC 7323 timestamps:
+					// MSS(4) + SACKperm(2) + TS(10) [+ WS(3) + NOP(1)]
+					meta.ts = 1;
+					meta.tsEcr = 0;
+#if (WINDOW_SCALE)
+					meta.length = 20;
+#else
+					meta.length = 16;
+#endif
+				}
 
 				txEng_ipMetaFifoOut.write(meta.length);
 				txEng_tcpMetaFifoOut.write(meta);
@@ -663,6 +699,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 1;
 				meta.fin = 0;
 				meta.sack = 0;
+				meta.ts = 0;
 				if (ml_curEvent.rt_count != 0)
 				{
 					meta.seqNumb = txSar.ackd;
@@ -693,6 +730,14 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				{
 					meta.sack = 1;
 					meta.length = (meta.length == 4) ? (ap_uint<16>)8 : (ap_uint<16>)12;
+				}
+				// echo RFC 7323 timestamps if the peer's SYN carried them;
+				// the option layout is then always the fixed 20B one
+				meta.ts = rxSar.tsEnabled;
+				meta.tsEcr = rxSar.tsRecent;
+				if (meta.ts)
+				{
+					meta.length = 20;
 				}
 
 				txEng_ipMetaFifoOut.write(meta.length);
@@ -742,6 +787,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 0;
 				meta.fin = 1;
 				meta.sack = 0;
+				meta.ts = rxSar.tsEnabled;
+				meta.tsEcr = rxSar.tsRecent;
 
 				// Check if retransmission, in case of RT, we have to reuse not_ackd number
 				if (ml_curEvent.rt_count != 0)
@@ -772,7 +819,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				if (meta.seqNumb(WINDOW_BITS-1, 0) == txSar.app)
 #endif
 				{
-					txEng_ipMetaFifoOut.write(meta.length);
+					txEng_ipMetaFifoOut.write((ap_uint<16>)(meta.ts ? 12 : 0));
 					txEng_tcpMetaFifoOut.write(meta);
 					txEng_isLookUpFifoOut.write(true);
 					txEng2sLookup_rev_req.write(ml_curEvent.sessionID);
@@ -1182,7 +1229,8 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-	enum fsmState {META, HEADER, PARTIAL_HEADER, BODY, HEADER_MSS_OPTION, HEADER_OPT_WORD2, HEADER_SACK_OPTION, HEADER_SACK_WORD2};
+	enum fsmState {META, HEADER, PARTIAL_HEADER, BODY, HEADER_MSS_OPTION, HEADER_OPT_WORD2, HEADER_SACK_OPTION, HEADER_SACK_WORD2,
+					HEADER_TS_SYN_W2, HEADER_TS_SYN_W3, HEADER_TS_WORD1, HEADER_TS_WORD2, HEADER_TS_SACK_W3, TS_BODY, TS_BODY_FLUSH};
 	static fsmState state = META;
 	static tcpFullPseudoHeader<WIDTH> header; //size 256Bit
 	static bool hasBody = false;
@@ -1191,6 +1239,16 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 	static bool hasSack = false;
 	static ap_uint<32> sackStart = 0;
 	static ap_uint<32> sackEnd = 0;
+	static bool hasTs = false;
+	static ap_uint<32> tsEcrReg = 0;
+	// free-running local timestamp clock (RFC 7323 TSval); the process body
+	// executes every cycle, >>17 gives ~0.84ms granularity at 156.25MHz
+	static ap_uint<49> tsClockCnt = 0;
+	tsClockCnt++;
+	ap_uint<32> tsVal = tsClockCnt(48, 17);
+	// carry for the 4-byte body realignment behind the 12B timestamps option
+	static ap_uint<32> tsCarry = 0;
+	static ap_uint<4> tsCarryKeep = 0;
 
 	switch (state)
 	{
@@ -1203,9 +1261,12 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 			header.clear();
 			header.setSrcAddr(tuple.srcIp);
 			header.setDstAddr(tuple.dstIp);
-			// TCP length: payload/options + 20B base header; a pure-ACK SACK
-			// block adds 12 option bytes not counted in meta.length
-			header.setLength(meta.length + 0x14 + ((!meta.syn && meta.sack) ? 12 : 0));
+			// TCP length: payload/options + 20B base header; on non-SYN
+			// segments the TS option (12B) and a pure-ACK SACK block (12B)
+			// are not counted in meta.length
+			header.setLength(meta.length + 0x14
+					+ ((!meta.syn && meta.ts) ? 12 : 0)
+					+ ((!meta.syn && meta.sack) ? 12 : 0));
 			header.setSrcPort(tuple.srcPort);
 			header.setDstPort(tuple.dstPort);
 			header.setSeqNumb(meta.seqNumb);
@@ -1216,6 +1277,8 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 			hasSack = meta.sack;
 			sackStart = meta.sackStart;
 			sackEnd = meta.sackEnd;
+			hasTs = meta.ts; //SYN: TS inside the SYN option layout; else 12B TS block
+			tsEcrReg = meta.tsEcr;
 			if (meta.syn)
 			{
 				// meta.length carries the option byte count (multiple of 4)
@@ -1223,7 +1286,7 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 			}
 			else
 			{
-				header.setDataOffset(meta.sack ? 0x8 : 0x5);
+				header.setDataOffset(0x5 + (meta.ts ? 3 : 0) + (meta.sack ? 3 : 0));
 			}
 			//flags
 			header.setFinFlag(meta.fin);
@@ -1259,7 +1322,13 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 		if (remainingLength < (WIDTH/8))
 		//if (header.consumeWord(sendWord.data) < WIDTH)
 		{
-			if (hasBody)
+			if (!isSYN && hasTs && WIDTH <= 256)
+			{
+				// timestamps option (and possibly a SACK block / the body,
+				// realigned by 4 bytes) follow the 20B header
+				state = HEADER_TS_WORD1;
+			}
+			else if (hasBody)
 			{
 				// std::cout << "switch to TCP BODY" << std::endl;
 				state = BODY; //PARTIAL_HEADER;
@@ -1377,7 +1446,18 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 #ifndef __SYNTHESIS__
 		sendWord.data(63, 32) = 0;
 #endif
-		if (hasSack)
+		if (hasTs)
+		{
+			// RFC 7323 layout: MSS | SACKperm-or-NOPs | TS(10B) | WS/pad
+			sendWord.data(39, 32) = hasSack ? 0x04 : 0x01;
+			sendWord.data(47, 40) = hasSack ? 0x02 : 0x01;
+			sendWord.data(55, 48) = 0x08; // TS Option Kind
+			sendWord.data(63, 56) = 0x0A; // TS Option length
+			sendWord.keep = 0xFF;
+			sendWord.last = 0;
+			state = HEADER_TS_SYN_W2;
+		}
+		else if (hasSack)
 		{
 			//SACK-Permitted (RFC 2018)
 			sendWord.data(39, 32) = 0x04;
@@ -1447,6 +1527,153 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 		sendWord.data = 0;
 		sendWord.data(31, 0) = reverse(sackEnd);
 		sendWord.keep = 0x0F;
+		sendWord.last = 1;
+		dataOut.write(sendWord);
+		state = META;
+		break;
+	}
+	case HEADER_TS_SYN_W2: //SYN timestamps: TSval + TSecr
+	{
+		net_axis<WIDTH> sendWord;
+		sendWord.data(31, 0) = reverse(tsVal);
+		sendWord.data(63, 32) = reverse(tsEcrReg);
+		sendWord.keep = 0xFF;
+		sendWord.last = 0;
+		dataOut.write(sendWord);
+		state = HEADER_TS_SYN_W3;
+		break;
+	}
+	case HEADER_TS_SYN_W3: //SYN tail: WS option (or NOPs) + NOP pad
+	{
+		net_axis<WIDTH> sendWord;
+		sendWord.data = 0;
+		if (win_shift != 0)
+		{
+			sendWord.data(7, 0) = 0x03;
+			sendWord.data(15, 8) = 0x03;
+			sendWord.data(23, 16) = win_shift;
+			sendWord.data(31, 24) = 0x01;
+		}
+		else
+		{
+			sendWord.data(31, 0) = 0x01010101; //NOP NOP NOP NOP
+		}
+		sendWord.keep = 0x0F;
+		sendWord.last = 1;
+		dataOut.write(sendWord);
+		state = META;
+		break;
+	}
+	case HEADER_TS_WORD1: //non-SYN timestamps: NOP NOP 08 0A TSval
+	{
+		net_axis<WIDTH> sendWord;
+		sendWord.data(7, 0) = 0x01;
+		sendWord.data(15, 8) = 0x01;
+		sendWord.data(23, 16) = 0x08;
+		sendWord.data(31, 24) = 0x0A;
+		sendWord.data(63, 32) = reverse(tsVal);
+		sendWord.keep = 0xFF;
+		sendWord.last = 0;
+		dataOut.write(sendWord);
+		state = HEADER_TS_WORD2;
+		break;
+	}
+	case HEADER_TS_WORD2: //TSecr + (SACK header | first 4 payload bytes | end)
+	{
+		net_axis<WIDTH> sendWord;
+		sendWord.data(31, 0) = reverse(tsEcrReg);
+		if (hasSack)
+		{
+			//pure ACK with SACK block: NOP NOP 05 0A follows
+			sendWord.data(63, 32) = 0x0A050101;
+			sendWord.keep = 0xFF;
+			sendWord.last = 0;
+			dataOut.write(sendWord);
+			state = HEADER_TS_SACK_W3;
+		}
+		else if (hasBody)
+		{
+			//merge the first 4 payload bytes; the rest of the body is
+			//realigned by 4 bytes in TS_BODY
+			if (!dataIn.empty())
+			{
+				net_axis<WIDTH> currWord = dataIn.read();
+				sendWord.data(63, 32) = currWord.data(31, 0);
+				sendWord.keep = 0;
+				sendWord.keep(7, 4) = currWord.keep(3, 0);
+				sendWord.keep(3, 0) = 0xF;
+				tsCarry = currWord.data(63, 32);
+				tsCarryKeep = currWord.keep(7, 4);
+				sendWord.last = 0;
+				if (currWord.last && tsCarryKeep == 0)
+				{
+					sendWord.last = 1;
+					state = META;
+				}
+				else if (currWord.last)
+				{
+					state = TS_BODY_FLUSH;
+				}
+				else
+				{
+					state = TS_BODY;
+				}
+				dataOut.write(sendWord);
+			}
+		}
+		else
+		{
+			//pure ACK/FIN with timestamps only
+			sendWord.data(63, 32) = 0;
+			sendWord.keep = 0x0F;
+			sendWord.last = 1;
+			dataOut.write(sendWord);
+			state = META;
+		}
+		break;
+	}
+	case HEADER_TS_SACK_W3: //SACK block after the timestamps option
+	{
+		net_axis<WIDTH> sendWord;
+		sendWord.data(31, 0) = reverse(sackStart);
+		sendWord.data(63, 32) = reverse(sackEnd);
+		sendWord.keep = 0xFF;
+		sendWord.last = 1;
+		dataOut.write(sendWord);
+		state = META;
+		break;
+	}
+	case TS_BODY: //payload realigned by 4 bytes behind the TS option
+		if (!dataIn.empty())
+		{
+			net_axis<WIDTH> currWord = dataIn.read();
+			net_axis<WIDTH> sendWord;
+			sendWord.data(31, 0) = tsCarry;
+			sendWord.data(63, 32) = currWord.data(31, 0);
+			sendWord.keep = 0;
+			sendWord.keep(7, 4) = currWord.keep(3, 0);
+			sendWord.keep(3, 0) = 0xF;
+			tsCarry = currWord.data(63, 32);
+			tsCarryKeep = currWord.keep(7, 4);
+			sendWord.last = 0;
+			if (currWord.last && tsCarryKeep == 0)
+			{
+				sendWord.last = 1;
+				state = META;
+			}
+			else if (currWord.last)
+			{
+				state = TS_BODY_FLUSH;
+			}
+			dataOut.write(sendWord);
+		}
+		break;
+	case TS_BODY_FLUSH: //left-over bytes of the realigned body
+	{
+		net_axis<WIDTH> sendWord;
+		sendWord.data = 0;
+		sendWord.data(31, 0) = tsCarry;
+		sendWord.keep = tsCarryKeep;
 		sendWord.last = 1;
 		dataOut.write(sendWord);
 		state = META;
