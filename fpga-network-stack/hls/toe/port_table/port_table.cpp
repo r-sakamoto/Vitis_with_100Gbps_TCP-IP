@@ -59,19 +59,23 @@ void listening_port_table(	stream<ap_uint<16> >&	rxApp2portTable_listen_req,
 	if (!rxApp2portTable_listen_req.empty()) //check range, TODO make sure currPort is not equal in 2 consecutive cycles
 	{
 		rxApp2portTable_listen_req.read(currPort);
-		//return true when the port is already open
-		if (listeningPortTable[currPort(14, 0)] && currPort < 32768)
+		if (currPort[15])
 		{
+			//bit 15 set = stop listening on port(14,0). Listen ports live in
+			//0..32767, so this was previously an always-rejected request and
+			//the encoding is backward compatible on the same AXIS interface.
+			listeningPortTable[currPort(14, 0)] = false;
 			portTable2rxApp_listen_rsp.write(true);
 		}
-		else if (!listeningPortTable[currPort(14, 0)] && currPort < 32768)
+		//return true when the port is already open
+		else if (listeningPortTable[currPort(14, 0)])
 		{
-			listeningPortTable[currPort] = true;
 			portTable2rxApp_listen_rsp.write(true);
 		}
 		else
 		{
-			portTable2rxApp_listen_rsp.write(false);
+			listeningPortTable[currPort(14, 0)] = true;
+			portTable2rxApp_listen_rsp.write(true);
 		}
 	}
 	else if (!pt_portCheckListening_req_fifo.empty())

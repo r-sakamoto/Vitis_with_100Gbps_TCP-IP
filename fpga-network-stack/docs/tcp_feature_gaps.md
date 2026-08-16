@@ -59,7 +59,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | ACKなしFIN | **実装済** (F3, `pure_fin_close`テスト): 純FINもFIN+ACKと同様に処理(ACK番号依存処理はACKフラグでガード) | 処理する | 完了 |
 | 同時オープン | 非対応(SYN_SENT中のSYNをパッシブオープン扱い) | 対応 | ★ |
 | TIME_WAIT | 60秒固定(2MSLでない)。TIME_WAIT中の同タプルSYN再利用不可 | 60s + 再利用(RFC 1122) | ★ |
-| listen解除 | **不可**(stop-listeningパスがコメントアウト, `rx_app_if.cpp:79-82`)。port>=32768はlistne不可、二重bind検出なし | close/bind準拠 | ★ |
+| listen解除 | **実装済** (L1, `listen_close`テスト): listen要求のbit15をclose-listenフラグとして解釈(listenポートは0..32767なので既存AXIS I/F互換)。閉鎖後のSYNにはRST、再listenで復旧 | close/bind準拠 | 完了 |
 | ISN生成 | **改善済** (R1, `isn_quality`テスト): ISN = LFSR ^ (sessionID<<16) + フリーランカウンタ。旧実装の「下位6bit常に0x3F」パターンを解消し時間成分を追加。RFC 6528完全準拠(秘密鍵+4タプルハッシュ)は未 | RFC 6528(秘密鍵+4タプルハッシュ+時刻) | ★(残) |
 | SYNバックログ制限 | なし。1000個の偽SYNで**全セッション枯渇**(SYN flood無防備) | syncookies等 | ★ |
 | RST検証 | seq==recvd完全一致のみ(RFC 5961のchallenge ACKなし) | RFC 5961 | ★ |

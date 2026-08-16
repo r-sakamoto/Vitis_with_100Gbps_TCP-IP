@@ -3683,6 +3683,36 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // L1: stop-listening. A listen request with bit 15 set closes the listen
+  // port; a SYN to the closed port then draws a RST, and re-listening
+  // restores normal passive open.
+  task automatic test_listen_close();
+    bytes_t p;
+    bit ok;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+    // close the listening port (bit 15 = close-listen flag)
+    app_listen(16'h8000 | 16'd80, ok);
+    tb_check(ok, "stop-listening(80) accepted");
+    repeat (100) @(posedge ap_clk);
+
+    // SYN to the closed port -> RST
+    peer_port = 16'd42200; toe_port = 16'd80;
+    peer_seq = 32'h7800_0000; peer_win = 16'hFFFF;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, 0, F_SYN, 16'hFFFF, syn_options(1), no_bytes()));
+    expect_flags(F_RST, "RST for closed listen port", p, 100000, 0);
+    if (err_count) return;
+
+    // listening again restores passive open
+    app_listen(16'd80, ok);
+    tb_check(ok, "re-listen(80)");
+    do_passive_handshake(16'd80, 16'd42201, 32'h7810_0000);
+    tb_check(err_count == 0, "handshake works after re-listen");
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   //---------------------------------------------------------------------------
   // Main
   //---------------------------------------------------------------------------
@@ -3745,6 +3775,7 @@ module tb_toe_top;
       "sws_avoidance"  : test_sws_avoidance();
       "ca_growth"      : test_ca_growth();
       "sack_multi_rtx" : test_sack_multi_rtx();
+      "listen_close"   : test_listen_close();
       "rt_abort"       : test_rt_abort();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
