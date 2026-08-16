@@ -646,13 +646,14 @@ void drop_optional_header_fields(	hls::stream<optionalFieldsMeta>&		metaIn,
  *   3  |     3B | Window scale
  *   4  |     2B | SACK permitted (Selective Acknowledgment)
  */
-// Result is packed as {tsEcr[150:119], tsVal[118:87], tsValid[86],
+// Result is packed as {sack2End[215:184], sack2Start[183:152],
+// sack2Valid[151], tsEcr[150:119], tsVal[118:87], tsValid[86],
 // sackEnd[85:54], sackStart[53:22], sackValid[21], sackPermitted[20],
 // mss[19:4], windowScale[3:0]}. MSS defaults to 536 (RFC 1122) when the
 // peer's SYN carries no MSS option.
 void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 												hls::stream<ap_uint<320> >&	optionalHeaderFieldsIn,
-												hls::stream<ap_uint<151> >&		parsedOptionsOut)
+												hls::stream<ap_uint<216> >&		parsedOptionsOut)
 {
 	#pragma HLS PIPELINE II=1
 	#pragma HLS INLINE off
@@ -673,6 +674,9 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 	static ap_uint<1> tsValidVal;
 	static ap_uint<32> tsValVal;
 	static ap_uint<32> tsEcrVal;
+	static ap_uint<1> sack2Val;
+	static ap_uint<32> sack2StartVal;
+	static ap_uint<32> sack2EndVal;
 
 	switch (state)
 	{
@@ -692,6 +696,9 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 			tsValidVal = 0;
 			tsValVal = 0;
 			tsEcrVal = 0;
+			sack2Val = 0;
+			sack2StartVal = 0;
+			sack2EndVal = 0;
 			state = PARSE;
 		}
 		break;
@@ -725,13 +732,19 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 					done = true; //malformed MSS option, stop parsing
 				}
 				break;
-			case 5: //SACK blocks (we use the first one)
+			case 5: //SACK blocks (we use the first two)
 				if (optionLength >= 10 && optionLength <= remainingBytes && (optionLength & 0x7) == 2)
 				{
 					sackVal = 1;
 					//values are big-endian on the wire, fields is byte0-at-LSB
 					sackStartVal = (fields(23, 16), fields(31, 24), fields(39, 32), fields(47, 40));
 					sackEndVal = (fields(55, 48), fields(63, 56), fields(71, 64), fields(79, 72));
+					if (optionLength >= 18)
+					{
+						sack2Val = 1;
+						sack2StartVal = (fields(87, 80), fields(95, 88), fields(103, 96), fields(111, 104));
+						sack2EndVal = (fields(119, 112), fields(127, 120), fields(135, 128), fields(143, 136));
+					}
 				}
 				else
 				{
@@ -788,7 +801,7 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 
 		if (done)
 		{
-			parsedOptionsOut.write((tsEcrVal, tsValVal, tsValidVal, sackEndVal, sackStartVal, sackVal, sackPermVal, mssVal, wsVal));
+			parsedOptionsOut.write((sack2EndVal, sack2StartVal, sack2Val, tsEcrVal, tsValVal, tsValidVal, sackEndVal, sackStartVal, sackVal, sackPermVal, mssVal, wsVal));
 			state = IDLE;
 		}
 		else
@@ -801,7 +814,7 @@ void parse_optional_header_fields(	hls::stream<ap_uint<4> >&		dataOffsetIn,
 	}//switch
 }
 
-void merge_header_meta(hls::stream<ap_uint<151> >&			rxEng_winScaleFifo,
+void merge_header_meta(hls::stream<ap_uint<216> >&			rxEng_winScaleFifo,
 								hls::stream<rxEngineMetaData>&	rxEng_headerMetaFifo,
 								hls::stream<rxEngineMetaData>& 	rxEng_metaDataFifo)
 {
@@ -828,6 +841,7 @@ void merge_header_meta(hls::stream<ap_uint<151> >&			rxEng_winScaleFifo,
 				meta.mss = 536; //RFC 1122 default when no MSS option present
 				meta.sackPermitted = 0;
 				meta.sackValid = 0;
+				meta.sackValid2 = 0;
 				meta.tsValid = 0;
 				rxEng_metaDataFifo.write(meta);
 			}
@@ -837,7 +851,7 @@ void merge_header_meta(hls::stream<ap_uint<151> >&			rxEng_winScaleFifo,
 		if (!rxEng_winScaleFifo.empty())
 		{
 			// std::cout << "META MERGE 1" << std::endl;
-			ap_uint<151> parsedOptions = rxEng_winScaleFifo.read();
+			ap_uint<216> parsedOptions = rxEng_winScaleFifo.read();
 			meta.winScale = parsedOptions(3, 0);
 			meta.mss = parsedOptions(19, 4);
 			meta.sackPermitted = parsedOptions[20];
@@ -847,6 +861,9 @@ void merge_header_meta(hls::stream<ap_uint<151> >&			rxEng_winScaleFifo,
 			meta.tsValid = parsedOptions[86];
 			meta.tsVal = parsedOptions(118, 87);
 			meta.tsEcr = parsedOptions(150, 119);
+			meta.sackValid2 = parsedOptions[151];
+			meta.sackStart2 = parsedOptions(183, 152);
+			meta.sackEnd2 = parsedOptions(215, 184);
 			rxEng_metaDataFifo.write(meta);
 			state = 0;
 		}
@@ -1198,20 +1215,27 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					// per-session effective MSS for congestion arithmetic
 					ap_uint<16> sessMSS = (txSar.mss == 0) ? (ap_uint<16>)MSS : txSar.mss;
 					bool enterFastRecovery = false;
-					// track the peer's latest SACK block (RFC 2018)
+					// track the peer's latest SACK blocks (RFC 2018, up to two)
 					ap_uint<32> newPeerSackStart = txSar.peerSackStart;
 					ap_uint<32> newPeerSackEnd = txSar.peerSackEnd;
 					ap_uint<1> newPeerSackValid = txSar.peerSackValid;
+					ap_uint<32> newPeerSackStart2 = txSar.peerSackStart2;
+					ap_uint<32> newPeerSackEnd2 = txSar.peerSackEnd2;
+					ap_uint<1> newPeerSackValid2 = txSar.peerSackValid2;
 					if (fsm_meta.meta.sackValid)
 					{
 						newPeerSackStart = fsm_meta.meta.sackStart;
 						newPeerSackEnd = fsm_meta.meta.sackEnd;
 						newPeerSackValid = 1;
+						newPeerSackStart2 = fsm_meta.meta.sackStart2;
+						newPeerSackEnd2 = fsm_meta.meta.sackEnd2;
+						newPeerSackValid2 = fsm_meta.meta.sackValid2;
 					}
 					else if (seq_gt(fsm_meta.meta.ackNumb, txSar.prevAck))
 					{
-						//cumulative progress without new SACK info: drop the stale block
+						//cumulative progress without new SACK info: drop the stale blocks
 						newPeerSackValid = 0;
+						newPeerSackValid2 = 0;
 					}
 					// Check if new ACK arrived
 					if (fsm_meta.meta.ackNumb == txSar.prevAck && txSar.prevAck != txSar.nextByte)
@@ -1297,6 +1321,9 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						txSarUpd.peerSackStart = newPeerSackStart;
 						txSarUpd.peerSackEnd = newPeerSackEnd;
 						txSarUpd.peerSackValid = newPeerSackValid;
+						txSarUpd.peerSackStart2 = newPeerSackStart2;
+						txSarUpd.peerSackEnd2 = newPeerSackEnd2;
+						txSarUpd.peerSackValid2 = newPeerSackValid2;
 						rxEng2txSar_upd_req.write(txSarUpd);
 					}
 					// zero-window persist (RFC 1122 4.2.2.17): arm the probe
@@ -2370,7 +2397,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 	static hls::stream<rxEngineMetaData>		rxEng_headerMetaFifo("rxEng_headerMetaFifo");
 	static hls::stream<ap_uint<4> >		rxEng_dataOffsetFifo("rxEng_dataOffsetFifo");
 	static hls::stream<ap_uint<320> >		rxEng_optionalFieldsFifo("rxEng_optionalFieldsFifo");
-	static hls::stream<ap_uint<151> >		rxEng_winScaleFifo("rxEng_winScaleFifo");
+	static hls::stream<ap_uint<216> >		rxEng_winScaleFifo("rxEng_winScaleFifo");
 	#pragma HLS stream variable=rxEng_headerMetaFifo depth=16
 	#pragma HLS stream variable=rxEng_dataOffsetFifo depth=2
 	#pragma HLS stream variable=rxEng_optionalFieldsFifo depth=2

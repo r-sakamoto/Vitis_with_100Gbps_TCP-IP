@@ -443,14 +443,28 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					txEng2rtt_event.write(rttEvent(ml_curEvent.sessionID, 0, 1));
 				}
 				// RFC 2018 selective retransmit: if the retransmit pointer sits
-				// inside the range the peer has already SACKed, skip over it
-				if (txSar.peerSackValid
-					&& seq_geq(txSar.ackd, txSar.peerSackStart) && seq_lt(txSar.ackd, txSar.peerSackEnd)
-					&& seq_leq(txSar.peerSackEnd, txSar.ackd + txSar.usedLength))
+				// inside a range the peer has already SACKed, skip over it.
+				// Two rounds handle both (possibly unordered) blocks, including
+				// adjacent ones where skipping block A lands inside block B.
+				for (int skipRound = 0; skipRound < 2; skipRound++)
 				{
-					ap_uint<32> sackSkip32 = txSar.peerSackEnd - txSar.ackd;
-					txSar.ackd += sackSkip32;
-					txSar.usedLength -= sackSkip32(WINDOW_BITS-1, 0);
+#pragma HLS UNROLL
+					if (txSar.peerSackValid
+						&& seq_geq(txSar.ackd, txSar.peerSackStart) && seq_lt(txSar.ackd, txSar.peerSackEnd)
+						&& seq_leq(txSar.peerSackEnd, txSar.ackd + txSar.usedLength))
+					{
+						ap_uint<32> sackSkip32 = txSar.peerSackEnd - txSar.ackd;
+						txSar.ackd += sackSkip32;
+						txSar.usedLength -= sackSkip32(WINDOW_BITS-1, 0);
+					}
+					else if (txSar.peerSackValid2
+						&& seq_geq(txSar.ackd, txSar.peerSackStart2) && seq_lt(txSar.ackd, txSar.peerSackEnd2)
+						&& seq_leq(txSar.peerSackEnd2, txSar.ackd + txSar.usedLength))
+					{
+						ap_uint<32> sackSkip32 = txSar.peerSackEnd2 - txSar.ackd;
+						txSar.ackd += sackSkip32;
+						txSar.usedLength -= sackSkip32(WINDOW_BITS-1, 0);
+					}
 				}
 				// usedLength counts the FIN's phantom sequence byte once finSent
 				// is set; retransmitting it as payload emitted a bogus 1-byte
@@ -504,12 +518,21 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				// => no check is required
 				ap_uint<WINDOW_BITS> segLen = (currLength > sessionMSS) ? (ap_uint<WINDOW_BITS>)sessionMSS : currLength;
 				bool lastSegment = (segLen == currLength);
-				// clamp the segment so it does not overlap the SACKed range;
-				// the next iteration then jumps over that range
+				// clamp the segment so it does not overlap a SACKed range;
+				// the next iteration then jumps over that range. Applying the
+				// second clamp on the already-clamped length yields the
+				// nearest block start regardless of block order.
 				if (txSar.peerSackValid && seq_gt(txSar.peerSackStart, txSar.ackd)
 					&& seq_lt(txSar.peerSackStart, txSar.ackd + segLen))
 				{
 					ap_uint<32> tillSack32 = txSar.peerSackStart - txSar.ackd;
+					segLen = tillSack32(WINDOW_BITS-1, 0);
+					lastSegment = false;
+				}
+				if (txSar.peerSackValid2 && seq_gt(txSar.peerSackStart2, txSar.ackd)
+					&& seq_lt(txSar.peerSackStart2, txSar.ackd + segLen))
+				{
+					ap_uint<32> tillSack32 = txSar.peerSackStart2 - txSar.ackd;
 					segLen = tillSack32(WINDOW_BITS-1, 0);
 					lastSegment = false;
 				}

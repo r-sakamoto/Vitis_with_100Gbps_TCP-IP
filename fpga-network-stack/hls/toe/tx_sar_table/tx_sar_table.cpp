@@ -150,6 +150,9 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			txEngReply.peerSackStart = entry.peerSackStart;
 			txEngReply.peerSackEnd = entry.peerSackEnd;
 			txEngReply.peerSackValid = entry.peerSackValid;
+			txEngReply.peerSackStart2 = entry.peerSackStart2;
+			txEngReply.peerSackEnd2 = entry.peerSackEnd2;
+			txEngReply.peerSackValid2 = entry.peerSackValid2;
 			txSar2txEng_upd_rsp.write(txEngReply);
 		}
 	}
@@ -174,6 +177,9 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			tx_table[tst_rxEngUpdate.sessionID].peerSackStart = tst_rxEngUpdate.peerSackStart;
 			tx_table[tst_rxEngUpdate.sessionID].peerSackEnd = tst_rxEngUpdate.peerSackEnd;
 			tx_table[tst_rxEngUpdate.sessionID].peerSackValid = tst_rxEngUpdate.peerSackValid;
+			tx_table[tst_rxEngUpdate.sessionID].peerSackStart2 = tst_rxEngUpdate.peerSackStart2;
+			tx_table[tst_rxEngUpdate.sessionID].peerSackEnd2 = tst_rxEngUpdate.peerSackEnd2;
+			tx_table[tst_rxEngUpdate.sessionID].peerSackValid2 = tst_rxEngUpdate.peerSackValid2;
 			// effective cwnd for the app-side min_window push (on init the
 			// query still carries a stale value, use the fresh IW instead)
 			ap_uint<WINDOW_BITS> effCongWindow = tst_rxEngUpdate.cong_window;
@@ -238,6 +244,9 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			rxEngReply.peerSackStart = tx_table[tst_rxEngUpdate.sessionID].peerSackStart;
 			rxEngReply.peerSackEnd = tx_table[tst_rxEngUpdate.sessionID].peerSackEnd;
 			rxEngReply.peerSackValid = tx_table[tst_rxEngUpdate.sessionID].peerSackValid;
+			rxEngReply.peerSackStart2 = tx_table[tst_rxEngUpdate.sessionID].peerSackStart2;
+			rxEngReply.peerSackEnd2 = tx_table[tst_rxEngUpdate.sessionID].peerSackEnd2;
+			rxEngReply.peerSackValid2 = tx_table[tst_rxEngUpdate.sessionID].peerSackValid2;
 			txSar2rxEng_upd_rsp.write(rxEngReply);
 		}
 	}

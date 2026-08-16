@@ -896,6 +896,19 @@ module tb_toe_top;
     return 0;
   endfunction
 
+  // 20-byte option list with two SACK blocks: NOP NOP kind=5 len=18 s0 e0 s1 e1
+  function automatic bytes_t sack_opt2(input bit [31:0] s0, input bit [31:0] e0,
+                                       input bit [31:0] s1, input bit [31:0] e1);
+    bytes_t o;
+    o = new[20];
+    o[0] = 8'h01; o[1] = 8'h01; o[2] = 8'h05; o[3] = 8'h12;
+    o[4] = s0[31:24]; o[5] = s0[23:16]; o[6] = s0[15:8]; o[7] = s0[7:0];
+    o[8] = e0[31:24]; o[9] = e0[23:16]; o[10] = e0[15:8]; o[11] = e0[7:0];
+    o[12] = s1[31:24]; o[13] = s1[23:16]; o[14] = s1[15:8]; o[15] = s1[7:0];
+    o[16] = e1[31:24]; o[17] = e1[23:16]; o[18] = e1[15:8]; o[19] = e1[7:0];
+    return o;
+  endfunction
+
   function automatic bytes_t gen_payload(input int len, input byte unsigned seed);
     bytes_t d;
     d = new[len];
@@ -3587,6 +3600,89 @@ module tb_toe_top;
     end
   endtask
 
+  // C2: selective retransmit honours BOTH SACK blocks of a duplicate ACK.
+  // 5 x 1000B in flight, peer got segments 0, 2 and 4 (blocks [2000,3000)
+  // and [4000,5000)) -> fast retransmit must resend exactly [1000,2000) and
+  // [3000,4000), skipping both SACKed ranges.
+  task automatic test_sack_multi_rtx();
+    bytes_t p, pay;
+    bit ok, ok2;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] d0_seq;
+    int got;
+    bit got1, got3, extra;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd42100);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+    if (err_count) return;
+
+    for (int i = 0; i < 5; i++) begin
+      pay = gen_payload(1000, 8'hA0 + i[7:0]);
+      app_send(sid, pay, rsp);
+      tb_check(rsp.error == 0, $sformatf("app_send %0d accepted", i));
+    end
+    got = 0;
+    while (got < 5) begin
+      wait_pkt(p, 400000, ok2);
+      if (!ok2) begin tb_error("timeout collecting data segments"); return; end
+      if (f_payload_len(p) == 1000) begin
+        if (got == 0) d0_seq = f_seq(p);
+        got++;
+      end
+    end
+
+    // 3 duplicate ACKs (no cumulative progress) carrying both SACK blocks
+    // [1000,2000) and [3000,4000) -> fast retransmit of the three holes
+    for (int i = 0; i < 3; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, d0_seq, F_ACK, peer_win,
+                        sack_opt2(d0_seq + 1000, d0_seq + 2000,
+                                  d0_seq + 3000, d0_seq + 4000), no_bytes()));
+      repeat (100) @(posedge ap_clk);
+    end
+
+    // expect exactly the three un-SACKed holes
+    got1 = 0; got3 = 0; extra = 0;
+    begin
+      bit got0 = 0;
+      for (int k = 0; k < 3; k++) begin
+        ok2 = 0;
+        while (!ok2) begin
+          wait_pkt(p, 400000, ok2);
+          if (!ok2) begin tb_error("timeout waiting for selective retransmissions"); return; end
+          if (f_payload_len(p) == 0) ok2 = 0; // skip pure ACKs
+        end
+        if (f_seq(p) == d0_seq && f_payload_len(p) == 1000) got0 = 1;
+        else if (f_seq(p) == d0_seq + 2000 && f_payload_len(p) == 1000) got1 = 1;
+        else if (f_seq(p) == d0_seq + 4000 && f_payload_len(p) == 1000) got3 = 1;
+        else extra = 1;
+      end
+      tb_check(got0, "hole [0,1000) retransmitted");
+      tb_check(got1, "hole [2000,3000) retransmitted");
+      tb_check(got3, "hole [4000,5000) retransmitted");
+      tb_check(!extra, "no SACKed data retransmitted");
+    end
+    // and nothing further
+    wait_pkt(p, 200000, ok2);
+    if (ok2 && f_payload_len(p) != 0)
+      tb_check(0, $sformatf("unexpected extra retransmission seq=%0d len=%0d", f_seq(p), f_payload_len(p)));
+
+    // clean up: cumulative ACK for everything
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq + 5000, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   //---------------------------------------------------------------------------
   // Main
   //---------------------------------------------------------------------------
@@ -3648,6 +3744,7 @@ module tb_toe_top;
       "zero_window_probe" : test_zero_window_probe();
       "sws_avoidance"  : test_sws_avoidance();
       "ca_growth"      : test_ca_growth();
+      "sack_multi_rtx" : test_sack_multi_rtx();
       "rt_abort"       : test_rt_abort();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase

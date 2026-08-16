@@ -20,7 +20,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 |---|---|---|---|
 | MSSオプション(受信) | **実装済** (F4+P1, `mss_option`/`tx_segmentation`テスト): 実効MSS=min(peer,local)をセッション毎に保存し、初送・再送ともMSS超過書込みをDDR読出しで分割送信(バイパス複製ストリームは破棄モードで整合)。PMTUDは未 | 相手MSSとPMTUからMSSを決定 | ★(残: PMTUD) |
 | Window Scale(受信) | SYN時のみパース。**自側shiftは0か2の固定** (`rx_engine.cpp:1366,1429`)。相手shiftは**14超の値を無検証で格納** → `tx_sar_table.cpp:121` でビット範囲オーバーフロー(issue #42) | shift 0〜14を交渉、バッファサイズから導出 | ★★★ |
-| SACK / SACK-Permitted | **実装済** (S1+S2+M1, `sack_rx_gen`/`sack_selective_rtx`/`multi_gap_sack`テスト): 交渉+最大2ブロックのSACK生成(TS共存で32Bオプション)+相手SACKの解釈と選択的再送。相手SACKの解釈は第1ブロックのみ、D-SACKは未 | あり(選択再送・D-SACK) | ★(残: 相手側複数ブロック解釈/D-SACK) |
+| SACK / SACK-Permitted | **実装済** (S1+S2+M1+C2, `sack_rx_gen`/`sack_selective_rtx`/`multi_gap_sack`/`sack_multi_rtx`テスト): 交渉+最大2ブロックのSACK生成(TS共存で32Bオプション)+相手SACK最大2ブロックの解釈と選択的再送(スキップ2ラウンド+2重クランプで順不同ブロック対応)。D-SACKは未 | あり(選択再送・D-SACK) | ★(残: D-SACK) |
 | Timestamps (RFC 7323) | **実装済** (T1, `ts_negotiate`/`paws_drop`テスト): SYN/SYN-ACKでTS交渉(常時提示/条件エコー)、全セグメント(データ含む)にNOP NOP TS 12B付与、64bitデータパスでボディを4Bシフト。TS.Recent追跡+PAWSで旧タイムスタンプのセグメントを破棄しdup ACK応答。実効MSSは-12B。TSval=~0.84ms粒度のフリーランカウンタ。RTT計測は既存rtt_estimator(Karn)のまま(TSecrベースRTTは未)。512bitデータパスはTS無効(TCP_TS_OPTIONゲート) | あり | 完了 |
 | ECN (ECE/CWR/ECT) | **なし**。フラグは常時0固定 (`toe_internals.hpp:522`) | あり | ★ |
 | オプションパーサの正当性 | dataOffsetの単位バグ(ワード vs バイト混在, issue #43)、不正オプション列でRXパイプラインがストールし得る (`rx_engine.cpp:645-700,730-738`) | — | ★★★(バグ修正) |
@@ -32,7 +32,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 |---|---|---|---|
 | RTT計測 / 適応RTO | **実装済** (P2, `adaptive_rto`テスト): 新モジュール`rtt_estimator`がKarn方式でRTT計測、RFC 6298のSRTT/RTTVAR→RTO=clamp(SRTT+4V, 250ms, 30s)。retransmit_timerはRTO×2^retriesの指数バックオフ化。Timestampsオプション(PAWS含む)は未 | SRTT/RTTVARによるRFC 6298、最小RTO 200ms | ★(残: TSopt) |
 | 再送回数上限 | **改善済** (C3, `rt_abort`テスト): データ再送は7回(RTO上限30sで累計1分超)後にセッション解放+app通知、SYN/SYN-ACKは4回のまま。LinuxもRTO枯渇時にRSTは送らない(ETIMEDOUT) | tcp_retries2(15回) | ★(残: 回数) |
-| 再送方式 | **改善済** (S2): peer SACKブロックの範囲をスキップする選択的再送(単一ブロック)。RTOあたり最大4セグメントの上限は残る | SACKベースの選択再送 | ★(残) |
+| 再送方式 | **改善済** (S2+C2): peer SACKブロック(最大2個)の範囲をスキップ/クランプする選択的再送。RTOあたり最大4セグメントの上限は残る(SACKで実質補完) | SACKベースの選択再送 | 完了 |
 | Fast Retransmit | **実装済** (P3, `fast_recovery`テスト): 3rd dup ACKでssthresh=max(flight/2,2MSS)・cwnd=ssthresh+3MSS、dup ACK毎に+MSS膨張、回復脱出でcwnd=ssthresh収縮。NewReno partial-ACK再送はgo-back-N再送のため実質不要 | RFC 5681 fast recovery、partial ACK処理 | 完了 |
 | 輻輳制御 | **正規化済** (P3+C1, `ca_growth`テスト): cwnd初期=IW10(RFC 6928)、RTO後=1×MSS、slow start+sessMSS/ACK、輻輳回避はRFC 3465バイトカウント(cwnd分のACKバイト毎に+1MSS ≒ MSS²/cwnd/ACK)。CUBIC/pacingは未(Reno相当) | CUBIC(デフォルト)ほか、ABC、pacing | ★(残: CUBIC) |
 | dup ACK判定 | **改善済** (P3): staleACK(snd_una以前)は輻輳状態に影響しない(seq_gtガード)。ウィンドウ不変チェックは未 | RFC 5681準拠 | ★(残) |
