@@ -95,6 +95,7 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 				// RFC 5681: after an RTO the loss window is one full-sized segment
 				ap_uint<16> lwMss = tx_table[tst_txEngUpdate.sessionID].mss;
 				tx_table[tst_txEngUpdate.sessionID].cong_window = (lwMss == 0) ? (ap_uint<16>)MSS : lwMss;
+				tx_table[tst_txEngUpdate.sessionID].ca_acc = 0;
 			}
 		}
 		else // Read
@@ -167,6 +168,7 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			tx_table[tst_rxEngUpdate.sessionID].ackd = tst_rxEngUpdate.ackd;
 			tx_table[tst_rxEngUpdate.sessionID].recv_window = tst_rxEngUpdate.recv_window;
 			tx_table[tst_rxEngUpdate.sessionID].cong_window = tst_rxEngUpdate.cong_window;
+			tx_table[tst_rxEngUpdate.sessionID].ca_acc = tst_rxEngUpdate.ca_acc;
 			tx_table[tst_rxEngUpdate.sessionID].count = tst_rxEngUpdate.count;
 			tx_table[tst_rxEngUpdate.sessionID].fastRetransmitted = tst_rxEngUpdate.fastRetransmitted;
 			tx_table[tst_rxEngUpdate.sessionID].peerSackStart = tst_rxEngUpdate.peerSackStart;
@@ -193,6 +195,7 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 				effCongWindow = (iw > iwCap) ? iwCap : iw;
 				tx_table[tst_rxEngUpdate.sessionID].cong_window = effCongWindow;
 				tx_table[tst_rxEngUpdate.sessionID].slowstart_threshold = CONGESTION_WINDOW_MAX;
+				tx_table[tst_rxEngUpdate.sessionID].ca_acc = 0;
 			}
 			else
 			{
@@ -231,6 +234,7 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 													tx_table[tst_rxEngUpdate.sessionID].count,
 													tx_table[tst_rxEngUpdate.sessionID].fastRetransmitted);
 			rxEngReply.mss = tx_table[tst_rxEngUpdate.sessionID].mss;
+			rxEngReply.ca_acc = tx_table[tst_rxEngUpdate.sessionID].ca_acc;
 			rxEngReply.peerSackStart = tx_table[tst_rxEngUpdate.sessionID].peerSackStart;
 			rxEngReply.peerSackEnd = tx_table[tst_rxEngUpdate.sessionID].peerSackEnd;
 			rxEngReply.peerSackValid = tx_table[tst_rxEngUpdate.sessionID].peerSackValid;

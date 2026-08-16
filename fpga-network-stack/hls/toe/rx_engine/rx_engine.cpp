@@ -1255,28 +1255,45 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						{
 							// leaving fast recovery: deflate cwnd to ssthresh (RFC 5681)
 							txSar.cong_window = txSar.slowstart_threshold;
+							txSar.ca_acc = 0;
 						}
 						// Check for SlowStart & Increase Congestion Window
 						else if (txSar.cong_window <= (txSar.slowstart_threshold-sessMSS))
 						{
 							txSar.cong_window += sessMSS;
+							txSar.ca_acc = 0;
 						}
-						else if (txSar.cong_window <= (ap_uint<WINDOW_BITS>)(CONGESTION_WINDOW_MAX - (sessMSS>>2)))
+						else
 						{
-							//congestion avoidance: ~MSS/4 per ACK (TODO proper MSS^2/cwnd)
-							txSar.cong_window += (sessMSS>>2);
+							// congestion avoidance, byte counting (RFC 3465):
+							// grow by one MSS per cwnd-worth of acked bytes,
+							// i.e. ~MSS^2/cwnd per ACK, ~one MSS per RTT
+							ap_uint<32> ackedBytes32 = fsm_meta.meta.ackNumb - txSar.prevAck;
+							ap_uint<WINDOW_BITS+2> accSum = (ap_uint<WINDOW_BITS+2>)txSar.ca_acc
+									+ (ap_uint<WINDOW_BITS+2>)ackedBytes32(WINDOW_BITS-1, 0);
+							if (accSum >= (ap_uint<WINDOW_BITS+2>)txSar.cong_window)
+							{
+								accSum -= txSar.cong_window;
+								if (txSar.cong_window <= (ap_uint<WINDOW_BITS>)(CONGESTION_WINDOW_MAX - sessMSS))
+								{
+									txSar.cong_window += sessMSS;
+								}
+							}
+							txSar.ca_acc = accSum(WINDOW_BITS-1, 0);
 						}
 						txSar.count = 0;
 						txSar.fastRetransmitted = false;
 					}
 					// else: stale ACK (older than snd_una) - ignore for congestion state
 					// TX SAR
-					if ((txSar.prevAck <= fsm_meta.meta.ackNumb && fsm_meta.meta.ackNumb <= txSar.nextByte)
-							|| ((txSar.prevAck <= fsm_meta.meta.ackNumb || fsm_meta.meta.ackNumb <= txSar.nextByte) && txSar.nextByte < txSar.prevAck))
+					// mod-2^32 form of "snd_una <= ack <= snd_nxt" (replaces the
+					// hand-rolled two-case wrap check)
+					if (seq_leq(txSar.prevAck, fsm_meta.meta.ackNumb) && seq_leq(fsm_meta.meta.ackNumb, txSar.nextByte))
 					{
 						rxTxSarQuery txSarUpd(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, txSar.count, ((txSar.count == 3) || txSar.fastRetransmitted));
 						txSarUpd.ssthresh = txSar.slowstart_threshold;
 						txSarUpd.writeSsthresh = enterFastRecovery;
+						txSarUpd.ca_acc = enterFastRecovery ? (ap_uint<WINDOW_BITS>)0 : txSar.ca_acc;
 						txSarUpd.peerSackStart = newPeerSackStart;
 						txSarUpd.peerSackEnd = newPeerSackEnd;
 						txSarUpd.peerSackValid = newPeerSackValid;

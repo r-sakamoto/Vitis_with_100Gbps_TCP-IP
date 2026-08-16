@@ -31,12 +31,12 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | 機能 | 現状 | Linux | 優先度 |
 |---|---|---|---|
 | RTT計測 / 適応RTO | **実装済** (P2, `adaptive_rto`テスト): 新モジュール`rtt_estimator`がKarn方式でRTT計測、RFC 6298のSRTT/RTTVAR→RTO=clamp(SRTT+4V, 250ms, 30s)。retransmit_timerはRTO×2^retriesの指数バックオフ化。Timestampsオプション(PAWS含む)は未 | SRTT/RTTVARによるRFC 6298、最小RTO 200ms | ★(残: TSopt) |
-| 再送回数上限 | 4回再送で**RSTも送らずセッション破棄** (`retransmit_timer.cpp:166-183`) | tcp_retries2(15回)、RST送信 | ★★ |
+| 再送回数上限 | **改善済** (C3, `rt_abort`テスト): データ再送は7回(RTO上限30sで累計1分超)後にセッション解放+app通知、SYN/SYN-ACKは4回のまま。LinuxもRTO枯渇時にRSTは送らない(ETIMEDOUT) | tcp_retries2(15回) | ★(残: 回数) |
 | 再送方式 | **改善済** (S2): peer SACKブロックの範囲をスキップする選択的再送(単一ブロック)。RTOあたり最大4セグメントの上限は残る | SACKベースの選択再送 | ★(残) |
 | Fast Retransmit | **実装済** (P3, `fast_recovery`テスト): 3rd dup ACKでssthresh=max(flight/2,2MSS)・cwnd=ssthresh+3MSS、dup ACK毎に+MSS膨張、回復脱出でcwnd=ssthresh収縮。NewReno partial-ACK再送はgo-back-N再送のため実質不要 | RFC 5681 fast recovery、partial ACK処理 | 完了 |
-| 輻輳制御 | **正規化済** (P3): cwnd初期=IW10(RFC 6928, sessMSSベース)、RTO後=1×MSS(loss window)、slow start+sessMSS、輻輳回避+sessMSS/4(MSS²/cwnd近似は未)。CUBIC/ABC/pacingは未 | CUBIC(デフォルト)ほか、ABC、pacing | ★(残) |
+| 輻輳制御 | **正規化済** (P3+C1, `ca_growth`テスト): cwnd初期=IW10(RFC 6928)、RTO後=1×MSS、slow start+sessMSS/ACK、輻輳回避はRFC 3465バイトカウント(cwnd分のACKバイト毎に+1MSS ≒ MSS²/cwnd/ACK)。CUBIC/pacingは未(Reno相当) | CUBIC(デフォルト)ほか、ABC、pacing | ★(残: CUBIC) |
 | dup ACK判定 | **改善済** (P3): staleACK(snd_una以前)は輻輳状態に影響しない(seq_gtガード)。ウィンドウ不変チェックは未 | RFC 5681準拠 | ★(残) |
-| シーケンス番号の巡回演算 | ACK窓ガード1箇所以外は**素の32bit比較**(wrap非対応) (`rx_engine.cpp:1129他`) | 全比較がmod 2^32 | ★★ |
+| シーケンス番号の巡回演算 | **統一済** (F2+P3+C4): OOO受理・dup ACK判定・ACK受理窓(snd_una≤ack≤snd_nxt)・PAWS・SACK処理はすべてseq_lt/leq/gt/geqヘルパ(mod 2^32)。等値比較はwrap非依存 | 全比較がmod 2^32 | 完了 |
 
 ## 3. 受信処理・フロー制御
 

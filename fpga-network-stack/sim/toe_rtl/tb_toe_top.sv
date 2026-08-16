@@ -3438,6 +3438,155 @@ module tb_toe_top;
   endtask
 `endif
 
+  // C1: congestion avoidance byte counting (RFC 3465). After fast recovery
+  // deflates cwnd to ssthresh=4900, each full-MSS ACK adds 1460 acked bytes
+  // to the accumulator; cwnd grows by one MSS only when a whole cwnd worth
+  // of bytes has been acked: 4900,4900,4900,6360,6360,6360,6360,7820.
+  task automatic test_ca_growth();
+    bytes_t p, pay;
+    bit ok, ok2;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] d0_seq, d_seq;
+    int got;
+    int unsigned cw;
+    int unsigned exp_cw[8];
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd41900);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    // enter and leave fast recovery (as in test_fast_recovery) to get a low
+    // ssthresh so congestion avoidance is actually exercised
+    for (int i = 0; i < 8; i++) begin
+      pay = gen_payload(1400, 8'h30 + i[7:0]);
+      app_send(sid, pay, rsp);
+    end
+    got = 0;
+    while (got < 8) begin
+      wait_pkt(p, 400000, ok2);
+      if (!ok2) begin tb_error("timeout collecting data segments"); return; end
+      if (f_payload_len(p) == 1400) begin
+        if (got == 0) d0_seq = f_seq(p);
+        got++;
+      end
+    end
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq + 1400, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    for (int i = 0; i < 4; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, d0_seq + 1400, F_ACK, peer_win, no_bytes(), no_bytes()));
+      repeat (100) @(posedge ap_clk);
+    end
+    repeat (3000) @(posedge ap_clk);
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq + 11200, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cw == 4900, $sformatf("cwnd=%0d expected 4900 after recovery exit", cw));
+    while (net_pkts.size() > 0) void'(net_pkts.pop_front());
+
+    // congestion avoidance: 8 full-MSS round trips
+    exp_cw[0] = 4900; exp_cw[1] = 4900; exp_cw[2] = 4900; exp_cw[3] = 6360;
+    exp_cw[4] = 6360; exp_cw[5] = 6360; exp_cw[6] = 6360; exp_cw[7] = 7820;
+    for (int k = 0; k < 8; k++) begin
+      pay = gen_payload(1460, 8'h90 + k[7:0]);
+      app_send(sid, pay, rsp);
+      tb_check(rsp.error == 0, $sformatf("CA app_send %0d accepted", k));
+      got = 0;
+      while (!got) begin
+        wait_pkt(p, 400000, ok2);
+        if (!ok2) begin tb_error($sformatf("timeout waiting for CA segment %0d", k)); return; end
+        if (f_payload_len(p) == 1460) begin d_seq = f_seq(p); got = 1; end
+      end
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, d_seq + 1460, F_ACK, peer_win, no_bytes(), no_bytes()));
+      repeat (3000) @(posedge ap_clk);
+      cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+      tb_check(cw == exp_cw[k], $sformatf("CA step %0d: cwnd=%0d expected %0d", k, cw, exp_cw[k]));
+    end
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  // C3: retransmission gives up after 7 data retries (SYN keeps 4).
+  // Requires the timer-scaled build; the exponential ladder sums to ~10M
+  // cycles, so this test (like keepalive) runs with the 40M-cycle watchdog.
+  task automatic test_rt_abort();
+    bytes_t p, pay;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    bit [31:0] d_seq;
+    int rtx, nn;
+    txrsp_t rsp_dummy;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd42000);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+    if (err_count) return;
+
+    // 200B that the peer never ACKs
+    pay = gen_payload(200, 8'h44);
+    app_send(sid, pay, rsp_dummy);
+    ok = 0;
+    while (!ok) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for original segment"); return; end
+      if (f_payload_len(p) != 200) ok = 0;
+    end
+    d_seq = f_seq(p);
+
+    // exactly 7 retransmissions of the same segment
+    for (rtx = 1; rtx <= 7; rtx++) begin
+      ok = 0;
+      while (!ok) begin
+        wait_pkt(p, 6_000_000, ok);
+        if (!ok) begin tb_error($sformatf("timeout waiting for retransmission %0d", rtx)); return; end
+        if (f_payload_len(p) != 200) ok = 0; // skip keepalive/pure ACKs
+      end
+      tb_check(f_seq(p) == d_seq, $sformatf("rtx %0d seq", rtx));
+      tb_info($sformatf("retransmission %0d seen", rtx));
+    end
+
+    // then the connection is aborted: closed notification + CAM delete,
+    // and no further data retransmissions
+    ok = 0; nn = 0;
+    while (!ok && nn < 3) begin
+      wait_notif(n, 6_000_000, ok);
+      if (ok && !n.closed) ok = 0;
+      nn++;
+    end
+    tb_check(ok && n.closed, "closed notification after retry exhaustion");
+    if (ok) tb_check(n.sessionID == sid, "notification session id");
+    nn = 0;
+    while (cam_delete_count == 0 && nn < 200_000) begin @(posedge ap_clk); nn++; end
+    tb_check(cam_delete_count > 0, "CAM DELETE issued on abort");
+    ok = 1;
+    while (ok) begin
+      wait_pkt(p, 1_000_000, ok);
+      if (ok && f_payload_len(p) == 200) begin
+        tb_check(0, "no further retransmissions after abort");
+        return;
+      end
+    end
+  endtask
+
   //---------------------------------------------------------------------------
   // Main
   //---------------------------------------------------------------------------
@@ -3498,6 +3647,8 @@ module tb_toe_top;
       "isn_quality"    : test_isn_quality();
       "zero_window_probe" : test_zero_window_probe();
       "sws_avoidance"  : test_sws_avoidance();
+      "ca_growth"      : test_ca_growth();
+      "rt_abort"       : test_rt_abort();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 
@@ -3512,8 +3663,8 @@ module tb_toe_top;
   // global watchdog (keepalive needs ~18M cycles of protocol silence)
   initial begin
     #1;
-    if (testname == "keepalive") #(CLK_PERIOD * 40_000_000);
-    else                         #(CLK_PERIOD * 10_000_000);
+    if (testname == "keepalive" || testname == "rt_abort") #(CLK_PERIOD * 40_000_000);
+    else                                                   #(CLK_PERIOD * 10_000_000);
     $display("[%0t] TB-ERROR: global watchdog expired", $time);
     $display("  TEST %s : FAIL (watchdog)", testname);
     $finish;

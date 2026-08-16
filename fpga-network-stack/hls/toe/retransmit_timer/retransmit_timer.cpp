@@ -170,7 +170,11 @@ void retransmit_timer(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetrans
 				{
 					currEntry.time = 0;
 					currEntry.active = false;
-					if (currEntry.retries < 4)
+					// data connections retry longer (Linux tcp_retries2 ~ 15;
+					// with the 30s RTO cap 7 retries already span >1 minute),
+					// handshake segments keep the short ladder
+					ap_uint<3> maxRetries = (currEntry.type == SYN || currEntry.type == SYN_ACK) ? 4 : 7;
+					if (currEntry.retries < maxRetries)
 					{
 						currEntry.retries++;
 						rtTimer2eventEng_setEvent.write(event(currEntry.type, currID, currEntry.retries));

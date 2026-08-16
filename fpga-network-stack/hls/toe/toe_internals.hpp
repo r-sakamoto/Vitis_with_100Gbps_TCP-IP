@@ -237,6 +237,9 @@ struct txSarEntry
 #endif
 	ap_uint<WINDOW_BITS> cong_window;
 	ap_uint<WINDOW_BITS> slowstart_threshold;
+	//congestion-avoidance byte counter (RFC 3465): cwnd grows by one MSS
+	//per cwnd-worth of newly acked bytes
+	ap_uint<WINDOW_BITS> ca_acc;
 	ap_uint<WINDOW_BITS> app;
 	ap_uint<2>	count;
 	bool		fastRetransmitted;
@@ -262,6 +265,7 @@ struct rxTxSarQuery
 	ap_uint<16> mss; //only valid on init
 	ap_uint<WINDOW_BITS> ssthresh; //only applied when writeSsthresh is set
 	ap_uint<1> writeSsthresh;
+	ap_uint<WINDOW_BITS> ca_acc; //congestion-avoidance byte counter
 	//peer SACK block state after this ACK (stored verbatim)
 	ap_uint<32>	peerSackStart;
 	ap_uint<32>	peerSackEnd;
@@ -270,14 +274,14 @@ struct rxTxSarQuery
 	ap_uint<1>	init;
 	rxTxSarQuery () {}
 	rxTxSarQuery(ap_uint<16> id)
-				:sessionID(id), ackd(0), recv_window(0), cong_window(0), count(0), fastRetransmitted(false), mss(MSS), ssthresh(0), writeSsthresh(0), peerSackStart(0), peerSackEnd(0), peerSackValid(0), write(0), init(0) {}
+				:sessionID(id), ackd(0), recv_window(0), cong_window(0), count(0), fastRetransmitted(false), mss(MSS), ssthresh(0), writeSsthresh(0), ca_acc(0), peerSackStart(0), peerSackEnd(0), peerSackValid(0), write(0), init(0) {}
 	rxTxSarQuery(ap_uint<16> id, ap_uint<32> ackd, ap_uint<16> recv_win, ap_uint<WINDOW_BITS> cong_win, ap_uint<2> count, bool fastRetransmitted)
-				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), mss(MSS), ssthresh(0), writeSsthresh(0), peerSackStart(0), peerSackEnd(0), peerSackValid(0), write(1), init(0) {}
+				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), mss(MSS), ssthresh(0), writeSsthresh(0), ca_acc(0), peerSackStart(0), peerSackEnd(0), peerSackValid(0), write(1), init(0) {}
 #if (WINDOW_SCALE)
 	rxTxSarQuery(ap_uint<16> id, ap_uint<32> ackd, ap_uint<16> recv_win, ap_uint<WINDOW_BITS> cong_win, ap_uint<2> count, bool fastRetransmitted, ap_uint<4> win_shift)
-				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), win_shift(win_shift), mss(MSS), ssthresh(0), writeSsthresh(0), peerSackStart(0), peerSackEnd(0), peerSackValid(0), write(1), init(1) {}
+				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), win_shift(win_shift), mss(MSS), ssthresh(0), writeSsthresh(0), ca_acc(0), peerSackStart(0), peerSackEnd(0), peerSackValid(0), write(1), init(1) {}
 	rxTxSarQuery(ap_uint<16> id, ap_uint<32> ackd, ap_uint<16> recv_win, ap_uint<WINDOW_BITS> cong_win, ap_uint<2> count, bool fastRetransmitted, ap_uint<4> win_shift, ap_uint<16> mss)
-				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), win_shift(win_shift), mss(mss), ssthresh(0), writeSsthresh(0), peerSackStart(0), peerSackEnd(0), peerSackValid(0), write(1), init(1) {}
+				:sessionID(id), ackd(ackd), recv_window(recv_win), cong_window(cong_win), count(count), fastRetransmitted(fastRetransmitted), win_shift(win_shift), mss(mss), ssthresh(0), writeSsthresh(0), ca_acc(0), peerSackStart(0), peerSackEnd(0), peerSackValid(0), write(1), init(1) {}
 #endif
 };
 
@@ -338,12 +342,13 @@ struct rxTxSarReply
 	ap_uint<2>	count;
 	bool		fastRetransmitted;
 	ap_uint<16>	mss; //effective segment size: min(peer MSS, local MSS)
+	ap_uint<WINDOW_BITS> ca_acc; //congestion-avoidance byte counter
 	ap_uint<32>	peerSackStart;
 	ap_uint<32>	peerSackEnd;
 	bool		peerSackValid;
 	rxTxSarReply() {}
 	rxTxSarReply(ap_uint<32> ack, ap_uint<32> next, ap_uint<WINDOW_BITS> cong_win, ap_uint<WINDOW_BITS> sstresh, ap_uint<2> count, bool fastRetransmitted)
-			:prevAck(ack), nextByte(next), cong_window(cong_win), slowstart_threshold(sstresh), count(count), fastRetransmitted(fastRetransmitted), mss(MSS), peerSackStart(0), peerSackEnd(0), peerSackValid(false) {}
+			:prevAck(ack), nextByte(next), cong_window(cong_win), slowstart_threshold(sstresh), count(count), fastRetransmitted(fastRetransmitted), mss(MSS), ca_acc(0), peerSackStart(0), peerSackEnd(0), peerSackValid(false) {}
 };
 
 struct txAppTxSarReply
