@@ -51,15 +51,19 @@ struct tx_engine_meta //same as rxEngine
 	ap_uint<1>	sack;
 	ap_uint<32>	sackStart;
 	ap_uint<32>	sackEnd;
+	//second SACK block (RFC 2018 multi-block, only valid with sack==1)
+	ap_uint<1>	sack2;
+	ap_uint<32>	sackStart2;
+	ap_uint<32>	sackEnd2;
 	// RFC 7323 timestamps: on a SYN this flag offers the option; on any other
 	// segment it appends NOP NOP TS(10B) with TSval=local clock, TSecr below
 	ap_uint<1>	ts;
 	ap_uint<32>	tsEcr;
-	tx_engine_meta() : sack(0), ts(0) {}
+	tx_engine_meta() : sack(0), sack2(0), ts(0) {}
 	tx_engine_meta(ap_uint<1> ack, ap_uint<1> rst, ap_uint<1> syn, ap_uint<1> fin)
-			:seqNumb(0), ackNumb(0), window_size(0), length(0), ack(ack), rst(rst), syn(syn), fin(fin), sack(0), ts(0) {}
+			:seqNumb(0), ackNumb(0), window_size(0), length(0), ack(ack), rst(rst), syn(syn), fin(fin), sack(0), sack2(0), ts(0) {}
 	tx_engine_meta(ap_uint<32> seqNumb, ap_uint<32> ackNumb, ap_uint<1> ack, ap_uint<1> rst, ap_uint<1> syn, ap_uint<1> fin)
-			:seqNumb(seqNumb), ackNumb(ackNumb), window_size(0), length(0), ack(ack), rst(rst), syn(syn), fin(fin), sack(0), ts(0) {}
+			:seqNumb(seqNumb), ackNumb(ackNumb), window_size(0), length(0), ack(ack), rst(rst), syn(syn), fin(fin), sack(0), sack2(0), ts(0) {}
 };
 
 /** @ingroup tx_engine

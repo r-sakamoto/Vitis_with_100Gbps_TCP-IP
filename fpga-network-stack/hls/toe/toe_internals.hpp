@@ -141,6 +141,10 @@ struct rxSarEntry
 	ap_uint<32> head;
 	ap_uint<32> offset;
 	bool gap;
+	//second out-of-order range (seq order: recvd < offset < head < offset2 < head2)
+	ap_uint<32> head2;
+	ap_uint<32> offset2;
+	bool gap2;
 	bool sackEnabled; //SACK permitted was negotiated on this session
 	bool tsEnabled;   //RFC 7323 timestamps negotiated on this session
 	ap_uint<32> tsRecent; //TS.Recent: last valid peer TSval
@@ -161,15 +165,18 @@ struct rxSarReply
 	ap_uint<32> head;
 	ap_uint<32> offset;
 	bool		gap;
+	ap_uint<32> head2;
+	ap_uint<32> offset2;
+	bool		gap2;
 	bool		sackEnabled;
 	bool		tsEnabled;
 	ap_uint<32>	tsRecent; //echoed as TSecr on outgoing segments
 	rxSarReply() {}
 	rxSarReply(rxSarEntry entry)
 #if !(WINDOW_SCALE)
-		:recvd(entry.recvd), head(entry.head), offset(entry.offset), gap(entry.gap), sackEnabled(entry.sackEnabled), tsEnabled(entry.tsEnabled), tsRecent(entry.tsRecent) {}
+		:recvd(entry.recvd), head(entry.head), offset(entry.offset), gap(entry.gap), head2(entry.head2), offset2(entry.offset2), gap2(entry.gap2), sackEnabled(entry.sackEnabled), tsEnabled(entry.tsEnabled), tsRecent(entry.tsRecent) {}
 #else
-		:recvd(entry.recvd), win_shift(entry.win_shift), head(entry.head), offset(entry.offset), gap(entry.gap), sackEnabled(entry.sackEnabled), tsEnabled(entry.tsEnabled), tsRecent(entry.tsRecent) {}
+		:recvd(entry.recvd), win_shift(entry.win_shift), head(entry.head), offset(entry.offset), gap(entry.gap), head2(entry.head2), offset2(entry.offset2), gap2(entry.gap2), sackEnabled(entry.sackEnabled), tsEnabled(entry.tsEnabled), tsRecent(entry.tsRecent) {}
 #endif
 };
 
@@ -187,20 +194,23 @@ struct rxSarRecvd
 	ap_uint<32> head;
 	ap_uint<32> offset;
 	bool gap;
+	ap_uint<32> head2;
+	ap_uint<32> offset2;
+	bool gap2; //set explicitly by the rx FSM after construction
 	rxSarRecvd() {}
 	rxSarRecvd(ap_uint<16> id)
-				:sessionID(id), recvd(0), tsEnabled(false), tsWrite(0), write(0), init(0) {}
+				:sessionID(id), recvd(0), tsEnabled(false), tsWrite(0), write(0), init(0), gap2(false) {}
 	rxSarRecvd(ap_uint<16> id, ap_uint<32> recvd)
-				:sessionID(id), recvd(recvd), tsEnabled(false), tsWrite(0), head(0), offset(0), gap(0), write(1), init(0) {}
+				:sessionID(id), recvd(recvd), tsEnabled(false), tsWrite(0), head(0), offset(0), gap(0), write(1), init(0), gap2(false) {}
 	// rxSarRecvd(ap_uint<16> id, ap_uint<32> recvd, ap_uint<4> win_shift)
 	// 				:sessionID(id), recvd(recvd), win_shift(win_shift), write(1), init(1) {}
 
 	rxSarRecvd(ap_uint<16> id, ap_uint<32> recvd, ap_uint<32> head, ap_uint<32>offset, bool gap)
-				:sessionID(id), recvd(recvd), tsEnabled(false), tsWrite(0), head(head), offset(offset), gap(gap), write(1), init(0) {}
+				:sessionID(id), recvd(recvd), tsEnabled(false), tsWrite(0), head(head), offset(offset), gap(gap), write(1), init(0), gap2(false) {}
 	rxSarRecvd(ap_uint<16> id, ap_uint<32> recvd, ap_uint<32> head, ap_uint<32>offset, bool gap, ap_uint<4> win_shift)
-				:sessionID(id), recvd(recvd), head(head), offset(offset), gap(gap), win_shift(win_shift), sackEnabled(false), tsEnabled(false), tsWrite(0), write(1), init(1) {}
+				:sessionID(id), recvd(recvd), head(head), offset(offset), gap(gap), win_shift(win_shift), sackEnabled(false), tsEnabled(false), tsWrite(0), write(1), init(1), gap2(false) {}
 	rxSarRecvd(ap_uint<16> id, ap_uint<32> recvd, ap_uint<32> head, ap_uint<32>offset, bool gap, ap_uint<4> win_shift, bool sackEnabled)
-				:sessionID(id), recvd(recvd), head(head), offset(offset), gap(gap), win_shift(win_shift), sackEnabled(sackEnabled), tsEnabled(false), tsWrite(0), write(1), init(1) {}
+				:sessionID(id), recvd(recvd), head(head), offset(offset), gap(gap), win_shift(win_shift), sackEnabled(sackEnabled), tsEnabled(false), tsWrite(0), write(1), init(1), gap2(false) {}
 };
 
 struct rxSarAppd

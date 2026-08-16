@@ -1342,7 +1342,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 #if !(RX_DDR_BYPASS) //if enable DDR, OOO is enabled
 					// Check if packet contains payload
 					// Second part makes sure that app pointer is not overtaken
-					ap_uint<WINDOW_BITS> free_space = ((rxSar.appd - rxSar.head(WINDOW_BITS-1, 0)) - 1);
+					ap_uint<WINDOW_BITS> free_space = ((rxSar.appd - (rxSar.gap2 ? rxSar.head2(WINDOW_BITS-1, 0) : rxSar.head(WINDOW_BITS-1, 0))) - 1);
 					
 					if (fsm_meta.meta.length != 0)
 					{
@@ -1353,157 +1353,129 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						pkgAddr(29, WINDOW_BITS) = fsm_meta.sessionID(13, 0);
 						pkgAddr(WINDOW_BITS-1, 0) = fsm_meta.meta.seqNumb(WINDOW_BITS-1, 0);
 
-						ap_uint<32> newRecvd = 0;
-						ap_uint<32> newHead = 0;
-						ap_uint<32> newOffset = 0;
-						// ### No gap, packet comes in order
-						if (!rxSar.gap && (fsm_meta.meta.seqNumb == rxSar.recvd) && (free_space > fsm_meta.meta.length))
+						// Two-range out-of-order bookkeeping. Invariant (seq order):
+						//   recvd < r0s < r0e < r1s < r1e
+						ap_uint<32> newRecvd = rxSar.recvd;
+						ap_uint<32> r0s = rxSar.offset;
+						ap_uint<32> r0e = rxSar.head;
+						bool r0v = rxSar.gap;
+						ap_uint<32> r1s = rxSar.offset2;
+						ap_uint<32> r1e = rxSar.head2;
+						bool r1v = rxSar.gap2;
+						ap_uint<32> segStart = fsm_meta.meta.seqNumb;
+						ap_uint<32> segEnd = fsm_meta.meta.seqNumb + fsm_meta.meta.length;
+						// wrap-safe acceptance: the whole segment must lie inside
+						// the advertised receive window (see the F2 fix)
+						ap_uint<32> winRight = rxSar.recvd + (ap_uint<32>)(ap_uint<WINDOW_BITS>)(rxSar.appd - rxSar.recvd(WINDOW_BITS-1, 0) - 1);
+						bool inWindow = seq_leq(segEnd, winRight);
+						bool accepted = false;
+						ap_uint<WINDOW_BITS> notifyLen = 0;
+
+						if (!r0v && (segStart == rxSar.recvd) && (free_space > fsm_meta.meta.length))
 						{
-							#ifndef __SYNTHESIS__
-							std::cout<<"RX_ACK: no gap in order";
-							std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
-							std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
-							std::cout<<" recvd:"<<rxSar.recvd;
-							std::cout<<" head:"<<rxSar.head;
-							std::cout<<" offset:"<<rxSar.offset;
-							std::cout<<" length:"<<fsm_meta.meta.length;							
-							std::cout<<" gap:"<<rxSar.gap;
-							std::cout<<" free_space:"<<free_space<<std::endl;
-							#endif
-							//increment both head and recvd pointers
-							newRecvd = fsm_meta.meta.seqNumb+fsm_meta.meta.length;
-							newHead = fsm_meta.meta.seqNumb+fsm_meta.meta.length;
-							//update head and recvd pointers
-							rxSarRecvd sarUpd0(fsm_meta.sessionID, newRecvd, newHead, rxSar.offset, rxSar.gap);
-							sarUpd0.tsWrite = tsUpdate;
-							sarUpd0.tsRecent = fsm_meta.meta.tsVal;
-							rxEng2rxSar_upd_req.write(sarUpd0);
-							//write to memory
-							rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
-							// Notify app length bytes available
-							rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, fsm_meta.meta.length, fsm_meta.srcIpAddress, fsm_meta.dstIpPort));
-							dropDataFifoOut.write(false);
+							// ### in order, no gap
+							newRecvd = segEnd;
+							notifyLen = fsm_meta.meta.length;
+							accepted = true;
 						}
-						// ### No gap, packet comes out-of-order
-						// Wrap-safe acceptance: the whole segment must lie inside the
-						// advertised receive window (recvd .. recvd+advertised). The old
-						// check truncated (seq+len-head) to WINDOW_BITS, so a segment
-						// arbitrarily far ahead aliased onto valid buffer content and
-						// could overwrite not-yet-read data.
-						else if (!rxSar.gap && seq_gt(fsm_meta.meta.seqNumb, rxSar.recvd)
-								&& seq_leq(fsm_meta.meta.seqNumb + fsm_meta.meta.length,
-										rxSar.recvd + (ap_uint<32>)(ap_uint<WINDOW_BITS>)(rxSar.appd - rxSar.recvd(WINDOW_BITS-1, 0) - 1)))
+						else if (!r0v && seq_gt(segStart, rxSar.recvd) && inWindow)
 						{
-							#ifndef __SYNTHESIS__
-							std::cout<<"RX_ACK: no gap ooo";
-							std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
-							std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
-							std::cout<<" recvd:"<<rxSar.recvd;
-							std::cout<<" head:"<<rxSar.head;
-							std::cout<<" offset:"<<rxSar.offset;
-							std::cout<<" length:"<<fsm_meta.meta.length;							
-							std::cout<<" gap:"<<rxSar.gap;
-							std::cout<<" free_space:"<<free_space<<std::endl;
-							#endif
-							//increment head pointer, set offset to ooo sequence number
-							newHead = fsm_meta.meta.seqNumb+fsm_meta.meta.length;
-							newOffset = fsm_meta.meta.seqNumb;
-							//update head and offset pointer, set gap to true
-							rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, rxSar.recvd, newHead, newOffset, true));
-							//notification for matching the mem write status in notificationDelayer
-							rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, 0, fsm_meta.srcIpAddress, fsm_meta.dstIpPort));
-							//write to memory
-							rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
-							dropDataFifoOut.write(false);
+							// ### first out-of-order segment: open range 0
+							r0s = segStart; r0e = segEnd; r0v = true;
+							accepted = true;
 						}
-						// ### Gap already exists, packet comes in-order after the head pointer
-						else if (rxSar.gap && (fsm_meta.meta.seqNumb == rxSar.head) && (free_space > fsm_meta.meta.length)  )
+						else if (r0v && (segStart == rxSar.recvd))
 						{
-							#ifndef __SYNTHESIS__
-							std::cout<<"RX_ACK: gap in order after head";
-							std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
-							std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
-							std::cout<<" recvd:"<<rxSar.recvd;
-							std::cout<<" head:"<<rxSar.head;
-							std::cout<<" offset:"<<rxSar.offset;
-							std::cout<<" length:"<<fsm_meta.meta.length;		
-							std::cout<<" gap:"<<rxSar.gap;
-							std::cout<<" free_space:"<<free_space<<std::endl;
-							#endif
-							//increment head pointer
-							newHead = fsm_meta.meta.seqNumb+fsm_meta.meta.length;
-							//update head pointer
-							rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, rxSar.recvd, newHead, rxSar.offset, rxSar.gap));
-							//write to memory
-							rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
-							//notification for matching the mem write status in notificationDelayer
-							rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, 0, fsm_meta.srcIpAddress, fsm_meta.dstIpPort));
-							dropDataFifoOut.write(false);
-						}
-						// ### Gap alread exists, packet comes in-order after the recvd pointer
-						else if (rxSar.gap && (fsm_meta.meta.seqNumb == rxSar.recvd))
-						{
-							#ifndef __SYNTHESIS__
-							std::cout<<"RX_ACK: gap in order after recvd";
-							std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
-							std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
-							std::cout<<" recvd:"<<rxSar.recvd;
-							std::cout<<" head:"<<rxSar.head;
-							std::cout<<" offset:"<<rxSar.offset;
-							std::cout<<" length:"<<fsm_meta.meta.length;		
-							std::cout<<" gap:"<<rxSar.gap;
-							std::cout<<" free_space:"<<free_space<<std::endl;
-							#endif
-							//fill the gap. This also covers retransmissions that
-							//OVERLAP the buffered premature data (seq+len > offset):
-							//previously that case fell through both branches without
-							//a SAR update or a drop token, wedging rxPackageDropper
-							//and the whole RX pipeline permanently.
-							if (seq_geq(fsm_meta.meta.seqNumb + fsm_meta.meta.length, rxSar.offset))
+							// ### fill (or partly fill) the first gap; a merge may
+							// cascade through both buffered ranges. This also covers
+							// retransmissions that overlap the buffered data (B6).
+							if (seq_geq(segEnd, r0s))
 							{
-								//overlapping bytes are rewritten with identical data;
-								//the segment may even extend past head
-								ap_uint<32> segEnd = fsm_meta.meta.seqNumb + fsm_meta.meta.length;
-								newRecvd = seq_gt(segEnd, rxSar.head) ? segEnd : rxSar.head;
-								ap_uint<32> newAvailable = newRecvd - fsm_meta.meta.seqNumb;
-								rxSarRecvd sarUpd1(fsm_meta.sessionID, newRecvd, newRecvd, rxSar.offset, false);
-								sarUpd1.tsWrite = tsUpdate;
-								sarUpd1.tsRecent = fsm_meta.meta.tsVal;
-								rxEng2rxSar_upd_req.write(sarUpd1);
-								//write to memory
-								rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
-								// Only notify about  new data available
-								rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, newAvailable(WINDOW_BITS-1, 0), fsm_meta.srcIpAddress, fsm_meta.dstIpPort));
-								dropDataFifoOut.write(false);
+								newRecvd = seq_gt(segEnd, r0e) ? segEnd : r0e;
+								r0v = false;
+								if (r1v && seq_geq(newRecvd, r1s))
+								{
+									newRecvd = seq_gt(newRecvd, r1e) ? newRecvd : r1e;
+									r1v = false;
+								}
+								else if (r1v)
+								{
+									//promote range 1 to range 0
+									r0s = r1s; r0e = r1e; r0v = true;
+									r1v = false;
+								}
 							}
-							//gap can not be filled
 							else
 							{
-								newRecvd = fsm_meta.meta.seqNumb + fsm_meta.meta.length;
-								rxSarRecvd sarUpd2(fsm_meta.sessionID, newRecvd, rxSar.head, rxSar.offset, rxSar.gap);
-								sarUpd2.tsWrite = tsUpdate;
-								sarUpd2.tsRecent = fsm_meta.meta.tsVal;
-								rxEng2rxSar_upd_req.write(sarUpd2);
-								//write to memory
-								rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
-								// Only notify about  new data available
-								rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, fsm_meta.meta.length, fsm_meta.srcIpAddress, fsm_meta.dstIpPort));
-								dropDataFifoOut.write(false);
+								newRecvd = segEnd;
 							}
+							notifyLen = (ap_uint<WINDOW_BITS>)(newRecvd - segStart);
+							accepted = true;
 						}
-						// ### drop the packet in all other cases 
-						else 
+						else if (r0v && (segStart == r0e) && (free_space > fsm_meta.meta.length))
+						{
+							// ### extend range 0 upward (may close the second gap)
+							if (r1v && seq_geq(segEnd, r1s))
+							{
+								r0e = seq_gt(segEnd, r1e) ? segEnd : r1e;
+								r1v = false;
+							}
+							else
+							{
+								r0e = segEnd;
+							}
+							accepted = true;
+						}
+						else if (r1v && (segStart == r1e) && (free_space > fsm_meta.meta.length))
+						{
+							// ### extend range 1 upward
+							r1e = segEnd;
+							accepted = true;
+						}
+						else if (r0v && !r1v && seq_gt(segStart, r0e) && inWindow)
+						{
+							// ### second out-of-order range
+							r1s = segStart; r1e = segEnd; r1v = true;
+							accepted = true;
+						}
+
+						if (accepted)
+						{
+							#ifndef __SYNTHESIS__
+							std::cout<<"RX_ACCEPT";
+							std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
+							std::cout<<" seq:"<<segStart<<" len:"<<fsm_meta.meta.length;
+							std::cout<<" recvd:"<<rxSar.recvd<<"->"<<newRecvd;
+							std::cout<<" r0:"<<r0v<<" ["<<r0s<<","<<r0e<<")";
+							std::cout<<" r1:"<<r1v<<" ["<<r1s<<","<<r1e<<")"<<std::endl;
+							#endif
+							rxSarRecvd sarUpd(fsm_meta.sessionID, newRecvd, r0v ? r0e : newRecvd, r0s, r0v);
+							sarUpd.head2 = r1e;
+							sarUpd.offset2 = r1s;
+							sarUpd.gap2 = r1v;
+							sarUpd.tsWrite = tsUpdate;
+							sarUpd.tsRecent = fsm_meta.meta.tsVal;
+							rxEng2rxSar_upd_req.write(sarUpd);
+							//write to memory
+							rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
+							//notify the app about newly contiguous bytes; a zero-length
+							//notification just matches the mem write status in the
+							//notification delayer
+							rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, notifyLen, fsm_meta.srcIpAddress, fsm_meta.dstIpPort));
+							dropDataFifoOut.write(false);
+						}
+						// ### drop the packet in all other cases
+						else
 						{
 							dropDataFifoOut.write(true);
 							#ifndef __SYNTHESIS__
 							std::cout<<"RX_DROP";
 							std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
-							std::cout<<" seqNum:"<<fsm_meta.meta.seqNumb;
+							std::cout<<" seqNum:"<<segStart;
 							std::cout<<" recvd:"<<rxSar.recvd;
-							std::cout<<" head:"<<rxSar.head;
-							std::cout<<" offset:"<<rxSar.offset;
-							std::cout<<" length:"<<fsm_meta.meta.length;		
-							std::cout<<" gap:"<<rxSar.gap;
+							std::cout<<" r0:"<<r0v<<" ["<<r0s<<","<<r0e<<")";
+							std::cout<<" r1:"<<r1v<<" ["<<r1s<<","<<r1e<<")";
+							std::cout<<" length:"<<fsm_meta.meta.length;
 							std::cout<<" free_space:"<<free_space<<std::endl;
 							#endif
 						}
@@ -1792,6 +1764,9 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 
 					// +1 for phantom byte, there might be data too
 					rxSarRecvd finUpd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+fsm_meta.meta.length+1, fsm_meta.meta.seqNumb+fsm_meta.meta.length+1, rxSar.offset, rxSar.gap); //diff to ACK
+					finUpd.head2 = rxSar.head2;
+					finUpd.offset2 = rxSar.offset2;
+					finUpd.gap2 = rxSar.gap2;
 					finUpd.tsWrite = rxSar.tsEnabled && fsm_meta.meta.tsValid && seq_geq(fsm_meta.meta.tsVal, rxSar.tsRecent);
 					finUpd.tsRecent = fsm_meta.meta.tsVal;
 					rxEng2rxSar_upd_req.write(finUpd);

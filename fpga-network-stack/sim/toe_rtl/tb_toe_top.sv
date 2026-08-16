@@ -806,6 +806,36 @@ module tb_toe_top;
     return 0;
   endfunction
 
+  // extract up to two SACK blocks (kind 5); returns the block count (0/1/2)
+  function automatic int get_sack_blocks(input bytes_t p,
+                                         output bit [31:0] s0, output bit [31:0] e0,
+                                         output bit [31:0] s1, output bit [31:0] e1);
+    bytes_t o;
+    int i;
+    o = f_options(p);
+    i = 0; s0 = 0; e0 = 0; s1 = 0; e1 = 0;
+    while (i < o.size()) begin
+      if (o[i] == 8'h00) return 0;
+      if (o[i] == 8'h01) begin i++; continue; end
+      if (o[i] == 8'h05) begin
+        if (i+9 < o.size()) begin
+          s0 = {o[i+2], o[i+3], o[i+4], o[i+5]};
+          e0 = {o[i+6], o[i+7], o[i+8], o[i+9]};
+          if (o[i+1] >= 8'h12 && i+17 < o.size()) begin
+            s1 = {o[i+10], o[i+11], o[i+12], o[i+13]};
+            e1 = {o[i+14], o[i+15], o[i+16], o[i+17]};
+            return 2;
+          end
+          return 1;
+        end
+        return 0;
+      end
+      if (i+1 < o.size() && o[i+1] >= 2) i += o[i+1];
+      else return 0;
+    end
+    return 0;
+  endfunction
+
   // 12-byte option list with one SACK block: NOP NOP kind=5 len=10 start end
   function automatic bytes_t sack_opt(input bit [31:0] sstart, input bit [31:0] send_);
     bytes_t o;
@@ -3293,6 +3323,121 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+`ifdef NO_RX_BYPASS
+  // M1: two concurrent receive gaps (RFC 2018 multi-block SACK). Sequence:
+  // A[0,1k) in order, C[2k,3k) -> 1 SACK block, E[4k,5k) -> 2 blocks,
+  // E2[5k,6k) extends block 1, fill B[1k,2k) -> cumulative ACK 3k + 1 block,
+  // fill D[3k,4k) -> ACK 6k, no SACK; then the app reads 6000 intact bytes.
+  task automatic test_multi_gap_sack();
+    bytes_t p;
+    bit ok, got;
+    notif_t n;
+    byte unsigned rdata[$];
+    bit [15:0] sid;
+    bit [31:0] base, s0, e0, s1, e1;
+    int nblk;
+
+    app_listen(16'd80, ok);
+    peer_port = 16'd41800; toe_port = 16'd80;
+    peer_seq  = 32'h7000_0000; peer_win = 16'hFFFF;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, 0, F_SYN, 16'hFFFF, syn_options_sack(), no_bytes()));
+    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 100000, 1);
+    if (err_count) return;
+    peer_ack = f_seq(p) + 1;
+    peer_seq += 1;
+    peer_send_seg(F_ACK, no_bytes());
+    base = peer_seq;
+
+    // A: in order
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      base, peer_ack, F_ACK, peer_win, no_bytes(), gen_payload(1000, 8'h81)));
+    wait_notif(n, 200000, ok);
+    tb_check(ok && n.length == 1000, "A notified");
+    if (!ok) return;
+    sid = n.sessionID;
+
+    // C: opens gap 0
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      base + 2000, peer_ack, F_ACK, peer_win, no_bytes(), gen_payload(1000, 8'h83)));
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for dup ACK (C)"); return; end
+      nblk = get_sack_blocks(p, s0, e0, s1, e1);
+      if (f_payload_len(p) == 0 && nblk > 0) got = 1;
+    end
+    tb_check(nblk == 1, "one SACK block after C");
+    tb_check(s0 == base + 2000 && e0 == base + 3000, "block 0 = [2000,3000)");
+    tb_check(f_ack(p) == base + 1000, "dup ACK number (C)");
+
+    // E: opens gap 1 -> two blocks
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      base + 4000, peer_ack, F_ACK, peer_win, no_bytes(), gen_payload(1000, 8'h85)));
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for dup ACK (E)"); return; end
+      nblk = get_sack_blocks(p, s0, e0, s1, e1);
+      if (f_payload_len(p) == 0 && nblk == 2) got = 1;
+    end
+    tb_check(s0 == base + 2000 && e0 == base + 3000, "block 0 still [2000,3000)");
+    tb_check(s1 == base + 4000 && e1 == base + 5000, "block 1 = [4000,5000)");
+
+    // E2: extends range 1
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      base + 5000, peer_ack, F_ACK, peer_win, no_bytes(), gen_payload(1000, 8'h86)));
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for dup ACK (E2)"); return; end
+      nblk = get_sack_blocks(p, s0, e0, s1, e1);
+      if (f_payload_len(p) == 0 && nblk == 2 && e1 == base + 6000) got = 1;
+    end
+    tb_check(s1 == base + 4000, "block 1 extended to [4000,6000)");
+
+    // fill B: cumulative ACK jumps over range 0, range 1 remains
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      base + 1000, peer_ack, F_ACK, peer_win, no_bytes(), gen_payload(1000, 8'h82)));
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for ACK (B fill)"); return; end
+      if (f_payload_len(p) == 0 && f_ack(p) == base + 3000) got = 1;
+    end
+    nblk = get_sack_blocks(p, s0, e0, s1, e1);
+    tb_check(nblk == 1, "one SACK block after filling gap 0");
+    tb_check(s0 == base + 4000 && e0 == base + 6000, "remaining block = [4000,6000)");
+
+    // fill D: everything contiguous
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      base + 3000, peer_ack, F_ACK, peer_win, no_bytes(), gen_payload(1000, 8'h84)));
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for ACK (D fill)"); return; end
+      if (f_payload_len(p) == 0 && f_ack(p) == base + 6000) got = 1;
+    end
+    nblk = get_sack_blocks(p, s0, e0, s1, e1);
+    tb_check(nblk == 0, "no SACK block once contiguous");
+    peer_seq = base + 6000;
+
+    // application data integrity across the reassembled 6000 bytes
+    app_read(sid, 6000, rdata);
+    tb_check(rdata.size() == 6000, "app_read 6000B");
+    begin
+      bit match = 1;
+      for (int i = 0; i < 6000; i++) begin
+        byte unsigned exp;
+        exp = ((8'h81 + i/1000) + (i % 1000)) & 8'hFF;
+        if (rdata[i] !== exp) match = 0;
+      end
+      tb_check(match, "reassembled data intact across both gaps");
+    end
+    repeat (2000) @(posedge ap_clk);
+  endtask
+`endif
+
   //---------------------------------------------------------------------------
   // Main
   //---------------------------------------------------------------------------
@@ -3339,6 +3484,7 @@ module tb_toe_top;
       "half_close"     : test_half_close();
 `ifdef NO_RX_BYPASS
       "rx_ooo_overlap" : test_rx_ooo_overlap();
+      "multi_gap_sack" : test_multi_gap_sack();
       "seq_window_check": test_seq_window_check();
       "sack_rx_gen"    : test_sack_rx_gen();
 `endif

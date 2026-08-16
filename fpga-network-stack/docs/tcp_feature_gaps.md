@@ -20,7 +20,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 |---|---|---|---|
 | MSSオプション(受信) | **実装済** (F4+P1, `mss_option`/`tx_segmentation`テスト): 実効MSS=min(peer,local)をセッション毎に保存し、初送・再送ともMSS超過書込みをDDR読出しで分割送信(バイパス複製ストリームは破棄モードで整合)。PMTUDは未 | 相手MSSとPMTUからMSSを決定 | ★(残: PMTUD) |
 | Window Scale(受信) | SYN時のみパース。**自側shiftは0か2の固定** (`rx_engine.cpp:1366,1429`)。相手shiftは**14超の値を無検証で格納** → `tx_sar_table.cpp:121` でビット範囲オーバーフロー(issue #42) | shift 0〜14を交渉、バッファサイズから導出 | ★★★ |
-| SACK / SACK-Permitted | **実装済** (S1+S2, `sack_rx_gen`/`sack_selective_rtx`テスト): 交渉+単一ブロック生成(受信側)+相手SACKの解釈と選択的再送(SACK済み範囲をスキップする2領域再送)。単一ブロックのみ(複数ブロック/D-SACKは未) | あり(選択再送・D-SACK) | ★(残: 複数ブロック) |
+| SACK / SACK-Permitted | **実装済** (S1+S2+M1, `sack_rx_gen`/`sack_selective_rtx`/`multi_gap_sack`テスト): 交渉+最大2ブロックのSACK生成(TS共存で32Bオプション)+相手SACKの解釈と選択的再送。相手SACKの解釈は第1ブロックのみ、D-SACKは未 | あり(選択再送・D-SACK) | ★(残: 相手側複数ブロック解釈/D-SACK) |
 | Timestamps (RFC 7323) | **実装済** (T1, `ts_negotiate`/`paws_drop`テスト): SYN/SYN-ACKでTS交渉(常時提示/条件エコー)、全セグメント(データ含む)にNOP NOP TS 12B付与、64bitデータパスでボディを4Bシフト。TS.Recent追跡+PAWSで旧タイムスタンプのセグメントを破棄しdup ACK応答。実効MSSは-12B。TSval=~0.84ms粒度のフリーランカウンタ。RTT計測は既存rtt_estimator(Karn)のまま(TSecrベースRTTは未)。512bitデータパスはTS無効(TCP_TS_OPTIONゲート) | あり | 完了 |
 | ECN (ECE/CWR/ECT) | **なし**。フラグは常時0固定 (`toe_internals.hpp:522`) | あり | ★ |
 | オプションパーサの正当性 | dataOffsetの単位バグ(ワード vs バイト混在, issue #43)、不正オプション列でRXパイプラインがストールし得る (`rx_engine.cpp:645-700,730-738`) | — | ★★★(バグ修正) |
@@ -42,7 +42,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 
 | 機能 | 現状 | Linux | 優先度 |
 |---|---|---|---|
-| 順序入替(OOO)受信 | RX_DDR_BYPASS=1 (現行ビルド)では**完全ドロップ**(`rx_engine.cpp:1249-1274`)。非bypass時も単一ギャップのみ、重複セグメントでハング可能性 (`rx_engine.cpp:1197-1230`) | 完全な再構成キュー | ★★★ |
+| 順序入替(OOO)受信 | **2ギャップ対応** (M1, `multi_gap_sack`テスト): 非bypass構成で同時2レンジをバッファし、充填時のカスケードマージ・上方拡張・レンジ昇格をサポート。RX_DDR_BYPASS=1はバッファなしのため引き続き全ドロップ(アーキテクチャ制約)。3ギャップ以上は最初の2レンジのみ保持 | 完全な再構成キュー | ★(残: bypass構成) |
 | RFC 793受理判定 | **一部実装済** (F2, `seq_window_check`テスト): 非bypassのOOO受理を広告ウィンドウ内に制限(バッファ別名書込み防止)、OOO系比較をmod 2^32化(seq_lt等ヘルパ追加)。ACK側の全面的なwrap対応は未 | あり | ★(残) |
 | ウィンドウ更新通知 | **実装済** (F1, `window_update`テスト): app読出しでappdが進むとACKイベントを発行しwindow update ACKを送出 | 即時window update | 完了 |
 | ゼロウィンドウプローブ | **実装済** (Z1, `zero_window_probe`テスト): rx側がゼロウィンドウ広告でpersistタイマ(50ms)をセット、満了でseq=snd_nxt-1の純ACKプローブ送出(相手が現ウィンドウを返答)、ウィンドウ回復のACKで解除+送信再開イベント。probe_timerは統一read-modify-writeパスに書換え(書込み順序ハザード根治) | RFC 1122準拠persist | 完了 |

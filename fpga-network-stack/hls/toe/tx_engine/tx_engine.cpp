@@ -186,6 +186,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 0;
 				meta.fin = 0;
 				meta.sack = 0;
+				meta.sack2 = 0;
 				meta.ts = rxSar.tsEnabled;
 				meta.tsEcr = rxSar.tsRecent;
 
@@ -308,6 +309,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 0;
 				meta.fin = 0;
 				meta.sack = 0;
+				meta.sack2 = 0;
 				meta.ts = rxSar.tsEnabled;
 				meta.tsEcr = rxSar.tsRecent;
 				meta.length = 0;
@@ -473,6 +475,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 0;
 				meta.fin = 0;
 				meta.sack = 0;
+				meta.sack2 = 0;
 				meta.ts = rxSar.tsEnabled;
 				meta.tsEcr = rxSar.tsRecent;
 
@@ -588,18 +591,25 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 0;
 				meta.fin = 0;
 				meta.sack = 0;
+				meta.sack2 = 0;
 				meta.ts = rxSar.tsEnabled;
 				meta.tsEcr = rxSar.tsRecent;
-				// RFC 2018: advertise the buffered out-of-order range as a
-				// single SACK block while a receive gap is open
+				// RFC 2018: advertise the buffered out-of-order ranges as
+				// SACK blocks while receive gaps are open (up to two blocks)
 				if (rxSar.gap && rxSar.sackEnabled)
 				{
 					meta.sack = 1;
 					meta.sackStart = rxSar.offset;
 					meta.sackEnd = rxSar.head;
+					if (rxSar.gap2)
+					{
+						meta.sack2 = 1;
+						meta.sackStart2 = rxSar.offset2;
+						meta.sackEnd2 = rxSar.head2;
+					}
 				}
 				//ipMeta carries the option length for header-only segments
-				txEng_ipMetaFifoOut.write((ap_uint<16>)((meta.sack ? 12 : 0) + (meta.ts ? 12 : 0)));
+				txEng_ipMetaFifoOut.write((ap_uint<16>)((meta.sack ? (meta.sack2 ? 20 : 12) : 0) + (meta.ts ? 12 : 0)));
 				txEng_tcpMetaFifoOut.write(meta);
 				txEng_isLookUpFifoOut.write(true);
 				txEng2sLookup_rev_req.write(ml_curEvent.sessionID);
@@ -650,6 +660,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 1;
 				meta.fin = 0;
 				meta.sack = 1; // offer SACK-Permitted (RFC 2018)
+				meta.sack2 = 0;
 				meta.ts = 0;
 #if (WINDOW_SCALE)
 				meta.length = 12; // MSS(4) + SACKperm(2) + WS(3) + padding(3)
@@ -705,6 +716,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 1;
 				meta.fin = 0;
 				meta.sack = 0;
+				meta.sack2 = 0;
 				meta.ts = 0;
 				if (ml_curEvent.rt_count != 0)
 				{
@@ -794,6 +806,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.syn = 0;
 				meta.fin = 1;
 				meta.sack = 0;
+				meta.sack2 = 0;
 				meta.ts = rxSar.tsEnabled;
 				meta.tsEcr = rxSar.tsRecent;
 
@@ -1236,8 +1249,8 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-	enum fsmState {META, HEADER, PARTIAL_HEADER, BODY, HEADER_MSS_OPTION, HEADER_OPT_WORD2, HEADER_SACK_OPTION, HEADER_SACK_WORD2,
-					HEADER_TS_SYN_W2, HEADER_TS_SYN_W3, HEADER_TS_WORD1, HEADER_TS_WORD2, HEADER_TS_SACK_W3, TS_BODY, TS_BODY_FLUSH};
+	enum fsmState {META, HEADER, PARTIAL_HEADER, BODY, HEADER_MSS_OPTION, HEADER_OPT_WORD2, HEADER_SACK_OPTION, HEADER_SACK_WORD2, HEADER_SACK_WORD3,
+					HEADER_TS_SYN_W2, HEADER_TS_SYN_W3, HEADER_TS_WORD1, HEADER_TS_WORD2, HEADER_TS_SACK_W3, HEADER_TS_SACK_W4, TS_BODY, TS_BODY_FLUSH};
 	static fsmState state = META;
 	static tcpFullPseudoHeader<WIDTH> header; //size 256Bit
 	static bool hasBody = false;
@@ -1246,6 +1259,9 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 	static bool hasSack = false;
 	static ap_uint<32> sackStart = 0;
 	static ap_uint<32> sackEnd = 0;
+	static bool hasSack2 = false;
+	static ap_uint<32> sackStart2 = 0;
+	static ap_uint<32> sackEnd2 = 0;
 	static bool hasTs = false;
 	static ap_uint<32> tsEcrReg = 0;
 	// free-running local timestamp clock (RFC 7323 TSval); the process body
@@ -1269,11 +1285,11 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 			header.setSrcAddr(tuple.srcIp);
 			header.setDstAddr(tuple.dstIp);
 			// TCP length: payload/options + 20B base header; on non-SYN
-			// segments the TS option (12B) and a pure-ACK SACK block (12B)
+			// segments the TS option (12B) and pure-ACK SACK blocks (12/20B)
 			// are not counted in meta.length
 			header.setLength(meta.length + 0x14
 					+ ((!meta.syn && meta.ts) ? 12 : 0)
-					+ ((!meta.syn && meta.sack) ? 12 : 0));
+					+ ((!meta.syn && meta.sack) ? (meta.sack2 ? 20 : 12) : 0));
 			header.setSrcPort(tuple.srcPort);
 			header.setDstPort(tuple.dstPort);
 			header.setSeqNumb(meta.seqNumb);
@@ -1284,6 +1300,9 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 			hasSack = meta.sack;
 			sackStart = meta.sackStart;
 			sackEnd = meta.sackEnd;
+			hasSack2 = meta.sack2;
+			sackStart2 = meta.sackStart2;
+			sackEnd2 = meta.sackEnd2;
 			hasTs = meta.ts; //SYN: TS inside the SYN option layout; else 12B TS block
 			tsEcrReg = meta.tsEcr;
 			if (meta.syn)
@@ -1293,7 +1312,7 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 			}
 			else
 			{
-				header.setDataOffset(0x5 + (meta.ts ? 3 : 0) + (meta.sack ? 3 : 0));
+				header.setDataOffset(0x5 + (meta.ts ? 3 : 0) + (meta.sack ? (meta.sack2 ? 5 : 3) : 0));
 			}
 			//flags
 			header.setFinFlag(meta.fin);
@@ -1514,13 +1533,13 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 		state = META;
 		break;
 	}
-	case HEADER_SACK_OPTION: //single SACK block on a pure ACK: NOP NOP 05 0A start
+	case HEADER_SACK_OPTION: //SACK block(s) on a pure ACK: NOP NOP 05 len start
 	{
 		net_axis<WIDTH> sendWord;
 		sendWord.data(7, 0) = 0x01;
 		sendWord.data(15, 8) = 0x01;
 		sendWord.data(23, 16) = 0x05;
-		sendWord.data(31, 24) = 0x0A;
+		sendWord.data(31, 24) = hasSack2 ? 0x12 : 0x0A; //10B or 18B option
 		sendWord.data(63, 32) = reverse(sackStart);
 		sendWord.keep = 0xFF;
 		sendWord.last = 0;
@@ -1528,11 +1547,32 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 		state = HEADER_SACK_WORD2;
 		break;
 	}
-	case HEADER_SACK_WORD2: //SACK block right edge
+	case HEADER_SACK_WORD2: //block 0 right edge (+ block 1 left edge)
 	{
 		net_axis<WIDTH> sendWord;
 		sendWord.data = 0;
 		sendWord.data(31, 0) = reverse(sackEnd);
+		if (hasSack2)
+		{
+			sendWord.data(63, 32) = reverse(sackStart2);
+			sendWord.keep = 0xFF;
+			sendWord.last = 0;
+			state = HEADER_SACK_WORD3;
+		}
+		else
+		{
+			sendWord.keep = 0x0F;
+			sendWord.last = 1;
+			state = META;
+		}
+		dataOut.write(sendWord);
+		break;
+	}
+	case HEADER_SACK_WORD3: //block 1 right edge
+	{
+		net_axis<WIDTH> sendWord;
+		sendWord.data = 0;
+		sendWord.data(31, 0) = reverse(sackEnd2);
 		sendWord.keep = 0x0F;
 		sendWord.last = 1;
 		dataOut.write(sendWord);
@@ -1591,8 +1631,8 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 		sendWord.data(31, 0) = reverse(tsEcrReg);
 		if (hasSack)
 		{
-			//pure ACK with SACK block: NOP NOP 05 0A follows
-			sendWord.data(63, 32) = 0x0A050101;
+			//pure ACK with SACK block(s): NOP NOP 05 len follows
+			sendWord.data(63, 32) = hasSack2 ? 0x12050101 : 0x0A050101;
 			sendWord.keep = 0xFF;
 			sendWord.last = 0;
 			dataOut.write(sendWord);
@@ -1639,11 +1679,22 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 		}
 		break;
 	}
-	case HEADER_TS_SACK_W3: //SACK block after the timestamps option
+	case HEADER_TS_SACK_W3: //SACK block 0 after the timestamps option
 	{
 		net_axis<WIDTH> sendWord;
 		sendWord.data(31, 0) = reverse(sackStart);
 		sendWord.data(63, 32) = reverse(sackEnd);
+		sendWord.keep = 0xFF;
+		sendWord.last = hasSack2 ? 0 : 1;
+		dataOut.write(sendWord);
+		state = hasSack2 ? HEADER_TS_SACK_W4 : META;
+		break;
+	}
+	case HEADER_TS_SACK_W4: //SACK block 1
+	{
+		net_axis<WIDTH> sendWord;
+		sendWord.data(31, 0) = reverse(sackStart2);
+		sendWord.data(63, 32) = reverse(sackEnd2);
 		sendWord.keep = 0xFF;
 		sendWord.last = 1;
 		dataOut.write(sendWord);
