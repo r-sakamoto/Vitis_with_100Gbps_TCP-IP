@@ -1240,8 +1240,10 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					// Check if new ACK arrived
 					if (fsm_meta.meta.ackNumb == txSar.prevAck && txSar.prevAck != txSar.nextByte)
 					{
-						// Not new ACK increase counter only if it does not contain data
-						if (fsm_meta.meta.length == 0)
+						// RFC 5681: a duplicate ACK carries no data AND leaves the
+						// advertised window unchanged - a pure window update must
+						// not count towards fast retransmit
+						if (fsm_meta.meta.length == 0 && fsm_meta.meta.winSize == txSar.recv_window)
 						{
 							txSar.count++;
 							if (txSar.count == 3 && !txSar.fastRetransmitted)

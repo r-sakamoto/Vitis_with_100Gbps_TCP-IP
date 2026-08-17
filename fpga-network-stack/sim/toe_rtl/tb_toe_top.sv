@@ -3713,6 +3713,186 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // G1: RFC 5681 duplicate-ACK definition - an ACK whose advertised window
+  // CHANGED is a window update, not a duplicate, and must not trigger fast
+  // retransmit. Three same-ack/changing-window ACKs -> no retransmission and
+  // cwnd untouched; three identical ones -> fast retransmit.
+  task automatic test_dupack_win_change();
+    bytes_t p, pay;
+    bit ok, got;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] d0_seq;
+    int unsigned cw0, cw1;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd42300);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+    if (err_count) return;
+
+    // 1000B outstanding, never cumulatively ACKed
+    pay = gen_payload(1000, 8'hB1);
+    app_send(sid, pay, rsp);
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for data segment"); return; end
+      if (f_payload_len(p) == 1000) begin d0_seq = f_seq(p); got = 1; end
+    end
+    cw0 = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+
+    // 3 same-ack ACKs with a CHANGING advertised window -> window updates
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq, F_ACK, 16'h4000, no_bytes(), no_bytes()));
+    repeat (500) @(posedge ap_clk);
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq, F_ACK, 16'h4100, no_bytes(), no_bytes()));
+    repeat (500) @(posedge ap_clk);
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq, F_ACK, 16'h4200, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    got = 0;
+    wait_pkt(p, 30000, ok);
+    if (ok && f_payload_len(p) == 1000) got = 1;
+    tb_check(!got, "no fast retransmit on pure window updates");
+    cw1 = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cw1 == cw0, $sformatf("cwnd unchanged (%0d vs %0d)", cw1, cw0));
+
+    // 3 REAL duplicate ACKs (same ack, same window) -> fast retransmit
+    for (int i = 0; i < 3; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, d0_seq, F_ACK, 16'h4200, no_bytes(), no_bytes()));
+      repeat (100) @(posedge ap_clk);
+    end
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for fast retransmit"); return; end
+      if (f_payload_len(p) == 1000 && f_seq(p) == d0_seq) got = 1;
+    end
+    tb_check(got, "fast retransmit on identical duplicate ACKs");
+    // clean up
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq + 1000, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  // G2: idle restart (RFC 5681 4.1). Requires the timer-scaled build: the
+  // idle threshold is ~153 units of 1024 cycles ~= 157k cycles. After the
+  // connection sits idle with nothing outstanding, the next transmission
+  // restarts from the initial window (14600) instead of the stale cwnd.
+  task automatic test_cwnd_idle_restart();
+    bytes_t p, pay;
+    bit ok, got;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    int unsigned cw;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd42400);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+    if (err_count) return;
+
+    cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cw == 16060, $sformatf("cwnd=%0d expected 16060 (> IW) before idle", cw));
+
+    // idle well past the scaled threshold, nothing outstanding
+    repeat (400_000) @(posedge ap_clk);
+
+    // next transmission triggers the restart check
+    pay = gen_payload(100, 8'hC1);
+    app_send(sid, pay, rsp);
+    tb_check(rsp.error == 0, "app_send after idle accepted");
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for post-idle segment"); return; end
+      if (f_payload_len(p) == 100) got = 1;
+    end
+    repeat (2000) @(posedge ap_clk);
+    cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cw == 14600, $sformatf("cwnd=%0d expected 14600 (restart window) after idle", cw));
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, f_seq(p) + 100, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  // G3: a timer RTO retransmits exactly ONE segment (loss window = 1 MSS);
+  // the old go-back-N burst of up to 4 segments is kept only for fast
+  // retransmit. Requires the timer-scaled build.
+  task automatic test_rto_single_seg();
+    bytes_t p, pay;
+    bit ok, got;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] d0_seq;
+    int nseg;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd42500);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+    if (err_count) return;
+
+    // 3 x 1000B in flight, peer stays silent
+    for (int i = 0; i < 3; i++) begin
+      pay = gen_payload(1000, 8'hD0 + i[7:0]);
+      app_send(sid, pay, rsp);
+    end
+    nseg = 0;
+    while (nseg < 3) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout collecting data segments"); return; end
+      if (f_payload_len(p) == 1000) begin
+        if (nseg == 0) d0_seq = f_seq(p);
+        nseg++;
+      end
+    end
+
+    // RTO: exactly one retransmission (the first segment)
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 1_000_000, ok);
+      if (!ok) begin tb_error("timeout waiting for RTO retransmission"); return; end
+      if (f_payload_len(p) != 0) got = 1;
+    end
+    // go-back-N repacketizes: one full-MSS segment from snd_una is correct
+    tb_check(f_seq(p) == d0_seq && f_payload_len(p) == 1460, "RTO resends one full-MSS segment from snd_una");
+    // quiet window shorter than the backed-off next RTO: no further data
+    got = 0;
+    wait_pkt(p, 30000, ok);
+    if (ok && f_payload_len(p) != 0) got = 1;
+    tb_check(!got, "only one segment retransmitted per RTO");
+
+    // clean up: ACK everything
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq + 3000, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   //---------------------------------------------------------------------------
   // Main
   //---------------------------------------------------------------------------
@@ -3776,6 +3956,9 @@ module tb_toe_top;
       "ca_growth"      : test_ca_growth();
       "sack_multi_rtx" : test_sack_multi_rtx();
       "listen_close"   : test_listen_close();
+      "dupack_win_change" : test_dupack_win_change();
+      "cwnd_idle_restart" : test_cwnd_idle_restart();
+      "rto_single_seg" : test_rto_single_seg();
       "rt_abort"       : test_rt_abort();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase

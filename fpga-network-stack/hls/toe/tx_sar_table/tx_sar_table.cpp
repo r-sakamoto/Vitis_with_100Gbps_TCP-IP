@@ -52,6 +52,10 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 #pragma HLS PIPELINE II=1
 
 	static txSarEntry tx_table[MAX_SESSIONS];
+	// free-running clock for the idle-restart check (units of 1024 cycles)
+	static ap_uint<48> tst_clock = 0;
+	tst_clock++;
+	ap_uint<32> nowUnits = tst_clock(41, CWND_IDLE_UNIT_SHIFT);
 	#pragma HLS DEPENDENCE variable=tx_table inter false
 	#pragma HLS bind_storage variable=tx_table type=RAM_T2P impl=BRAM
 
@@ -64,6 +68,7 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			if (!tst_txEngUpdate.isRtQuery)
 			{
 				tx_table[tst_txEngUpdate.sessionID].not_ackd = tst_txEngUpdate.not_ackd;
+				tx_table[tst_txEngUpdate.sessionID].lastTxTime = nowUnits;
 				if (tst_txEngUpdate.init)
 				{
 					tx_table[tst_txEngUpdate.sessionID].app = tst_txEngUpdate.not_ackd;
@@ -101,6 +106,26 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 		else // Read
 		{
 			txSarEntry entry = tx_table[tst_txEngUpdate.sessionID];
+			// idle restart (RFC 5681 4.1): if the connection sent nothing for
+			// ~1s and has nothing outstanding, restart from the initial window
+			// so a long-idle session does not burst a full stale cwnd.
+			// (With TCP_NODELAY the very first admission after idle may still
+			// use the stale app-side min_window; from this read on, growth
+			// restarts from IW in slow start.)
+			if (entry.not_ackd == entry.ackd
+					&& (ap_uint<32>)(nowUnits - entry.lastTxTime) > (ap_uint<32>)CWND_IDLE_THRESHOLD)
+			{
+				ap_uint<16> rwMss = (entry.mss == 0) ? (ap_uint<16>)MSS : entry.mss;
+				ap_uint<WINDOW_BITS> iw = 10 * rwMss;
+				ap_uint<WINDOW_BITS> iwCap = (2 * rwMss > 14600) ? (ap_uint<WINDOW_BITS>)(2 * rwMss) : (ap_uint<WINDOW_BITS>)14600;
+				ap_uint<WINDOW_BITS> rw = (iw > iwCap) ? iwCap : iw;
+				if (entry.cong_window > rw)
+				{
+					entry.cong_window = rw;
+					tx_table[tst_txEngUpdate.sessionID].cong_window = rw;
+					tx_table[tst_txEngUpdate.sessionID].ca_acc = 0;
+				}
+			}
 			//Pre-calculated usedLength, minWindow to improve timing in metaLoader
 			//When calculating the usedLength we also consider if the FIN was already sent
 			ap_uint<WINDOW_BITS> usedLength = ((ap_uint<WINDOW_BITS>) entry.not_ackd - entry.ackd);
@@ -241,6 +266,7 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 													tx_table[tst_rxEngUpdate.sessionID].fastRetransmitted);
 			rxEngReply.mss = tx_table[tst_rxEngUpdate.sessionID].mss;
 			rxEngReply.ca_acc = tx_table[tst_rxEngUpdate.sessionID].ca_acc;
+			rxEngReply.recv_window = tx_table[tst_rxEngUpdate.sessionID].recv_window;
 			rxEngReply.peerSackStart = tx_table[tst_rxEngUpdate.sessionID].peerSackStart;
 			rxEngReply.peerSackEnd = tx_table[tst_rxEngUpdate.sessionID].peerSackEnd;
 			rxEngReply.peerSackValid = tx_table[tst_rxEngUpdate.sessionID].peerSackValid;

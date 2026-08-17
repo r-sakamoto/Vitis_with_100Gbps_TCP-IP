@@ -51,6 +51,13 @@ static const ap_uint<32> TIME_120s		= (120000000.0/0.0064/MAX_SESSIONS/TCP_SIM_T
 #endif
 
 
+// Idle-restart threshold for congestion window validation (RFC 5681 4.1):
+// if nothing was sent for ~1s the cwnd is reset to the initial window before
+// the next transmission. Units of 1024 cycles (~6.5us at 156.25MHz); shrunk
+// by the simulation timer scale like all other protocol timers.
+#define CWND_IDLE_UNIT_SHIFT 10
+#define CWND_IDLE_THRESHOLD ((156250000 / 1024 / TCP_SIM_TIMER_SCALE) + 1)
+
 // RFC 7323 timestamps: full support (option on every segment including
 // payload-carrying ones) is only implemented for the narrow datapath; the
 // 512-bit header builder embeds options in the first beat and cannot shift
@@ -240,6 +247,8 @@ struct txSarEntry
 	//congestion-avoidance byte counter (RFC 3465): cwnd grows by one MSS
 	//per cwnd-worth of newly acked bytes
 	ap_uint<WINDOW_BITS> ca_acc;
+	//time of the last transmission, for idle restart (RFC 5681 4.1)
+	ap_uint<32> lastTxTime;
 	ap_uint<WINDOW_BITS> app;
 	ap_uint<2>	count;
 	bool		fastRetransmitted;
@@ -349,6 +358,7 @@ struct rxTxSarReply
 	bool		fastRetransmitted;
 	ap_uint<16>	mss; //effective segment size: min(peer MSS, local MSS)
 	ap_uint<WINDOW_BITS> ca_acc; //congestion-avoidance byte counter
+	ap_uint<16>	recv_window; //last advertised window (raw, unscaled)
 	ap_uint<32>	peerSackStart;
 	ap_uint<32>	peerSackEnd;
 	bool		peerSackValid;

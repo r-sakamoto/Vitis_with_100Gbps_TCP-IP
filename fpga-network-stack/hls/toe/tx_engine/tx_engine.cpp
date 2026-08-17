@@ -539,16 +539,28 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.length = segLen;
 				if (!lastSegment)
 				{
-					// We stay in this state and sent immediately another packet
-					txSar.ackd += segLen;
-					txSar.usedLength -= segLen;
-					// TODO replace with dynamic count, remove this
-					if (ml_segmentCount == 3)
+					if (ml_curEvent.rt_count != 0)
 					{
-						// Should set a probe or sth??
+						// RFC 5681: after an RTO the loss window is one
+						// full-sized segment - retransmit only the first
+						// unacked segment and let the ACK clock drive the
+						// rest (fast retransmit, rt_count==0, keeps the
+						// bounded go-back-N below)
 						ml_FsmState = 0;
 					}
-					ml_segmentCount++;
+					else
+					{
+						// We stay in this state and sent immediately another packet
+						txSar.ackd += segLen;
+						txSar.usedLength -= segLen;
+						// TODO replace with dynamic count, remove this
+						if (ml_segmentCount == 3)
+						{
+							// Should set a probe or sth??
+							ml_FsmState = 0;
+						}
+						ml_segmentCount++;
+					}
 				}
 				else
 				{
