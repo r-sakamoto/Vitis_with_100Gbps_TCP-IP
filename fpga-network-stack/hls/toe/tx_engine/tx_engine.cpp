@@ -77,7 +77,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 #pragma HLS INLINE off
 #pragma HLS pipeline II=1
 
-	static ap_uint<1> ml_FsmState = 0;
+	static ap_uint<2> ml_FsmState = 0; //0=idle, 1=load/handle event, 2=RT loop
 	static bool ml_sarLoaded = false;
 	static extendedEvent ml_curEvent;
 	static ap_uint<32> ml_randomValue= 0x562301af;
@@ -89,6 +89,13 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 	static ap_uint<16> ml_segOffset = 0; //progress within an oversized app write (TX segmentation)
 	static rxSarReply	rxSar;
 	static txTxSarReply	txSarReg;
+	// RT loop state (offsets relative to snd_una at load time)
+	static ap_uint<32> ml_rtSeq;
+	static ap_uint<WINDOW_BITS+1> ml_rtPos;
+	static ap_uint<WINDOW_BITS+1> ml_rtFlight;
+	static ap_uint<16> ml_rtMss;
+	static ap_uint<WINDOW_BITS+1> ml_rtStart1, ml_rtEnd1, ml_rtStart2, ml_rtEnd2;
+	static bool ml_rtSkip1, ml_rtSkip2, ml_rtClamp1, ml_rtClamp2;
 	ap_uint<WINDOW_BITS> slowstart_threshold;
 	static tx_engine_meta meta;
 	rstEvent resetEvent;
@@ -423,55 +430,20 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 			break;
 #endif
 		case RT:
-			if ((!rxSar2txEng_rsp.empty() && !txSar2txEng_upd_rsp.empty()) || ml_sarLoaded)
+			// RT load cycle: fetch the SAR entries and precompute everything
+			// the retransmit loop (state 2) needs as offsets relative to
+			// snd_una. Comparing small window offsets instead of chaining
+			// 32bit modular sequence compares keeps the per-cycle logic of
+			// the loop short (the old single-state loop was ~75 logic levels).
+			if (!rxSar2txEng_rsp.empty() && !txSar2txEng_upd_rsp.empty())
 			{
-				txTxSarReply txSar;
-				if (!ml_sarLoaded)
-				{
-					rxSar2txEng_rsp.read(rxSar);
-					txSar = txSar2txEng_upd_rsp.read();
-				}
-				else
-				{
-					txSar = txSarReg;
-				}
+				rxSar2txEng_rsp.read(rxSar);
+				txTxSarReply txSar = txSar2txEng_upd_rsp.read();
 
-				if (!ml_sarLoaded)
-				{
-					// retransmission: the outstanding RTT sample is no longer
-					// unambiguous, discard it (Karn's algorithm)
-					txEng2rtt_event.write(rttEvent(ml_curEvent.sessionID, 0, 1));
-				}
-				// RFC 2018 selective retransmit: if the retransmit pointer sits
-				// inside a range the peer has already SACKed, skip over it.
-				// Two rounds handle both (possibly unordered) blocks, including
-				// adjacent ones where skipping block A lands inside block B.
-				for (int skipRound = 0; skipRound < 2; skipRound++)
-				{
-#pragma HLS UNROLL
-					if (txSar.peerSackValid
-						&& seq_geq(txSar.ackd, txSar.peerSackStart) && seq_lt(txSar.ackd, txSar.peerSackEnd)
-						&& seq_leq(txSar.peerSackEnd, txSar.ackd + txSar.usedLength))
-					{
-						ap_uint<32> sackSkip32 = txSar.peerSackEnd - txSar.ackd;
-						txSar.ackd += sackSkip32;
-						txSar.usedLength -= sackSkip32(WINDOW_BITS-1, 0);
-					}
-					else if (txSar.peerSackValid2
-						&& seq_geq(txSar.ackd, txSar.peerSackStart2) && seq_lt(txSar.ackd, txSar.peerSackEnd2)
-						&& seq_leq(txSar.peerSackEnd2, txSar.ackd + txSar.usedLength))
-					{
-						ap_uint<32> sackSkip32 = txSar.peerSackEnd2 - txSar.ackd;
-						txSar.ackd += sackSkip32;
-						txSar.usedLength -= sackSkip32(WINDOW_BITS-1, 0);
-					}
-				}
-				// usedLength counts the FIN's phantom sequence byte once finSent
-				// is set; retransmitting it as payload emitted a bogus 1-byte
-				// data segment at the FIN's seq number (and inflated go-back-N
-				// lengths by one). Exclude it here; when all data is resent the
-				// FIN itself is regenerated via the finSent conversion below.
-				ap_uint<WINDOW_BITS> currLength = txSar.usedLength - (txSar.finSent ? 1 : 0);
+				// retransmission: the outstanding RTT sample is no longer
+				// unambiguous, discard it (Karn's algorithm)
+				txEng2rtt_event.write(rttEvent(ml_curEvent.sessionID, 0, 1));
+
 				// per-session effective MSS (min(peer MSS, local MSS), set at
 				// connection setup); guard against uninitialized entries.
 				// The 12B timestamps option eats into the payload budget.
@@ -480,9 +452,52 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				{
 					sessionMSS -= 12;
 				}
+				// usedLength counts the FIN's phantom sequence byte once finSent
+				// is set; retransmitting it as payload emitted a bogus 1-byte
+				// data segment at the FIN's seq number. Exclude it here; when all
+				// data is resent the FIN itself is regenerated via FIN below.
+				ap_uint<WINDOW_BITS> flight = txSar.usedLength - (txSar.finSent ? 1 : 0);
+
+				// Decrease Slow Start Threshold, only on first RT from retransmitTimer
+				if (ml_curEvent.rt_count == 1)
+				{
+					if (flight > (4*sessionMSS)) // max( FlightSize/2, 2*MSS) RFC:5681
+					{
+						slowstart_threshold = flight/2;
+					}
+					else
+					{
+						slowstart_threshold = (2 * sessionMSS);
+					}
+					txEng2txSar_upd_req.write(txTxSarRtQuery(ml_curEvent.sessionID, slowstart_threshold));
+				}
+
+				// RFC 2018 selective retransmit: peer SACK blocks as offsets
+				// from snd_una. A block is skipped when the retransmit position
+				// lies in it and it ends inside the outstanding data; a segment
+				// is clamped at a block start that lies inside the outstanding
+				// data.
+				ap_uint<32> sOff1 = txSar.peerSackStart - txSar.ackd;
+				ap_uint<32> eOff1 = txSar.peerSackEnd - txSar.ackd;
+				ap_uint<32> sOff2 = txSar.peerSackStart2 - txSar.ackd;
+				ap_uint<32> eOff2 = txSar.peerSackEnd2 - txSar.ackd;
+				ml_rtSkip1 = txSar.peerSackValid && (eOff1 != 0) && (eOff1 <= txSar.usedLength)
+								&& (sOff1[31] == 1 || sOff1 < eOff1);
+				ml_rtSkip2 = txSar.peerSackValid2 && (eOff2 != 0) && (eOff2 <= txSar.usedLength)
+								&& (sOff2[31] == 1 || sOff2 < eOff2);
+				ml_rtClamp1 = txSar.peerSackValid && (sOff1 != 0) && (sOff1 <= txSar.usedLength);
+				ml_rtClamp2 = txSar.peerSackValid2 && (sOff2 != 0) && (sOff2 <= txSar.usedLength);
+				// a block that starts before snd_una is skipped from offset 0
+				ml_rtStart1 = (sOff1[31] == 1) ? (ap_uint<WINDOW_BITS+1>)0 : (ap_uint<WINDOW_BITS+1>)sOff1(WINDOW_BITS, 0);
+				ml_rtStart2 = (sOff2[31] == 1) ? (ap_uint<WINDOW_BITS+1>)0 : (ap_uint<WINDOW_BITS+1>)sOff2(WINDOW_BITS, 0);
+				ml_rtEnd1 = eOff1(WINDOW_BITS, 0);
+				ml_rtEnd2 = eOff2(WINDOW_BITS, 0);
+				ml_rtFlight = flight;
+				ml_rtMss = sessionMSS;
+				ml_rtPos = 0;
+				ml_rtSeq = txSar.ackd;
 
 				meta.ackNumb = rxSar.recvd;
-				meta.seqNumb = txSar.ackd;
 				meta.window_size = rxSar.windowSize; //Precalcualted in rx_sar_table ((rxSar.appd - rxSar.recvd) - 1)
 				meta.ack = 1; // ACK is always set when session is established
 				meta.rst = 0;
@@ -493,118 +508,9 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.ts = rxSar.tsEnabled;
 				meta.tsEcr = rxSar.tsRecent;
 
-				// Construct address before modifying txSar.ackd
-				ap_uint<32> pkgAddr;
-				pkgAddr(31, 30) = 0x00; //TODO: this is combined with addr offset calculation in mem_inf to separate rx and tx
-				pkgAddr(29, WINDOW_BITS) = ml_curEvent.sessionID(13, 0);
-				pkgAddr(WINDOW_BITS-1, 0) = txSar.ackd(WINDOW_BITS-1, 0); //ml_curEvent.address;
-
-				// Decrease Slow Start Threshold, only on first RT from retransmitTimer
-				if (!ml_sarLoaded && (ml_curEvent.rt_count == 1))
-				{
-					if (currLength > (4*sessionMSS)) // max( FlightSize/2, 2*MSS) RFC:5681
-					{
-						slowstart_threshold = currLength/2;
-					}
-					else
-					{
-						slowstart_threshold = (2 * sessionMSS);
-					}
-					txEng2txSar_upd_req.write(txTxSarRtQuery(ml_curEvent.sessionID, slowstart_threshold));
-				}
-
-
-				// Since we are retransmitting from txSar.ackd to txSar.not_ackd, this data is already inside the usableWindow
-				// => no check is required
-				ap_uint<WINDOW_BITS> segLen = (currLength > sessionMSS) ? (ap_uint<WINDOW_BITS>)sessionMSS : currLength;
-				bool lastSegment = (segLen == currLength);
-				// clamp the segment so it does not overlap a SACKed range;
-				// the next iteration then jumps over that range. Applying the
-				// second clamp on the already-clamped length yields the
-				// nearest block start regardless of block order.
-				if (txSar.peerSackValid && seq_gt(txSar.peerSackStart, txSar.ackd)
-					&& seq_lt(txSar.peerSackStart, txSar.ackd + segLen))
-				{
-					ap_uint<32> tillSack32 = txSar.peerSackStart - txSar.ackd;
-					segLen = tillSack32(WINDOW_BITS-1, 0);
-					lastSegment = false;
-				}
-				if (txSar.peerSackValid2 && seq_gt(txSar.peerSackStart2, txSar.ackd)
-					&& seq_lt(txSar.peerSackStart2, txSar.ackd + segLen))
-				{
-					ap_uint<32> tillSack32 = txSar.peerSackStart2 - txSar.ackd;
-					segLen = tillSack32(WINDOW_BITS-1, 0);
-					lastSegment = false;
-				}
-				meta.length = segLen;
-				if (!lastSegment)
-				{
-					if (ml_curEvent.rt_count != 0)
-					{
-						// RFC 5681: after an RTO the loss window is one
-						// full-sized segment - retransmit only the first
-						// unacked segment and let the ACK clock drive the
-						// rest (fast retransmit, rt_count==0, keeps the
-						// bounded go-back-N below)
-						ml_FsmState = 0;
-					}
-					else
-					{
-						// We stay in this state and sent immediately another packet
-						txSar.ackd += segLen;
-						txSar.usedLength -= segLen;
-						// TODO replace with dynamic count, remove this
-						if (ml_segmentCount == 3)
-						{
-							// Should set a probe or sth??
-							ml_FsmState = 0;
-						}
-						ml_segmentCount++;
-					}
-				}
-				else
-				{
-					if (txSar.finSent)
-					{
-						ml_curEvent.type = FIN;
-					}
-					else
-					{
-						// set RT here???
-						ml_FsmState = 0;
-					}
-				}
-
-				// Only send a packet if there is data
-				if (meta.length != 0)
-				{
-					txBufferReadCmd.write(mmCmd(pkgAddr, meta.length));
-					txEng_ipMetaFifoOut.write(meta.length + (meta.ts ? 12 : 0));
-					txEng_tcpMetaFifoOut.write(meta);
-					txEng_isLookUpFifoOut.write(true);
-#if (TCP_NODELAY)
-					txEng_isDDRbypass.write(0);
-#endif
-					txEng2sLookup_rev_req.write(ml_curEvent.sessionID);
-
-					// Only set RT timer if we actually send sth
-					txEng2timer_setRetransmitTimer.write(txRetransmitTimerSet(ml_curEvent.sessionID));
-				}
 				ml_sarLoaded = true;
 				txSarReg = txSar;
-
-				#ifndef __SYNTHESIS__
-				std::cout<<"RT";
-				std::cout<<std::dec<<" session id:"<<ml_curEvent.sessionID;
-				std::cout<<" seqNum:"<<txSar.not_ackd;
-				std::cout<<" ackNum:"<<rxSar.recvd;
-				std::cout<<" window_size:"<<rxSar.windowSize;
-				std::cout<<" ack:"<<meta.ack;
-				std::cout<<" rst:"<<meta.rst;
-				std::cout<<" syn:"<<meta.syn;
-				std::cout<<" fin:"<<meta.fin;
-				std::cout<<" length:"<<ml_curEvent.length<<std::endl;	
-				#endif
+				ml_FsmState = 2;
 			}
 			break;
 		case ACK:
@@ -928,6 +834,108 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 			}
 			break;
 		} //switch
+		break;
+	case 2:
+		// RT loop: per cycle either skip one SACKed block or emit one segment
+		{
+			bool inBlock1 = ml_rtSkip1 && (ml_rtPos >= ml_rtStart1) && (ml_rtPos < ml_rtEnd1);
+			bool inBlock2 = ml_rtSkip2 && (ml_rtPos >= ml_rtStart2) && (ml_rtPos < ml_rtEnd2);
+			if (inBlock1)
+			{
+				ml_rtSeq += (ml_rtEnd1 - ml_rtPos);
+				ml_rtPos = ml_rtEnd1;
+			}
+			else if (inBlock2)
+			{
+				ml_rtSeq += (ml_rtEnd2 - ml_rtPos);
+				ml_rtPos = ml_rtEnd2;
+			}
+			else
+			{
+				// remaining data, then the segment is the minimum of MSS,
+				// the remaining data and the distance to a SACK block start
+				ap_uint<WINDOW_BITS+1> remaining = (ml_rtPos >= ml_rtFlight) ? (ap_uint<WINDOW_BITS+1>)0 : (ap_uint<WINDOW_BITS+1>)(ml_rtFlight - ml_rtPos);
+				ap_uint<WINDOW_BITS+1> tillSack1 = (ml_rtClamp1 && (ml_rtStart1 > ml_rtPos)) ? (ap_uint<WINDOW_BITS+1>)(ml_rtStart1 - ml_rtPos) : (ap_uint<WINDOW_BITS+1>)BUFFER_SIZE;
+				ap_uint<WINDOW_BITS+1> tillSack2 = (ml_rtClamp2 && (ml_rtStart2 > ml_rtPos)) ? (ap_uint<WINDOW_BITS+1>)(ml_rtStart2 - ml_rtPos) : (ap_uint<WINDOW_BITS+1>)BUFFER_SIZE;
+				ap_uint<WINDOW_BITS+1> minA = (remaining < ml_rtMss) ? remaining : (ap_uint<WINDOW_BITS+1>)ml_rtMss;
+				ap_uint<WINDOW_BITS+1> minB = (tillSack1 < tillSack2) ? tillSack1 : tillSack2;
+				ap_uint<WINDOW_BITS+1> segLen = (minA < minB) ? minA : minB;
+				bool lastSegment = (segLen == remaining);
+
+				meta.seqNumb = ml_rtSeq;
+				meta.length = segLen;
+
+				// Construct address from the current retransmit position
+				ap_uint<32> pkgAddr;
+				pkgAddr(31, 30) = 0x00; //TODO: this is combined with addr offset calculation in mem_inf to separate rx and tx
+				pkgAddr(29, WINDOW_BITS) = ml_curEvent.sessionID(13, 0);
+				pkgAddr(WINDOW_BITS-1, 0) = ml_rtSeq(WINDOW_BITS-1, 0);
+
+				if (!lastSegment)
+				{
+					if (ml_curEvent.rt_count != 0)
+					{
+						// RFC 5681: after an RTO the loss window is one
+						// full-sized segment - retransmit only the first
+						// unacked segment and let the ACK clock drive the
+						// rest (fast retransmit, rt_count==0, keeps the
+						// bounded go-back-N below)
+						ml_FsmState = 0;
+					}
+					else
+					{
+						// We stay in this state and sent immediately another packet
+						ml_rtSeq += segLen;
+						ml_rtPos += segLen;
+						// TODO replace with dynamic count, remove this
+						if (ml_segmentCount == 3)
+						{
+							// Should set a probe or sth??
+							ml_FsmState = 0;
+						}
+						ml_segmentCount++;
+					}
+				}
+				else
+				{
+					if (txSarReg.finSent)
+					{
+						// all data resent, regenerate the FIN (state 1, SAR loaded)
+						ml_curEvent.type = FIN;
+						ml_FsmState = 1;
+					}
+					else
+					{
+						// set RT here???
+						ml_FsmState = 0;
+					}
+				}
+
+				// Only send a packet if there is data
+				if (segLen != 0)
+				{
+					txBufferReadCmd.write(mmCmd(pkgAddr, segLen));
+					txEng_ipMetaFifoOut.write(segLen + (meta.ts ? 12 : 0));
+					txEng_tcpMetaFifoOut.write(meta);
+					txEng_isLookUpFifoOut.write(true);
+#if (TCP_NODELAY)
+					txEng_isDDRbypass.write(0);
+#endif
+					txEng2sLookup_rev_req.write(ml_curEvent.sessionID);
+
+					// Only set RT timer if we actually send sth
+					txEng2timer_setRetransmitTimer.write(txRetransmitTimerSet(ml_curEvent.sessionID));
+				}
+
+				#ifndef __SYNTHESIS__
+				std::cout<<"RT";
+				std::cout<<std::dec<<" session id:"<<ml_curEvent.sessionID;
+				std::cout<<" seqNum:"<<ml_rtSeq;
+				std::cout<<" ackNum:"<<rxSar.recvd;
+				std::cout<<" length:"<<segLen<<std::endl;
+				#endif
+			}
+		}
 		break;
 	} //switch
 }
