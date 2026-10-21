@@ -167,6 +167,7 @@ module tb_toe_top;
   //---------------------------------------------------------------------------
   int unsigned err_count = 0;
   string       testname  = "passive_open";
+  bit          tb_quiet  = 0;   // suppress per-packet logging during bulk sends
 
   task automatic tb_error(input string msg);
     err_count++;
@@ -174,6 +175,7 @@ module tb_toe_top;
   endtask
 
   task automatic tb_info(input string msg);
+    if (tb_quiet) return;
     $display("[%0t] TB-INFO : %s", $time, msg);
   endtask
 
@@ -634,6 +636,7 @@ module tb_toe_top;
   endfunction
 
   function automatic void print_pkt(input string dir, input bytes_t p);
+    if (tb_quiet) return;
     $display("[%0t] %s: %0d.%0d.%0d.%0d:%0d -> %0d.%0d.%0d.%0d:%0d [%s] seq=%0d ack=%0d win=%0d len=%0d",
       $time, dir,
       p[12], p[13], p[14], p[15], f_src_port(p),
@@ -3785,6 +3788,147 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // R2: RFC 5961 blind-injection defenses. In-window RST / SYN / unacceptable
+  // ACK are answered with a challenge ACK and do not affect the connection;
+  // out-of-window RSTs are dropped silently; only an exact RST resets.
+  task automatic flush_net(input int cycles);
+    repeat (cycles) @(posedge ap_clk);
+    while (net_pkts.size() > 0) void'(net_pkts.pop_front());
+  endtask
+
+  task automatic expect_challenge_ack(input string what);
+    bytes_t p;
+    bit ok;
+    wait_pkt(p, 100000, ok);
+    tb_check(ok, $sformatf("challenge ACK for %s", what));
+    if (!ok) return;
+    tb_check(f_flags(p) == F_ACK && f_payload_len(p) == 0,
+             $sformatf("%s: pure ACK expected, got %s len=%0d", what, flags_str(f_flags(p)), f_payload_len(p)));
+    tb_check(f_ack(p) == peer_seq, $sformatf("%s: ack=%0d expected %0d", what, f_ack(p), peer_seq));
+    tb_check(f_seq(p) == peer_ack, $sformatf("%s: seq=%0d expected %0d", what, f_seq(p), peer_ack));
+  endtask
+
+  task automatic test_challenge_ack();
+    bytes_t p;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    byte unsigned rd[$];
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd42400);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h11));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    app_read(sid, 8, rd);
+    flush_net(5000);
+
+    // (1) RST inside the window but not at RCV.NXT -> challenge ACK
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq + 100, peer_ack, F_RST, peer_win, no_bytes(), no_bytes()));
+    expect_challenge_ack("in-window RST");
+    // (2) RST+ACK inside the window -> challenge ACK as well
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq + 1, peer_ack, F_RST | F_ACK, peer_win, no_bytes(), no_bytes()));
+    expect_challenge_ack("in-window RST+ACK");
+    // (3) RST far outside the window -> silently dropped
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq + 32'h4000_0000, peer_ack, F_RST, peer_win, no_bytes(), no_bytes()));
+    wait_pkt(p, 20000, ok);
+    tb_check(!ok, "no response to out-of-window RST");
+    // (4) SYN on the established connection -> challenge ACK
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq + 5000, 0, F_SYN, peer_win, syn_options(1), no_bytes()));
+    expect_challenge_ack("SYN in ESTABLISHED");
+    // (5) data with an ACK for bytes never sent -> data dropped, ACK
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, peer_ack + 5000, F_ACK, peer_win, no_bytes(), gen_payload(16, 8'h21)));
+    expect_challenge_ack("ACK > SND.NXT");
+    // (6) data with an ancient ACK -> data dropped, ACK
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, peer_ack - 32'h1000_0000, F_ACK, peer_win, no_bytes(), gen_payload(16, 8'h31)));
+    expect_challenge_ack("ACK < SND.UNA - MAX.SND.WND");
+    repeat (2000) @(posedge ap_clk);
+    tb_check(notif_q.size() == 0, $sformatf("no app notification for rejected segments (%0d queued)", notif_q.size()));
+    notif_q.delete();
+
+    // (7) the connection is unaffected: valid data is accepted
+    peer_send_seg(F_ACK, gen_payload(16, 8'h41));
+    wait_notif(n, 200000, ok);
+    tb_check(ok && !n.closed && n.length == 16, "valid data after the rejected segments");
+    peer_seq += 16;
+    expect_flags(F_ACK, "ACK of valid data", p, 400000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq, $sformatf("ACK of valid data ack=%0d expected %0d", f_ack(p), peer_seq));
+    app_read(sid, 16, rd);
+    tb_check(rd.size() == 16 && rd[0] == 8'h41, "valid data content");
+    flush_net(5000);
+
+    // (8) RST exactly at RCV.NXT still resets the connection
+    peer_send_seg(F_RST, no_bytes());
+    wait_notif(n, 300000, ok);
+    tb_check(ok && n.closed, "exact RST closes the connection");
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  // R2: challenge ACK throttling (timer-scaled build only: the 1s budget
+  // window is ~156k cycles there). A burst of 2500 in-window RSTs spans at
+  // most two budget windows, so between 1000 and 2000 ACKs may come back.
+  task automatic test_challenge_ack_limit();
+    bytes_t p;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    byte unsigned rd[$];
+    int acks;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd42410);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h11));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "initial data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    app_read(sid, 8, rd);
+    flush_net(5000);
+
+    tb_quiet = 1;
+    acks = 0;
+    for (int i = 0; i < 2500; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq + 100 + i, peer_ack, F_RST, peer_win, no_bytes(), no_bytes()));
+      while (net_pkts.size() > 0) begin
+        p = net_pkts.pop_front();
+        if (f_flags(p) == F_ACK) acks++;
+      end
+    end
+    repeat (20000) @(posedge ap_clk);
+    while (net_pkts.size() > 0) begin
+      p = net_pkts.pop_front();
+      if (f_flags(p) == F_ACK) acks++;
+    end
+    tb_quiet = 0;
+    tb_info($sformatf("2500 in-window RSTs -> %0d challenge ACKs", acks));
+    tb_check(acks >= 1000 && acks <= 2000, $sformatf("challenge ACKs throttled (%0d)", acks));
+
+    // after a full budget window challenge ACKs are sent again
+    repeat (170000) @(posedge ap_clk);
+    flush_net(10);
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq + 7, peer_ack, F_RST, peer_win, no_bytes(), no_bytes()));
+    expect_challenge_ack("in-window RST after the budget window");
+    tb_check(notif_q.size() == 0, "connection survived the RST burst");
+    peer_send_seg(F_RST, no_bytes());
+    wait_notif(n, 300000, ok);
+    tb_check(ok && n.closed, "exact RST closes the connection");
+  endtask
+
   // G2: idle restart (RFC 5681 4.1). Requires the timer-scaled build: the
   // idle threshold is ~153 units of 1024 cycles ~= 157k cycles. After the
   // connection sits idle with nothing outstanding, the next transmission
@@ -3960,6 +4104,8 @@ module tb_toe_top;
       "cwnd_idle_restart" : test_cwnd_idle_restart();
       "rto_single_seg" : test_rto_single_seg();
       "rt_abort"       : test_rt_abort();
+      "challenge_ack"  : test_challenge_ack();
+      "challenge_ack_limit" : test_challenge_ack_limit();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 

@@ -62,7 +62,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | listen解除 | **実装済** (L1, `listen_close`テスト): listen要求のbit15をclose-listenフラグとして解釈(listenポートは0..32767なので既存AXIS I/F互換)。閉鎖後のSYNにはRST、再listenで復旧 | close/bind準拠 | 完了 |
 | ISN生成 | **改善済** (R1, `isn_quality`テスト): ISN = LFSR ^ (sessionID<<16) + フリーランカウンタ。旧実装の「下位6bit常に0x3F」パターンを解消し時間成分を追加。RFC 6528完全準拠(秘密鍵+4タプルハッシュ)は未 | RFC 6528(秘密鍵+4タプルハッシュ+時刻) | ★(残) |
 | SYNバックログ制限 | なし。1000個の偽SYNで**全セッション枯渇**(SYN flood無防備) | syncookies等 | ★ |
-| RST検証 | seq==recvd完全一致のみ(RFC 5961のchallenge ACKなし) | RFC 5961 | ★ |
+| RST検証 | **実装済** (R2, `challenge_ack`/`challenge_ack_limit`テスト): RFC 5961。seq==RCV.NXTのRSTのみ切断、窓内RST・同期状態のSYN/SYN-ACKにはchallenge ACK、ACK検証(SEG.ACK>SND.NXT または SND.UNA-バッファサイズ未満はデータごと破棄+ACK)、challenge ACKは全体で1000回/秒に制限 | RFC 5961 | 完了 |
 | マルチホーム | 3タプル(theirIp,myPort,theirPort)キーで**ローカルIPは1つのみ** | 4タプル | ★ |
 
 ## 5. 実装バグ(機能追加とは別に修正が必要)

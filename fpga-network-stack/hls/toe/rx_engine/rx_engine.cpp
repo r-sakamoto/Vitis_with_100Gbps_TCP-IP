@@ -1129,6 +1129,11 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 
 	static rxFsmMetaData fsm_meta;
 	static bool fsm_txSarRequest = false;
+	// RFC 5961 challenge ACK rate limit (global)
+	static ap_uint<28> fsm_challengeTimer = 0;
+	static ap_uint<11> fsm_challengeCount = 0;
+	bool challengeOk = (fsm_challengeCount < CHALLENGE_ACK_LIMIT);
+	bool challengeSent = false;
 
 
 	ap_uint<4> control_bits = 0;
@@ -1194,6 +1199,18 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				bool tsUpdate = rxSar.tsEnabled && fsm_meta.meta.tsValid && !pawsReject
 						&& seq_geq(fsm_meta.meta.tsVal, rxSar.tsRecent)
 						&& seq_leq(fsm_meta.meta.seqNumb, rxSar.recvd);
+				// RFC 5961 5.2 ACK validation in the synchronized states:
+				// SND.UNA - MAX.SND.WND <= SEG.ACK <= SND.NXT. An ACK for data
+				// never sent (RFC 793) or one too old to belong to this
+				// connection's recent history is dropped together with its
+				// payload and answered with a (throttled) ACK. MAX.SND.WND is
+				// bounded by the per-session TX buffer.
+				bool ackInvalid = !pawsReject
+						&& (tcpState == ESTABLISHED || tcpState == FIN_WAIT_1
+							|| tcpState == FIN_WAIT_2 || tcpState == CLOSE_WAIT
+							|| tcpState == CLOSING || tcpState == LAST_ACK)
+						&& (seq_gt(fsm_meta.meta.ackNumb, txSar.nextByte)
+							|| seq_lt(fsm_meta.meta.ackNumb, txSar.prevAck - (ap_uint<32>)BUFFER_SIZE));
 				if (pawsReject)
 				{
 					if (fsm_meta.meta.length != 0)
@@ -1201,6 +1218,19 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						dropDataFifoOut.write(true);
 					}
 					rxEng2eventEng_setEvent.write(event(ACK_NODELAY, fsm_meta.sessionID));
+					rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, tcpState, 1));
+				}
+				else if (ackInvalid)
+				{
+					if (fsm_meta.meta.length != 0)
+					{
+						dropDataFifoOut.write(true);
+					}
+					if (challengeOk)
+					{
+						rxEng2eventEng_setEvent.write(event(ACK_NODELAY, fsm_meta.sessionID));
+						challengeSent = true;
+					}
 					rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, tcpState, 1));
 				}
 				else
@@ -1708,8 +1738,13 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				}
 				else // Any synchronized state
 				{
-					// Unexpected SYN arrived, reply with normal ACK, RFC 793: fig.10
-					rxEng2eventEng_setEvent.write(event(ACK_NODELAY, fsm_meta.sessionID));
+					// Unexpected SYN arrived: RFC 5961 4.2 challenge ACK regardless
+					// of the sequence number (throttled)
+					if (challengeOk)
+					{
+						rxEng2eventEng_setEvent.write(event(ACK_NODELAY, fsm_meta.sessionID));
+						challengeSent = true;
+					}
 					// TODo send RST, has no ACK??
 					// Respond with RST, no ACK, seq ==
 					//eventEngine.write(rstEvent(mh_meta.seqNumb, mh_meta.length, true));
@@ -1771,8 +1806,13 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				}
 				else
 				{
-					// Unexpected SYN arrived, reply with normal ACK, RFC 793: fig.10
-					rxEng2eventEng_setEvent.write(event(ACK_NODELAY, fsm_meta.sessionID));
+					// Unexpected SYN arrived: RFC 5961 4.2 challenge ACK regardless
+					// of the sequence number (throttled)
+					if (challengeOk)
+					{
+						rxEng2eventEng_setEvent.write(event(ACK_NODELAY, fsm_meta.sessionID));
+						challengeSent = true;
+					}
 					rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, tcpState, 1));
 				}
 			}
@@ -1916,7 +1956,17 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						}
 						else
 						{
-							// Ingore since not matching window
+							// RFC 5961 3.2: a RST inside the receive window but not
+							// exactly at RCV.NXT may be a blind injection - answer
+							// with a (throttled) challenge ACK; the real peer then
+							// resends its RST with the exact sequence number.
+							// Outside the window it is silently dropped.
+							if (seq_gt(fsm_meta.meta.seqNumb, rxSar.recvd) && seq_lt(fsm_meta.meta.seqNumb, rxSar.advEdge)
+								&& tcpState != CLOSED && tcpState != SYN_RECEIVED && challengeOk)
+							{
+								rxEng2eventEng_setEvent.write(event(ACK_NODELAY, fsm_meta.sessionID));
+								challengeSent = true;
+							}
 							rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, tcpState, 1));
 						}
 					}
@@ -1933,6 +1983,21 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 		} //switch control_bits
 		break;
 	} //switch state
+
+	// challenge ACK budget: refilled once per window
+	if (fsm_challengeTimer == 0)
+	{
+		fsm_challengeTimer = CHALLENGE_ACK_WINDOW;
+		fsm_challengeCount = 0;
+	}
+	else
+	{
+		fsm_challengeTimer--;
+		if (challengeSent)
+		{
+			fsm_challengeCount++;
+		}
+	}
 }
 
 /** @ingroup rx_engine

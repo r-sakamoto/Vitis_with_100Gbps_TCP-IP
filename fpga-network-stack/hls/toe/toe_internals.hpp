@@ -58,6 +58,14 @@ static const ap_uint<32> TIME_120s		= (120000000.0/0.0064/MAX_SESSIONS/TCP_SIM_T
 #define CWND_IDLE_UNIT_SHIFT 10
 #define CWND_IDLE_THRESHOLD ((156250000 / 1024 / TCP_SIM_TIMER_SCALE) + 1)
 
+// RFC 5961 challenge ACK throttling (section 7): at most CHALLENGE_ACK_LIMIT
+// challenge ACKs per ~1s window, shared by all sessions like Linux'
+// tcp_challenge_ack_limit. The window counts rxTcpFSM invocations, and that
+// pipeline schedules at II=2 (carried rxSar request dependence), so one
+// invocation is two cycles at 156.25MHz.
+#define CHALLENGE_ACK_LIMIT 1000
+#define CHALLENGE_ACK_WINDOW ((156250000 / 2 / TCP_SIM_TIMER_SCALE) + 1)
+
 // RFC 7323 timestamps: full support (option on every segment including
 // payload-carrying ones) is only implemented for the narrow datapath; the
 // 512-bit header builder embeds options in the first beat and cannot shift
