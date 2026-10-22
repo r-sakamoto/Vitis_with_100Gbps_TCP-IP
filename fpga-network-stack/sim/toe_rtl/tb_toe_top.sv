@@ -4003,6 +4003,103 @@ module tb_toe_top;
     tb_check(f_ack(p) == 32'h3000_0009, $sformatf("data ACK=%0h", f_ack(p)));
   endtask
 
+  // R4: TIME_WAIT reuse (RFC 1122 4.2.2.13 / RFC 6191)
+  // active close by the TOE on the current connection -> TIME_WAIT;
+  // returns the session id
+  task automatic close_to_time_wait(output bit [15:0] sid);
+    bytes_t p;
+    bit ok;
+    notif_t n;
+    bit [31:0] fin_seq;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h41));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+    if (err_count) return;
+    app_close(sid);
+    expect_flags(F_FIN, "TOE FIN", p, 400000, 1);
+    if (err_count) return;
+    fin_seq = f_seq(p);
+    peer_ack = fin_seq + 1;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, peer_ack, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, peer_ack, F_FIN | F_ACK, peer_win, no_bytes(), no_bytes()));
+    peer_seq += 1;
+    expect_flags(F_ACK, "ACK of peer FIN", p, 400000, 0);
+    if (err_count) return;
+    wait_notif(n, 200000, ok); // closed notification
+    repeat (2000) @(posedge ap_clk);
+    tb_check(dut.close_timer_U0.closeTimerTable_U.ram[sid][32] == 1'b1,
+             "TIME_WAIT timer running");
+  endtask
+
+  // SYN in TIME_WAIT that must be accepted: SYN-ACK, handshake, data on the
+  // same (reused) session
+  task automatic expect_tw_reuse(input string what, input bit [31:0] seq, input bytes_t opts,
+                                 input bit [15:0] sid);
+    bytes_t p;
+    bit ok;
+    notif_t n;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port, seq, 0, F_SYN, 16'hFFFF,
+                      opts, no_bytes()));
+    expect_flags(F_SYN | F_ACK, $sformatf("SYN-ACK for %s", what), p, 100000, 1);
+    if (err_count) return;
+    tb_check(f_ack(p) == seq + 1, $sformatf("%s: SYN-ACK ack=%0d expected %0d", what, f_ack(p), seq + 1));
+    peer_seq = seq + 1;
+    peer_ack = f_seq(p) + 1;
+    peer_send_seg(F_ACK, no_bytes());
+    repeat (2000) @(posedge ap_clk);
+    peer_send_seg(F_ACK, gen_payload(16, 8'h51));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, $sformatf("%s: data notification on the new connection", what));
+    if (ok) tb_check(n.sessionID == sid, $sformatf("%s: session %0d reused (got %0d)", what, sid, n.sessionID));
+    peer_seq += 16;
+    expect_flags(F_ACK, $sformatf("%s: ACK of new data", what), p, 400000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq, $sformatf("%s: ack=%0d expected %0d", what, f_ack(p), peer_seq));
+    tb_check(dut.close_timer_U0.closeTimerTable_U.ram[sid][32] == 1'b0,
+             $sformatf("%s: TIME_WAIT timer cancelled", what));
+  endtask
+
+  task automatic test_time_wait_reuse();
+    bit ok;
+    bit [15:0] sid;
+    bit [31:0] toe_ts, old_seq;
+
+    app_listen(16'd80, ok);
+    // (1) no timestamps: decided by sequence number
+    do_passive_handshake(16'd80, 16'd42600, 32'h4000_0000);
+    if (err_count) return;
+    close_to_time_wait(sid);
+    if (err_count) return;
+    // old SYN (seq not beyond RCV.NXT) -> ACK, no new connection
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port, peer_seq - 32'd100, 0, F_SYN,
+                      16'hFFFF, syn_options(1), no_bytes()));
+    expect_challenge_ack("old SYN in TIME_WAIT");
+    if (err_count) return;
+    expect_tw_reuse("new SYN", peer_seq + 32'h0010_0000, syn_options(1), sid);
+    if (err_count) return;
+
+    // (2) timestamps: decided by TSval, not by sequence number
+    do_ts_handshake(16'd80, 16'd42601, 32'h5000_0000, 32'd60_000, toe_ts);
+    if (err_count) return;
+    close_to_time_wait(sid);
+    if (err_count) return;
+    old_seq = peer_seq;
+    // newer sequence number but older TSval -> rejected
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port, old_seq + 32'h0010_0000, 0, F_SYN,
+                      16'hFFFF, ts_syn_options(32'd10_000), no_bytes()));
+    expect_challenge_ack("SYN with old TSval in TIME_WAIT");
+    if (err_count) return;
+    // older sequence number but newer TSval -> accepted
+    expect_tw_reuse("SYN with new TSval", old_seq - 32'h0010_0000, ts_syn_options(32'd90_000), sid);
+  endtask
+
   // G2: idle restart (RFC 5681 4.1). Requires the timer-scaled build: the
   // idle threshold is ~153 units of 1024 cycles ~= 157k cycles. After the
   // connection sits idle with nothing outstanding, the next transmission
@@ -4181,6 +4278,7 @@ module tb_toe_top;
       "challenge_ack"  : test_challenge_ack();
       "challenge_ack_limit" : test_challenge_ack_limit();
       "syn_backlog"    : test_syn_backlog();
+      "time_wait_reuse": test_time_wait_reuse();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 

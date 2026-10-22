@@ -1700,14 +1700,28 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				std::cout<<" gap:"<<rxSar.gap<<std::endl;
 				#endif
 				// std::cout<<" free_space"<<free_space<<std::endl;
+				// TIME_WAIT reuse (RFC 1122 4.2.2.13, RFC 6191): a new SYN for a
+				// listening port is accepted if it is provably newer than the
+				// old connection - by timestamp when the old connection used
+				// them, by sequence number otherwise
+				bool twNewer = (rxSar.tsEnabled && fsm_meta.meta.tsValid)
+								? (ap_int<32>)(fsm_meta.meta.tsVal - rxSar.tsRecent) > 0
+								: seq_gt(fsm_meta.meta.seqNumb, rxSar.recvd);
+				bool twReuse = (tcpState == TIME_WAIT) && (fsm_meta.dstIpPort[15] == 0)
+								&& !fsm_synBacklogFull && twNewer;
 				if (tcpState == CLOSED && fsm_synBacklogFull)
 				{
 					// SYN backlog exhausted: drop the SYN and release the
 					// session that the lookup just created for it
 					rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, CLOSED, 1));
 				}
-				else if (tcpState == CLOSED || tcpState == SYN_SENT) // Actually this is LISTEN || SYN_SENT
+				else if (tcpState == CLOSED || tcpState == SYN_SENT || twReuse) // Actually this is LISTEN || SYN_SENT
 				{
+					if (twReuse)
+					{
+						// the old connection's TIME_WAIT timer must not close the new one
+						rxEng2timer_setCloseTimer.write((ap_uint<16>)(fsm_meta.sessionID | CLOSE_TIMER_CANCEL));
+					}
 #if (WINDOW_SCALE)
 					ap_uint<4> rx_win_shift = (fsm_meta.meta.winScale == 0) ? 0 : WINDOW_SCALE_BITS;
 					ap_uint<4> tx_win_shift = fsm_meta.meta.winScale;

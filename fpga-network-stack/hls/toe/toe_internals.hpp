@@ -72,6 +72,9 @@ static const ap_uint<32> TIME_120s		= (120000000.0/0.0064/MAX_SESSIONS/TCP_SIM_T
 #ifndef SYN_BACKLOG_MAX
 #define SYN_BACKLOG_MAX (MAX_SESSIONS / 2)
 #endif
+// close timer request flag (session IDs stay below 0x8000): cancel the
+// TIME_WAIT timer of a session that was reused by a new SYN
+#define CLOSE_TIMER_CANCEL 0x8000
 #define CHALLENGE_ACK_WINDOW ((156250000 / 2 / TCP_SIM_TIMER_SCALE) + 1)
 
 // RFC 7323 timestamps: full support (option on every segment including

@@ -54,6 +54,7 @@ void close_timer(	stream<ap_uint<16> >&		rxEng2timer_setCloseTimer,
 	static ap_uint<16>	ct_setSessionID = 0;
 	static ap_uint<16>	ct_prevSessionID = 0;
 	static bool			ct_waitForWrite = false;
+	static bool			ct_cancel = false;
 	//ap_uint<16> sessionID;
 
 	if (ct_waitForWrite)
@@ -61,14 +62,17 @@ void close_timer(	stream<ap_uint<16> >&		rxEng2timer_setCloseTimer,
 		if (ct_setSessionID != ct_prevSessionID)
 		{
 			closeTimerTable[ct_setSessionID].time = TIME_60s;
-			closeTimerTable[ct_setSessionID].active = true;
+			closeTimerTable[ct_setSessionID].active = !ct_cancel;
 			ct_waitForWrite = false;
 		}
 		ct_prevSessionID--;
 	}
 	else if (!rxEng2timer_setCloseTimer.empty())
 	{
-		rxEng2timer_setCloseTimer.read(ct_setSessionID);
+		ap_uint<16> req = rxEng2timer_setCloseTimer.read();
+		ct_cancel = req[15]; // CLOSE_TIMER_CANCEL
+		req[15] = 0;
+		ct_setSessionID = req;
 		ct_waitForWrite = true;
 	}
 	else

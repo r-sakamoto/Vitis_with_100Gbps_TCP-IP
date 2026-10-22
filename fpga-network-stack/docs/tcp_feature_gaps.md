@@ -58,7 +58,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | FIN_WAIT_2 | **実装済** (N1+R1, `time_wait_ack`テスト): FIN_WAIT_1→FIN_WAIT_2遷移、FIN_WAIT_2でのデータ受信・相手FIN→TIME_WAIT。TIME_WAIT中の迷子ACK/再送FINにはRSTでなくACKを返す(RFC 793) | 準拠 | 完了 |
 | ACKなしFIN | **実装済** (F3, `pure_fin_close`テスト): 純FINもFIN+ACKと同様に処理(ACK番号依存処理はACKフラグでガード) | 処理する | 完了 |
 | 同時オープン | 非対応(SYN_SENT中のSYNをパッシブオープン扱い) | 対応 | ★ |
-| TIME_WAIT | 60秒固定(2MSLでない)。TIME_WAIT中の同タプルSYN再利用不可 | 60s + 再利用(RFC 1122) | ★ |
+| TIME_WAIT | 60秒固定(2MSLでない)。**再利用は実装済** (R4, `time_wait_reuse`テスト): listenポート宛てでバックログに空きがあれば、TIME_WAIT中の新SYNをTS有効ならTSval>TS.Recent(RFC 6191)、無効ならSEQ>RCV.NXT(RFC 1122 4.2.2.13)で受理し、新規接続として初期化+SYN-ACK、TIME_WAITタイマは取消。条件外のSYNはACK応答 | 60s + 再利用(RFC 1122) | 完了 |
 | listen解除 | **実装済** (L1, `listen_close`テスト): listen要求のbit15をclose-listenフラグとして解釈(listenポートは0..32767なので既存AXIS I/F互換)。閉鎖後のSYNにはRST、再listenで復旧 | close/bind準拠 | 完了 |
 | ISN生成 | **改善済** (R1, `isn_quality`テスト): ISN = LFSR ^ (sessionID<<16) + フリーランカウンタ。旧実装の「下位6bit常に0x3F」パターンを解消し時間成分を追加。RFC 6528完全準拠(秘密鍵+4タプルハッシュ)は未 | RFC 6528(秘密鍵+4タプルハッシュ+時刻) | ★(残) |
 | SYNバックログ制限 | **実装済** (R3, `syn_backlog`テスト): SYN_RECEIVED状態のセッション数をstate_tableで計数し、`SYN_BACKLOG_MAX`(既定MAX_SESSIONS/2)に達したら新規SYNを無応答で破棄(セッション即解放)。確立済み接続用に残り半分のセッションを確保。SYN cookiesは未 | tcp_max_syn_backlog + syncookies | ★(残: cookies) |
