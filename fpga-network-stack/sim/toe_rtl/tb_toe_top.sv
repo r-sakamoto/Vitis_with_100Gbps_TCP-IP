@@ -4100,6 +4100,47 @@ module tb_toe_top;
     expect_tw_reuse("SYN with new TSval", old_seq - 32'h0010_0000, ts_syn_options(32'd90_000), sid);
   endtask
 
+  // R5: an unanswered SYN-ACK is retransmitted 4 times, then the half-open
+  // session is released silently - no notification to the application,
+  // which never saw the connection (timer-scaled build)
+  task automatic test_synack_giveup();
+    bytes_t p;
+    bit ok;
+    notif_t n;
+    bit [31:0] iss;
+    int rtx, nn, base_deletes;
+
+    app_listen(16'd80, ok);
+    base_deletes = cam_delete_count;
+    syn_from(16'd42700, 32'h7000_0000);
+    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 100000, 1);
+    if (err_count) return;
+    iss = f_seq(p);
+    for (rtx = 1; rtx <= 4; rtx++) begin
+      ok = 0;
+      while (!ok) begin
+        wait_pkt(p, 6_000_000, ok);
+        if (!ok) begin tb_error($sformatf("timeout waiting for SYN-ACK retransmission %0d", rtx)); return; end
+        if (f_flags(p) != (F_SYN | F_ACK)) ok = 0;
+      end
+      tb_check(f_seq(p) == iss, $sformatf("SYN-ACK rtx %0d seq", rtx));
+      tb_info($sformatf("SYN-ACK retransmission %0d seen", rtx));
+    end
+    // give-up: CAM entry deleted, backlog slot freed, no app notification
+    nn = 0;
+    while (cam_delete_count == base_deletes && nn < 8_000_000) begin @(posedge ap_clk); nn++; end
+    tb_check(cam_delete_count > base_deletes, "half-open session released after SYN-ACK retries");
+    repeat (1000) @(posedge ap_clk);
+    tb_check(dut.state_table_U0.stt_halfOpen == 0,
+             $sformatf("half-open count %0d expected 0", dut.state_table_U0.stt_halfOpen));
+    wait_notif(n, 200000, ok);
+    tb_check(!ok, $sformatf("no application notification for the dropped half-open session (got sid=%0d closed=%0d)",
+                            n.sessionID, n.closed));
+    // the port still accepts new connections
+    syn_from(16'd42701, 32'h7100_0000);
+    expect_flags(F_SYN | F_ACK, "SYN-ACK for a new SYN", p, 100000, 1);
+  endtask
+
   // G2: idle restart (RFC 5681 4.1). Requires the timer-scaled build: the
   // idle threshold is ~153 units of 1024 cycles ~= 157k cycles. After the
   // connection sits idle with nothing outstanding, the next transmission
@@ -4279,6 +4320,7 @@ module tb_toe_top;
       "challenge_ack_limit" : test_challenge_ack_limit();
       "syn_backlog"    : test_syn_backlog();
       "time_wait_reuse": test_time_wait_reuse();
+      "synack_giveup"  : test_synack_giveup();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 
@@ -4293,7 +4335,7 @@ module tb_toe_top;
   // global watchdog (keepalive needs ~18M cycles of protocol silence)
   initial begin
     #1;
-    if (testname == "keepalive" || testname == "rt_abort") #(CLK_PERIOD * 40_000_000);
+    if (testname == "keepalive" || testname == "rt_abort" || testname == "synack_giveup") #(CLK_PERIOD * 40_000_000);
     else                                                   #(CLK_PERIOD * 10_000_000);
     $display("[%0t] TB-ERROR: global watchdog expired", $time);
     $display("  TEST %s : FAIL (watchdog)", testname);

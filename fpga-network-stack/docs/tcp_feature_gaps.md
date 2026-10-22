@@ -77,6 +77,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | B6 | **修正済** (`rx_ooo_overlap`テストで検証) | OOOギャップ充填時の重複セグメントで分岐が無くパイプラインストール(非bypass構成) | `rx_engine.cpp` ギャップ充填分岐 |
 | B7 | **修正済** (`fin_retransmit`テストで検証。RT再送長からFINファントムバイトを除外) | FIN再送タイマのイベント型がRT(FIXMEコメントあり) | `tx_engine.cpp:643-644` |
 | B8 | **修正済** (`#ifndef __SYNTHESIS__`ガードを28ブロックに適用) | 合成対象コードに`std::cout`が無ガードで残存 | `tx_engine.cpp`他多数 |
+| B9 | **修正済** (R5, `synack_giveup`テストで検証) | SYN-ACK再送4回の打ち切り時に、アプリが一度も見ていないセッションのTIME_OUT通知をrx appへ送っていた。half-openセッションは通知せず黙って解放(Linuxのrequest sock破棄と同等) | `retransmit_timer.cpp` |
 
 ## 6. 実装優先順位の提案(Linux同等化ロードマップ)
 

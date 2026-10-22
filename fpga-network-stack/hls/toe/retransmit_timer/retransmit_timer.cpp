@@ -187,8 +187,11 @@ void retransmit_timer(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetrans
 						{
 							rtTimer2txApp_notification.write(openStatus(currID, false));
 						}
-						else
+						else if (currEntry.type != SYN_ACK)
 						{
+							// a half-open passive session was never visible to
+							// the application: release it silently (as Linux
+							// drops an unanswered request socket)
 							rtTimer2rxApp_notification.write(appNotification(currID, true)); //TIME_OUT
 						}
 					}
