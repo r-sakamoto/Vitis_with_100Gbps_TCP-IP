@@ -61,7 +61,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | TIME_WAIT | 60秒固定(2MSLでない)。TIME_WAIT中の同タプルSYN再利用不可 | 60s + 再利用(RFC 1122) | ★ |
 | listen解除 | **実装済** (L1, `listen_close`テスト): listen要求のbit15をclose-listenフラグとして解釈(listenポートは0..32767なので既存AXIS I/F互換)。閉鎖後のSYNにはRST、再listenで復旧 | close/bind準拠 | 完了 |
 | ISN生成 | **改善済** (R1, `isn_quality`テスト): ISN = LFSR ^ (sessionID<<16) + フリーランカウンタ。旧実装の「下位6bit常に0x3F」パターンを解消し時間成分を追加。RFC 6528完全準拠(秘密鍵+4タプルハッシュ)は未 | RFC 6528(秘密鍵+4タプルハッシュ+時刻) | ★(残) |
-| SYNバックログ制限 | なし。1000個の偽SYNで**全セッション枯渇**(SYN flood無防備) | syncookies等 | ★ |
+| SYNバックログ制限 | **実装済** (R3, `syn_backlog`テスト): SYN_RECEIVED状態のセッション数をstate_tableで計数し、`SYN_BACKLOG_MAX`(既定MAX_SESSIONS/2)に達したら新規SYNを無応答で破棄(セッション即解放)。確立済み接続用に残り半分のセッションを確保。SYN cookiesは未 | tcp_max_syn_backlog + syncookies | ★(残: cookies) |
 | RST検証 | **実装済** (R2, `challenge_ack`/`challenge_ack_limit`テスト): RFC 5961。seq==RCV.NXTのRSTのみ切断、窓内RST・同期状態のSYN/SYN-ACKにはchallenge ACK、ACK検証(SEG.ACK>SND.NXT または SND.UNA-バッファサイズ未満はデータごと破棄+ACK)、challenge ACKは全体で1000回/秒に制限 | RFC 5961 | 完了 |
 | マルチホーム | 3タプル(theirIp,myPort,theirPort)キーで**ローカルIPは1つのみ** | 4タプル | ★ |
 

@@ -53,7 +53,8 @@ void state_table(	stream<stateQuery>&			rxEng2stateTable_upd_req,
 					stream<sessionState>&		stateTable2rxEng_upd_rsp,
 					stream<sessionState>&		stateTable2TxApp_upd_rsp,
 					stream<sessionState>&		stateTable2txApp_rsp,
-					stream<ap_uint<16> >&		stateTable2sLookup_releaseSession)
+					stream<ap_uint<16> >&		stateTable2sLookup_releaseSession,
+					stream<bool>&				stateTable2rxEng_synBacklogFull)
 {
 #pragma HLS PIPELINE II=1
 
@@ -74,6 +75,20 @@ void state_table(	stream<stateQuery>&			rxEng2stateTable_upd_req,
 	static ap_uint<16> stt_closeSessionID;
 	static bool stt_closeWait = false;
 
+	// SYN backlog accounting: number of sessions in SYN_RECEIVED. Every
+	// state write compares the previous with the new state. RX writes always
+	// follow the locked RX read, whose result is kept; the other writers read
+	// the old state here, forwarding the most recent write.
+	static ap_uint<16> stt_halfOpen = 0;
+	static bool stt_backlogFull = false;
+	static sessionState stt_rxOldState = CLOSED;
+	static ap_uint<16> stt_lastWrID = 0xFFFF;
+	static sessionState stt_lastWrState = CLOSED;
+	bool wrDone = false;
+	ap_uint<16> wrID = 0;
+	sessionState wrOld = CLOSED;
+	sessionState wrNew = CLOSED;
+
 	ap_uint<16> sessionID;
 
 
@@ -89,6 +104,10 @@ void state_table(	stream<stateQuery>&			rxEng2stateTable_upd_req,
 		{
 			if (stt_txAccess.write)
 			{
+				sessionState txOld = state_table[stt_txAccess.sessionID];
+				if (stt_txAccess.sessionID == stt_lastWrID)
+					txOld = stt_lastWrState;
+				wrDone = true; wrID = stt_txAccess.sessionID; wrOld = txOld; wrNew = stt_txAccess.state;
 				state_table[stt_txAccess.sessionID] = stt_txAccess.state;
 				stt_txSessionLocked = false;
 			}
@@ -123,12 +142,17 @@ void state_table(	stream<stateQuery>&			rxEng2stateTable_upd_req,
 				{
 					stateTable2sLookup_releaseSession.write(stt_rxAccess.sessionID);
 				}
+				wrDone = true; wrID = stt_rxAccess.sessionID; wrOld = stt_rxOldState; wrNew = stt_rxAccess.state;
 				state_table[stt_rxAccess.sessionID] = stt_rxAccess.state;
 				stt_rxSessionLocked = false;
 			}
 			else
 			{
-				stateTable2rxEng_upd_rsp.write(state_table[stt_rxAccess.sessionID]);
+				sessionState rxCur = state_table[stt_rxAccess.sessionID];
+				if (stt_rxAccess.sessionID == stt_lastWrID)
+					rxCur = stt_lastWrState;
+				stateTable2rxEng_upd_rsp.write(rxCur);
+				stt_rxOldState = rxCur;
 				stt_rxSessionID = stt_rxAccess.sessionID;
 				stt_rxSessionLocked = true;
 			}
@@ -145,6 +169,10 @@ void state_table(	stream<stateQuery>&			rxEng2stateTable_upd_req,
 		}
 		else
 		{
+			sessionState clOld = state_table[stt_closeSessionID];
+			if (stt_closeSessionID == stt_lastWrID)
+				clOld = stt_lastWrState;
+			wrDone = true; wrID = stt_closeSessionID; wrOld = clOld; wrNew = CLOSED;
 			state_table[stt_closeSessionID] = CLOSED;
 			stateTable2sLookup_releaseSession.write(stt_closeSessionID);
 		}
@@ -155,6 +183,10 @@ void state_table(	stream<stateQuery>&			rxEng2stateTable_upd_req,
 		{
 			if (stt_txAccess.write)
 			{
+				sessionState txOld = state_table[stt_txAccess.sessionID];
+				if (stt_txAccess.sessionID == stt_lastWrID)
+					txOld = stt_lastWrState;
+				wrDone = true; wrID = stt_txAccess.sessionID; wrOld = txOld; wrNew = stt_txAccess.state;
 				state_table[stt_txAccess.sessionID] = stt_txAccess.state;
 				stt_txSessionLocked = false;
 			}
@@ -177,12 +209,17 @@ void state_table(	stream<stateQuery>&			rxEng2stateTable_upd_req,
 				{
 					stateTable2sLookup_releaseSession.write(stt_rxAccess.sessionID);
 				}
+				wrDone = true; wrID = stt_rxAccess.sessionID; wrOld = stt_rxOldState; wrNew = stt_rxAccess.state;
 				state_table[stt_rxAccess.sessionID] = stt_rxAccess.state;
 				stt_rxSessionLocked = false;
 			}
 			else
 			{
-				stateTable2rxEng_upd_rsp.write(state_table[stt_rxAccess.sessionID]);
+				sessionState rxCur = state_table[stt_rxAccess.sessionID];
+				if (stt_rxAccess.sessionID == stt_lastWrID)
+					rxCur = stt_lastWrState;
+				stateTable2rxEng_upd_rsp.write(rxCur);
+				stt_rxOldState = rxCur;
 				stt_rxSessionID = stt_rxAccess.sessionID;
 				stt_rxSessionLocked = true;
 			}
@@ -193,9 +230,34 @@ void state_table(	stream<stateQuery>&			rxEng2stateTable_upd_req,
 	{
 		if (((stt_closeSessionID != stt_rxSessionID) || !stt_rxSessionLocked) && ((stt_closeSessionID != stt_txSessionID) || !stt_txSessionLocked))
 		{
+			sessionState clOld = state_table[stt_closeSessionID];
+			if (stt_closeSessionID == stt_lastWrID)
+				clOld = stt_lastWrState;
+			wrDone = true; wrID = stt_closeSessionID; wrOld = clOld; wrNew = CLOSED;
 			state_table[stt_closeSessionID] = CLOSED;
 			stateTable2sLookup_releaseSession.write(stt_closeSessionID);
 			stt_closeWait = false;
 		}
 	}
+	if (wrDone)
+	{
+		if (wrNew == SYN_RECEIVED && wrOld != SYN_RECEIVED)
+		{
+			stt_halfOpen++;
+		}
+		else if (wrOld == SYN_RECEIVED && wrNew != SYN_RECEIVED && stt_halfOpen != 0)
+		{
+			stt_halfOpen--;
+		}
+		stt_lastWrID = wrID;
+		stt_lastWrState = wrNew;
+	}
+	// publish changes of the backlog-full condition to the RX engine
+	bool backlogFull = (stt_halfOpen >= SYN_BACKLOG_MAX);
+	if (backlogFull != stt_backlogFull && !stateTable2rxEng_synBacklogFull.full())
+	{
+		stateTable2rxEng_synBacklogFull.write(backlogFull);
+		stt_backlogFull = backlogFull;
+	}
 }
+

@@ -3929,6 +3929,80 @@ module tb_toe_top;
     tb_check(ok && n.closed, "exact RST closes the connection");
   endtask
 
+  // R3: SYN backlog limit (SYN_BACKLOG_MAX = MAX_SESSIONS/2 = 500). A SYN
+  // flood fills the backlog; further SYNs get no SYN-ACK. Leaving
+  // SYN_RECEIVED (RST, completed handshake) frees a backlog slot again.
+  task automatic syn_from(input bit [15:0] rport, input bit [31:0] seq);
+    net_send(make_tcp(PEER_IP, TOE_IP, rport, 16'd80, seq, 0, F_SYN, 16'hFFFF,
+                      syn_options(1), no_bytes()));
+  endtask
+
+  task automatic test_syn_backlog();
+    bytes_t p;
+    bit ok;
+    int synacks;
+    bit [31:0] iss;
+    localparam int BACKLOG = 500;
+
+    app_listen(16'd80, ok);
+    // flood: BACKLOG half-open sessions
+    tb_quiet = 1;
+    synacks = 0;
+    for (int i = 0; i < BACKLOG; i++) begin
+      syn_from(16'd30000 + i, 32'h2000_0000 + i * 32'h100);
+      while (net_pkts.size() > 0) begin
+        p = net_pkts.pop_front();
+        if (f_flags(p) == (F_SYN | F_ACK)) synacks++;
+      end
+    end
+    repeat (20000) @(posedge ap_clk);
+    while (net_pkts.size() > 0) begin
+      p = net_pkts.pop_front();
+      if (f_flags(p) == (F_SYN | F_ACK)) synacks++;
+    end
+    tb_quiet = 0;
+    tb_check(synacks == BACKLOG, $sformatf("%0d SYN-ACKs for %0d SYNs", synacks, BACKLOG));
+    tb_info($sformatf("half-open count = %0d", dut.state_table_U0.stt_halfOpen));
+
+    // backlog full: the next SYN is dropped
+    syn_from(16'd31000, 32'h3000_0000);
+    wait_pkt(p, 30000, ok);
+    tb_check(!ok, "no SYN-ACK while the SYN backlog is full");
+
+    // RST on one half-open session frees a slot
+    net_send(make_tcp(PEER_IP, TOE_IP, 16'd30000, 16'd80, 32'h2000_0001, 0, F_RST,
+                      16'hFFFF, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    flush_net(10);
+    syn_from(16'd31000, 32'h3000_0000);
+    expect_flags(F_SYN | F_ACK, "SYN-ACK after a backlog slot was freed", p, 50000, 0);
+    if (err_count) return;
+    iss = f_seq(p);
+    // complete this handshake -> ESTABLISHED frees its slot too
+    net_send(make_tcp(PEER_IP, TOE_IP, 16'd31000, 16'd80, 32'h3000_0001, iss + 1, F_ACK,
+                      16'hFFFF, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    flush_net(10);
+    syn_from(16'd31001, 32'h3100_0000);
+    expect_flags(F_SYN | F_ACK, "SYN-ACK after a handshake completed", p, 50000, 0);
+    if (err_count) return;
+    // ... and the backlog is full again
+    repeat (3000) @(posedge ap_clk);
+    flush_net(10);
+    syn_from(16'd31002, 32'h3200_0000);
+    wait_pkt(p, 30000, ok);
+    tb_check(!ok, "backlog full again");
+    tb_check(dut.state_table_U0.stt_halfOpen == BACKLOG,
+             $sformatf("half-open count %0d expected %0d", dut.state_table_U0.stt_halfOpen, BACKLOG));
+
+    // the established connection is unaffected and carries data
+    net_send(make_tcp(PEER_IP, TOE_IP, 16'd31000, 16'd80, 32'h3000_0001, iss + 1, F_ACK,
+                      16'hFFFF, no_bytes(), gen_payload(8, 8'h51)));
+    expect_flags(F_ACK, "ACK of data on the established connection", p, 400000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == 32'h3000_0009, $sformatf("data ACK=%0h", f_ack(p)));
+  endtask
+
   // G2: idle restart (RFC 5681 4.1). Requires the timer-scaled build: the
   // idle threshold is ~153 units of 1024 cycles ~= 157k cycles. After the
   // connection sits idle with nothing outstanding, the next transmission
@@ -4106,6 +4180,7 @@ module tb_toe_top;
       "rt_abort"       : test_rt_abort();
       "challenge_ack"  : test_challenge_ack();
       "challenge_ack_limit" : test_challenge_ack_limit();
+      "syn_backlog"    : test_syn_backlog();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 

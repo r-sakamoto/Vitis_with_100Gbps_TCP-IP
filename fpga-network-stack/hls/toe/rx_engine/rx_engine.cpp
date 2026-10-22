@@ -1111,6 +1111,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						stream<bool>&							dropDataFifoOut,
 						stream<rttAck>&							rxEng2rtt_ack,
 						stream<ap_uint<16> >&					rxEng2timer_resetKeepalive,
+						stream<bool>&						stateTable2rxEng_synBacklogFull,
 #if !(RX_DDR_BYPASS)
 						stream<mmCmd>&							rxBufferWriteCmd,
 						stream<appNotification>&				rxEng2rxApp_notification)
@@ -1134,6 +1135,12 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 	static ap_uint<11> fsm_challengeCount = 0;
 	bool challengeOk = (fsm_challengeCount < CHALLENGE_ACK_LIMIT);
 	bool challengeSent = false;
+	// SYN backlog full (published by the state table on change)
+	static bool fsm_synBacklogFull = false;
+	if (!stateTable2rxEng_synBacklogFull.empty())
+	{
+		fsm_synBacklogFull = stateTable2rxEng_synBacklogFull.read();
+	}
 
 
 	ap_uint<4> control_bits = 0;
@@ -1693,7 +1700,13 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				std::cout<<" gap:"<<rxSar.gap<<std::endl;
 				#endif
 				// std::cout<<" free_space"<<free_space<<std::endl;
-				if (tcpState == CLOSED || tcpState == SYN_SENT) // Actually this is LISTEN || SYN_SENT
+				if (tcpState == CLOSED && fsm_synBacklogFull)
+				{
+					// SYN backlog exhausted: drop the SYN and release the
+					// session that the lookup just created for it
+					rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, CLOSED, 1));
+				}
+				else if (tcpState == CLOSED || tcpState == SYN_SENT) // Actually this is LISTEN || SYN_SENT
 				{
 #if (WINDOW_SCALE)
 					ap_uint<4> rx_win_shift = (fsm_meta.meta.winScale == 0) ? 0 : WINDOW_SCALE_BITS;
@@ -2348,6 +2361,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 				stream<extendedEvent>&				rxEng2eventEng_setEvent,
 				stream<rttAck>&						rxEng2rtt_ack,
 				stream<ap_uint<16> >&				rxEng2timer_resetKeepalive,
+				stream<bool>&						stateTable2rxEng_synBacklogFull,
 #if !(RX_DDR_BYPASS)
 				stream<mmCmd>&						rxBufferWriteCmd,
 				stream<appNotification>&			rxEng2rxApp_notification)
@@ -2527,6 +2541,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 							rxEng_fsmDropFifo,
 							rxEng2rtt_ack,
 							rxEng2timer_resetKeepalive,
+							stateTable2rxEng_synBacklogFull,
 #if !(RX_DDR_BYPASS)
 							rxTcpFsm2wrAccessBreakdown,
 							rx_internalNotificationFifo);
@@ -2573,6 +2588,7 @@ template void rx_engine<DATA_WIDTH>(	stream<net_axis<DATA_WIDTH> >&					ipRxData
 				stream<extendedEvent>&				rxEng2eventEng_setEvent,
 				stream<rttAck>&						rxEng2rtt_ack,
 				stream<ap_uint<16> >&				rxEng2timer_resetKeepalive,
+				stream<bool>&						stateTable2rxEng_synBacklogFull,
 #if !(RX_DDR_BYPASS)
 				stream<mmCmd>&						rxBufferWriteCmd,
 				stream<appNotification>&			rxEng2rxApp_notification);

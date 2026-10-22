@@ -64,6 +64,14 @@ static const ap_uint<32> TIME_120s		= (120000000.0/0.0064/MAX_SESSIONS/TCP_SIM_T
 // pipeline schedules at II=2 (carried rxSar request dependence), so one
 // invocation is two cycles at 156.25MHz.
 #define CHALLENGE_ACK_LIMIT 1000
+
+// SYN flood mitigation (cf. Linux tcp_max_syn_backlog): at most this many
+// sessions may sit in SYN_RECEIVED; further SYNs to a listening port are
+// dropped (no session, no SYN-ACK) until a half-open session completes or
+// times out, so a flood cannot exhaust the whole session table.
+#ifndef SYN_BACKLOG_MAX
+#define SYN_BACKLOG_MAX (MAX_SESSIONS / 2)
+#endif
 #define CHALLENGE_ACK_WINDOW ((156250000 / 2 / TCP_SIM_TIMER_SCALE) + 1)
 
 // RFC 7323 timestamps: full support (option on every segment including

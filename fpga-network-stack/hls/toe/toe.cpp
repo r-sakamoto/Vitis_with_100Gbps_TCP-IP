@@ -682,6 +682,8 @@ void toe(	// Data & Memory Interface
 
 	static stream<ap_uint<16> >				rxEng2timer_resetKeepalive("rxEng2timer_resetKeepalive");
 	#pragma HLS stream variable=rxEng2timer_resetKeepalive	depth=4
+	static stream<bool>						stateTable2rxEng_synBacklogFull("stateTable2rxEng_synBacklogFull");
+	#pragma HLS stream variable=stateTable2rxEng_synBacklogFull	depth=2
 	static stream<ap_uint<16> >				stateTable2sLookup_releaseSessionInt("stateTable2sLookup_releaseSessionInt");
 	#pragma HLS stream variable=stateTable2sLookup_releaseSessionInt	depth=2
 	static stream<ap_uint<16> >				stateTable2timer_releaseKeepalive("stateTable2timer_releaseKeepalive");
@@ -763,7 +765,8 @@ void toe(	// Data & Memory Interface
 					stateTable2rxEng_upd_rsp,
 					stateTable2txApp_upd_rsp,
 					stateTable2txApp_rsp,
-					stateTable2sLookup_releaseSessionInt);
+					stateTable2sLookup_releaseSessionInt,
+					stateTable2rxEng_synBacklogFull);
 	sessionReleaseTee(	stateTable2sLookup_releaseSessionInt,
 						stateTable2sLookup_releaseSession,
 						stateTable2timer_releaseKeepalive);
@@ -851,6 +854,7 @@ void toe(	// Data & Memory Interface
 				rxEng2eventEng_setEvent,
 				rxEng2rtt_ack,
 				rxEng2timer_resetKeepalive,
+				stateTable2rxEng_synBacklogFull,
 #if !(RX_DDR_BYPASS)
 				rxBufferWriteCmd,
 				rxEng2rxApp_notification

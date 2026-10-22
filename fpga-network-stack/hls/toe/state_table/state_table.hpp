@@ -40,4 +40,5 @@ void state_table(	stream<stateQuery>&			rxEng2stateTable_upd_req,
 					stream<sessionState>&		stateTable2rxEng_upd_rsp,
 					stream<sessionState>&		stateTable2TxApp_upd_rsp,
 					stream<sessionState>&		stateTable2txApp_rsp,
-					stream<ap_uint<16> >&		stateTable2sLookup_releaseSession);
+					stream<ap_uint<16> >&		stateTable2sLookup_releaseSession,
+					stream<bool>&				stateTable2rxEng_synBacklogFull);
