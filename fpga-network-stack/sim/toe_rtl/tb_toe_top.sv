@@ -623,7 +623,7 @@ module tb_toe_top;
   endfunction
 
   localparam bit [7:0] F_FIN = 8'h01, F_SYN = 8'h02, F_RST = 8'h04,
-                       F_PSH = 8'h08, F_ACK = 8'h10;
+                       F_PSH = 8'h08, F_ACK = 8'h10, F_ECE = 8'h40, F_CWR = 8'h80;
 
   function automatic string flags_str(input bit [7:0] f);
     string s = "";
@@ -632,6 +632,8 @@ module tb_toe_top;
     if (f & F_FIN) s = {s, "FIN,"};
     if (f & F_RST) s = {s, "RST,"};
     if (f & F_PSH) s = {s, "PSH,"};
+    if (f & F_ECE) s = {s, "ECE,"};
+    if (f & F_CWR) s = {s, "CWR,"};
     return s;
   endfunction
 
@@ -736,6 +738,18 @@ module tb_toe_top;
 
   function automatic bytes_t no_bytes();
     bytes_t e; e = new[0]; return e;
+  endfunction
+
+  // ECN codepoint of the IP header (RFC 3168): 0 Not-ECT, 2 ECT(0), 3 CE
+  function automatic bit [1:0] f_ecn(input bytes_t p); return p[1][1:0]; endfunction
+  function automatic bytes_t with_ecn(input bytes_t p, input bit [1:0] ecn);
+    bytes_t q;
+    bit [15:0] cs;
+    q = p;
+    q[1] = {p[1][7:2], ecn};
+    cs = ip_header_csum(q);
+    q[10] = cs[15:8]; q[11] = cs[7:0];
+    return q;
   endfunction
 
   function automatic bytes_t syn_options_sack();
@@ -3808,6 +3822,154 @@ module tb_toe_top;
     tb_check(f_seq(p) == peer_ack, $sformatf("%s: seq=%0d expected %0d", what, f_seq(p), peer_ack));
   endtask
 
+  // R7: ECN (RFC 3168), accepted like Linux tcp_ecn=2
+  task automatic ecn_peer_seg(input bit [7:0] flags, input bytes_t payload, input bit [1:0] ecn);
+    net_send(with_ecn(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                               peer_seq, peer_ack, flags, peer_win, no_bytes(), payload), ecn));
+  endtask
+
+  // wait for the next segment from the TOE that acknowledges `ack`
+  task automatic ecn_expect_ack(input bit [31:0] ack, input string what, output bytes_t p);
+    bit ok;
+    forever begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error($sformatf("timeout waiting for %s", what)); return; end
+      if ((f_flags(p) & F_ACK) && f_ack(p) == ack) return;
+      tb_info($sformatf("(skipping segment ack=%0d while waiting for %s)", f_ack(p), what));
+    end
+  endtask
+
+  // app write of `len` bytes that must be sent as one segment; checks ECT/CWR
+  task automatic ecn_send_data(input bit [15:0] sid, input int len, input bit exp_ect,
+                               input bit exp_cwr, input string what);
+    bytes_t p;
+    txrsp_t rsp;
+    app_send(sid, gen_payload(len, 8'h70), rsp);
+    tb_check(rsp.error == 0, $sformatf("%s: app_send accepted (err=%0d)", what, rsp.error));
+    if (rsp.error != 0) return;
+    expect_flags(F_ACK, what, p, 300000, 1);
+    if (err_count) return;
+    tb_check(f_payload_len(p) == len && f_seq(p) == peer_ack,
+             $sformatf("%s: seq=%0d len=%0d expected %0d/%0d", what, f_seq(p), f_payload_len(p), peer_ack, len));
+    tb_check(f_ecn(p) == (exp_ect ? 2'b10 : 2'b00),
+             $sformatf("%s: IP ECN=%0d expected %0d", what, f_ecn(p), exp_ect ? 2 : 0));
+    tb_check(((f_flags(p) & F_CWR) != 0) == exp_cwr,
+             $sformatf("%s: CWR=%0d expected %0d", what, (f_flags(p) & F_CWR) != 0, exp_cwr));
+    tb_check((f_flags(p) & F_ECE) == 0, $sformatf("%s: no ECE", what));
+    peer_ack += len;
+  endtask
+
+  task automatic test_ecn();
+    bytes_t p;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid, sid2;
+    txrsp_t rsp;
+    bit [31:0] recover;
+    int cwnd0;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+
+    // --- ECN-setup SYN (ECE+CWR) -> ECN-setup SYN-ACK (ECE, no CWR), Not-ECT
+    peer_port = 16'd42500; toe_port = 16'd80;
+    peer_seq = 32'h2000_0000; peer_win = 16'hFFFF;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port, peer_seq, 0,
+                      F_SYN | F_ECE | F_CWR, 16'hFFFF, syn_options(1), no_bytes()));
+    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 50000, 1);
+    if (err_count) return;
+    tb_check((f_flags(p) & F_ECE) != 0, "SYN-ACK has ECE (ECN accepted)");
+    tb_check((f_flags(p) & F_CWR) == 0, "SYN-ACK has no CWR");
+    tb_check(f_ecn(p) == 0, "SYN-ACK is Not-ECT");
+    peer_ack = f_seq(p) + 1;
+    peer_seq += 1;
+    peer_send_seg(F_ACK, no_bytes());
+    // first data from the peer gives us the session id
+    ecn_peer_seg(F_ACK, gen_payload(16, 8'h01), 2'b10);
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "first data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 16;
+    ecn_expect_ack(peer_seq, "ACK of first data", p);
+    if (err_count) return;
+    tb_check((f_flags(p) & F_ECE) == 0, "no ECE without a CE mark");
+    tb_check(f_ecn(p) == 0, "pure ACK is Not-ECT");
+    flush_net(2000);
+
+    // --- receiver: CE mark -> immediate ACK with ECE, kept until CWR
+    ecn_peer_seg(F_ACK, gen_payload(100, 8'h02), 2'b11);
+    peer_seq += 100;
+    wait_pkt(p, 3000, ok);   // quick ACK, well before the delayed-ACK timer
+    tb_check(ok, "immediate ACK for the CE-marked segment");
+    if (!ok) return;
+    tb_check(f_ack(p) == peer_seq && (f_flags(p) & F_ECE) != 0,
+             $sformatf("CE ACK: ack=%0d ECE=%0d", f_ack(p), (f_flags(p) & F_ECE) != 0));
+    tb_check(f_ecn(p) == 0, "ECE ACK is Not-ECT");
+    ecn_peer_seg(F_ACK, gen_payload(100, 8'h03), 2'b10);
+    peer_seq += 100;
+    ecn_expect_ack(peer_seq, "ACK after CE, before CWR", p);
+    if (err_count) return;
+    tb_check((f_flags(p) & F_ECE) != 0, "ECE repeated until the peer sends CWR");
+    ecn_peer_seg(F_ACK | F_CWR, gen_payload(100, 8'h04), 2'b10);
+    peer_seq += 100;
+    ecn_expect_ack(peer_seq, "ACK of the CWR segment", p);
+    if (err_count) return;
+    tb_check((f_flags(p) & F_ECE) == 0, "ECE stops after CWR");
+    flush_net(2000);
+
+    // --- sender: data is ECT(0); ECE halves cwnd once per window, CWR follows
+    // (an oversized write is refused with the usable window = cwnd here)
+    app_send(sid, gen_payload(60000, 8'h80), rsp);
+    tb_check(rsp.error != 0, "60000B write refused (window probe)");
+    cwnd0 = rsp.remaining_space;
+    tb_info($sformatf("cwnd before the ECE = %0d", cwnd0));
+    ecn_send_data(sid, 1000, 1, 0, "D1");
+    if (err_count) return;
+    ecn_peer_seg(F_ACK | F_ECE, no_bytes(), 2'b00);
+    recover = peer_ack;
+    repeat (500) @(posedge ap_clk);
+    app_send(sid, gen_payload(60000, 8'h80), rsp);
+    tb_check(rsp.error != 0, "60000B write refused (window probe)");
+    tb_check(rsp.remaining_space == cwnd0 / 2,
+             $sformatf("usable window after ECE = %0d expected %0d", rsp.remaining_space, cwnd0 / 2));
+    ecn_send_data(sid, 1000, 1, 1, "D2 (first data after the reduction)");
+    if (err_count) return;
+    // ECE echoed for data sent before our CWR (ACK up to the recover point):
+    // within the hold, no new reduction
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port, peer_seq, recover,
+                      F_ACK | F_ECE, peer_win, no_bytes(), no_bytes()));
+    repeat (500) @(posedge ap_clk);
+    ecn_send_data(sid, 1000, 1, 0, "D3 (ECE inside the hold window)");
+    if (err_count) return;
+    // ECE beyond the recover point: a new congestion event
+    ecn_peer_seg(F_ACK | F_ECE, no_bytes(), 2'b00);
+    repeat (500) @(posedge ap_clk);
+    ecn_send_data(sid, 1000, 1, 1, "D4 (after a second ECE window)");
+    if (err_count) return;
+    peer_send_seg(F_ACK, no_bytes());
+    repeat (500) @(posedge ap_clk);
+    flush_net(2000);
+
+    // --- a peer without ECN: no ECE on the SYN-ACK, Not-ECT data, CE ignored
+    notif_q.delete();   // unread data notifications of the first session
+    do_passive_handshake(16'd80, 16'd42501, 32'h3000_0000);
+    if (err_count) return;
+    ecn_peer_seg(F_ACK, gen_payload(16, 8'h05), 2'b11);
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "non-ECN session data notification");
+    if (!ok) return;
+    sid2 = n.sessionID;
+    peer_seq += 16;
+    ecn_expect_ack(peer_seq, "ACK on the non-ECN session", p);
+    if (err_count) return;
+    tb_check((f_flags(p) & F_ECE) == 0, "non-ECN session: CE mark not echoed");
+    flush_net(2000);
+    ecn_send_data(sid2, 500, 0, 0, "non-ECN session data");
+    peer_send_seg(F_ACK, no_bytes());
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   task automatic test_challenge_ack();
     bytes_t p;
     bit ok;
@@ -4464,6 +4626,7 @@ module tb_toe_top;
       "synack_giveup"  : test_synack_giveup();
       "simultaneous_open": test_simultaneous_open();
       "simopen_giveup" : test_simopen_giveup();
+      "ecn"            : test_ecn();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 

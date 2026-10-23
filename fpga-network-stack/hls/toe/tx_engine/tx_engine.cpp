@@ -62,7 +62,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				hls::stream<txTxSarQuery>&				txEng2txSar_upd_req,
 				hls::stream<txRetransmitTimerSet>&		txEng2timer_setRetransmitTimer,
 				hls::stream<ap_uint<16> >&				txEng2timer_setProbeTimer,
-				hls::stream<ap_uint<16> >&				txEng_ipMetaFifoOut,
+				hls::stream<ap_uint<17> >&				txEng_ipMetaFifoOut, //[15:0] TCP length - 20, [16] ECT
 				hls::stream<tx_engine_meta>&			txEng_tcpMetaFifoOut,
 				hls::stream<mmCmd>&						txBufferReadCmd,
 				hls::stream<ap_uint<16> >&				txEng2sLookup_rev_req,
@@ -196,6 +196,14 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.sack2 = 0;
 				meta.ts = rxSar.tsEnabled;
 				meta.tsEcr = rxSar.tsRecent;
+				// ECN: echo a pending CE mark; the first new data segment
+				// after a cwnd reduction carries CWR (RFC 3168 6.1.2)
+				meta.ece = rxSar.ecePending;
+				meta.cwr = ml_sarLoaded ? false : txSar.cwrPending;
+				ap_uint<17> ipMetaEct = 0;
+				ipMetaEct[16] = txSar.ecnEnabled;
+				txTxSarQuery sndUpd(ml_curEvent.sessionID, txSar.not_ackd + ml_curEvent.length, 1);
+				sndUpd.cwrClear = meta.cwr;
 
 				if (ml_curEvent.length <= sessionMSS)
 				{
@@ -210,14 +218,14 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 						txEng2timer_setProbeTimer.write(ml_curEvent.sessionID);
 					}
 
-					txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID, txSar.not_ackd + ml_curEvent.length, 1));
+					txEng2txSar_upd_req.write(sndUpd);
 					//This state is always left
 					ml_FsmState = 0;
 
 					// Send a packet only if there is data or we want to send an empty probing message
 					if (meta.length != 0)
 					{
-						txEng_ipMetaFifoOut.write(meta.length + (meta.ts ? 12 : 0));
+						txEng_ipMetaFifoOut.write(ipMetaEct | (meta.length + (meta.ts ? 12 : 0)));
 						txEng_tcpMetaFifoOut.write(meta);
 						txEng_isLookUpFifoOut.write(true);
 						txEng_isDDRbypass.write(1);
@@ -246,13 +254,13 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 
 					if (ml_segOffset == 0)
 					{
-						txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID, txSar.not_ackd + ml_curEvent.length, 1));
+						txEng2txSar_upd_req.write(sndUpd);
 						// RTT sample: measurement completes when the whole write is ACKed
 						txEng2rtt_event.write(rttEvent(ml_curEvent.sessionID, txSar.not_ackd + ml_curEvent.length, 0));
 					}
 
 					txBufferReadCmd.write(mmCmd(pkgAddr, meta.length));
-					txEng_ipMetaFifoOut.write(meta.length + (meta.ts ? 12 : 0));
+					txEng_ipMetaFifoOut.write(ipMetaEct | (meta.length + (meta.ts ? 12 : 0)));
 					txEng_tcpMetaFifoOut.write(meta);
 					txEng_isLookUpFifoOut.write(true);
 					txEng_isDDRbypass.write((ml_segOffset == 0) ? (ap_uint<2>)2 : (ap_uint<2>)0);
@@ -320,6 +328,11 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.ts = rxSar.tsEnabled;
 				meta.tsEcr = rxSar.tsRecent;
 				meta.length = 0;
+				// ECN (see the TCP_NODELAY path)
+				meta.ece = rxSar.ecePending;
+				meta.cwr = ml_sarLoaded ? false : txSar.cwrPending;
+				ap_uint<17> ipMetaEct = 0;
+				ipMetaEct[16] = txSar.ecnEnabled;
 
 				currLength = (txSar.app - ((ap_uint<WINDOW_BITS>)txSar.not_ackd));
 				// Construct address before modifying txSar.not_ackd
@@ -367,7 +380,10 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 						}
 //#endif
 						// Write back txSar not_ackd pointer
-						txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID, txSar.not_ackd, 1));
+						txTxSarQuery sndUpd(ml_curEvent.sessionID, txSar.not_ackd, 1);
+						// CWR went out on the first segment of this event
+						sndUpd.cwrClear = txSar.cwrPending && (ml_sarLoaded || meta.length != 0);
+						txEng2txSar_upd_req.write(sndUpd);
 					}
 				}
 				else
@@ -391,7 +407,10 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 						}
 						// Set probe Timer to try again later
 						txEng2timer_setProbeTimer.write(ml_curEvent.sessionID);
-						txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID, txSar.not_ackd, 1));
+						txTxSarQuery sndUpd(ml_curEvent.sessionID, txSar.not_ackd, 1);
+						// CWR went out on the first segment of this event
+						sndUpd.cwrClear = txSar.cwrPending && (ml_sarLoaded || meta.length != 0);
+						txEng2txSar_upd_req.write(sndUpd);
 						ml_FsmState = 0;
 					}
 				}
@@ -403,7 +422,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				// Send a packet only if there is data or we want to send an empty probing message
 				if (meta.length != 0)// || ml_curEvent.retransmit) //TODO retransmit boolean currently not set, should be removed
 				{
-					txEng_ipMetaFifoOut.write(meta.length + (meta.ts ? 12 : 0));
+					txEng_ipMetaFifoOut.write(ipMetaEct | (meta.length + (meta.ts ? 12 : 0)));
 					txEng_tcpMetaFifoOut.write(meta);
 					txEng_isLookUpFifoOut.write(true);
 					txEng2sLookup_rev_req.write(ml_curEvent.sessionID);
@@ -507,6 +526,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.sack2 = 0;
 				meta.ts = rxSar.tsEnabled;
 				meta.tsEcr = rxSar.tsRecent;
+				meta.ece = rxSar.ecePending; //retransmissions/ACKs/FINs: Not-ECT, no CWR
+				meta.cwr = 0;
 
 				ml_sarLoaded = true;
 				txSarReg = txSar;
@@ -535,6 +556,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.sack2 = 0;
 				meta.ts = rxSar.tsEnabled;
 				meta.tsEcr = rxSar.tsRecent;
+				meta.ece = rxSar.ecePending; //retransmissions/ACKs/FINs: Not-ECT, no CWR
+				meta.cwr = 0;
 				// RFC 2018: advertise the buffered out-of-order ranges as
 				// SACK blocks while receive gaps are open (up to two blocks)
 				if (rxSar.gap && rxSar.sackEnabled)
@@ -603,6 +626,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.sack = 1; // offer SACK-Permitted (RFC 2018)
 				meta.sack2 = 0;
 				meta.ts = 0;
+				meta.ece = 0; //ECN is never requested (cf. Linux tcp_ecn=2)
+				meta.cwr = 0;
 #if (WINDOW_SCALE)
 				meta.length = 12; // MSS(4) + SACKperm(2) + WS(3) + padding(3)
 				meta.win_shift = WINDOW_SCALE_BITS;
@@ -699,6 +724,9 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				{
 					meta.length = 20;
 				}
+				// ECN-setup SYN-ACK (RFC 3168 6.1.1): ECE set, CWR clear
+				meta.ece = rxSar.ecnEnabled;
+				meta.cwr = 0;
 
 				txEng_ipMetaFifoOut.write(meta.length);
 				txEng_tcpMetaFifoOut.write(meta);
@@ -750,6 +778,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.sack2 = 0;
 				meta.ts = rxSar.tsEnabled;
 				meta.tsEcr = rxSar.tsRecent;
+				meta.ece = rxSar.ecePending; //retransmissions/ACKs/FINs: Not-ECT, no CWR
+				meta.cwr = 0;
 
 				// Check if retransmission, in case of RT, we have to reuse not_ackd number
 				if (ml_curEvent.rt_count != 0)
@@ -1055,7 +1085,7 @@ void tupleSplitter(	stream<fourTuple>&		sLookup2txEng_rev_rsp,
 //IMPORT INSTEAD of COPY //TODO or move to IP Output Handler
 template <int WIDTH>
 void generate_ipv4( //stream<ipv4Meta>&    txEng_ipMetaDataFifoIn,
-			stream<ap_uint<16> >&				txEng_ipMetaDataFifoIn,
+			stream<ap_uint<17> >&				txEng_ipMetaDataFifoIn,
 			stream<twoTuple>&				txEng_ipTupleFifoIn,
           stream<net_axis<WIDTH> >&  tx_shift2ipv4Fifo,
           stream<net_axis<WIDTH> >&  m_axis_tx_data)
@@ -1075,7 +1105,8 @@ void generate_ipv4( //stream<ipv4Meta>&    txEng_ipMetaDataFifoIn,
 	if (!txEng_ipMetaDataFifoIn.empty() && !txEng_ipTupleFifoIn.empty())
     {
       //txEng_ipMetaDataFifoIn.read();
-	  ap_uint<16> metaLength = txEng_ipMetaDataFifoIn.read();
+	  ap_uint<17> ipMeta = txEng_ipMetaDataFifoIn.read();
+	  ap_uint<16> metaLength = ipMeta(15, 0);
 	  twoTuple tuples = txEng_ipTupleFifoIn.read();
       header.clear();
 
@@ -1086,6 +1117,8 @@ void generate_ipv4( //stream<ipv4Meta>&    txEng_ipMetaDataFifoIn,
       header.setDstAddr(tuples.dstIp);
       header.setSrcAddr(tuples.srcIp);
       header.setProtocol(TCP_PROTOCOL);
+      // ECN-capable transport, ECT(0), on new data of an ECN session
+      header.setECN(ipMeta[16] ? 2 : 0);
       if (IPV4_HEADER_SIZE >= WIDTH)
       {
 		// std::cout << "switched to IP HEADER" << std::endl;
@@ -1362,6 +1395,8 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 			header.setSynFlag(meta.syn);
 			header.setRstFlag(meta.rst);
 			header.setAckFlag(meta.ack);
+			header.setEceFlag(meta.ece);
+			header.setCwrFlag(meta.cwr);
 
 			hasBody = meta.length != 0 && !meta.syn;
 			isSYN = meta.syn;
@@ -2218,7 +2253,7 @@ void tx_engine(	stream<extendedEvent>&			eventEng2txEng_event,
 
 	// Memory Read delay around 76 cycles, 10 cycles/packet, so keep meta of at least 8 packets
 	//static stream<tx_engine_meta>		txEng_metaDataFifo("txEng_metaDataFifo");
-	static stream<ap_uint<16> >			txEng_ipMetaFifo("txEng_ipMetaFifo");
+	static stream<ap_uint<17> >			txEng_ipMetaFifo("txEng_ipMetaFifo");
 	static stream<tx_engine_meta>		txEng_tcpMetaFifo("txEng_tcpMetaFifo");
 	//#pragma HLS stream variable=txEng_metaDataFifo depth=16
 	#pragma HLS stream variable=txEng_ipMetaFifo depth=32

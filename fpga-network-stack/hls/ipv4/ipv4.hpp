@@ -649,6 +649,15 @@ public:
 	{
 		return header(3, 0);
 	}
+	// ECN codepoint (RFC 3168): the two low-order bits of the TOS byte
+	void setECN(const ap_uint<2> ecn)
+	{
+		header(9, 8) = ecn;
+	}
+	ap_uint<2> getECN()
+	{
+		return header(9, 8);
+	}
 };
 
 template <int WIDTH>

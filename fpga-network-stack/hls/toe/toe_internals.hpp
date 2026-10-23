@@ -83,6 +83,14 @@ static const ap_uint<32> TIME_120s		= (120000000.0/0.0064/MAX_SESSIONS/TCP_SIM_T
 // the body yet.
 #define TCP_TS_OPTION (DATA_WIDTH <= 256)
 
+// ECN (RFC 3168), like Linux' default tcp_ecn=2: accepted when the peer's SYN
+// requests it (ECE+CWR), never requested on our own SYNs. Data segments are
+// then sent ECT(0), a CE mark is echoed with ECE until the peer's CWR, and an
+// ECE halves cwnd once per window of data.
+#ifndef TCP_ECN_ACCEPT
+#define TCP_ECN_ACCEPT 1
+#endif
+
 // Modulo-2^32 TCP sequence number comparisons (RFC 793 / RFC 1982 style).
 // Valid as long as the two values are less than 2^31 apart.
 inline bool seq_lt (ap_uint<32> a, ap_uint<32> b) { return ((ap_int<32>)(ap_uint<32>)(a - b)) < 0; }
@@ -177,6 +185,10 @@ struct rxSarEntry
 	//receiver SWS avoidance (RFC 1122 4.2.3.3): the advertised right window
 	//edge only advances in steps of at least one MSS
 	ap_uint<32> advEdge;
+	//ECN (RFC 3168) receiver side: negotiated, and a CE mark is waiting to
+	//be echoed (ECE on every outgoing segment until the peer sends CWR)
+	bool ecnEnabled;
+	bool ecePending;
 };
 
 struct rxSarReply
@@ -197,12 +209,14 @@ struct rxSarReply
 	bool		sackEnabled;
 	bool		tsEnabled;
 	ap_uint<32>	tsRecent; //echoed as TSecr on outgoing segments
+	bool		ecnEnabled;
+	bool		ecePending;
 	rxSarReply() {}
 	rxSarReply(rxSarEntry entry)
 #if !(WINDOW_SCALE)
-		:recvd(entry.recvd), head(entry.head), offset(entry.offset), gap(entry.gap), head2(entry.head2), offset2(entry.offset2), gap2(entry.gap2), sackEnabled(entry.sackEnabled), tsEnabled(entry.tsEnabled), tsRecent(entry.tsRecent) {}
+		:recvd(entry.recvd), head(entry.head), offset(entry.offset), gap(entry.gap), head2(entry.head2), offset2(entry.offset2), gap2(entry.gap2), sackEnabled(entry.sackEnabled), tsEnabled(entry.tsEnabled), tsRecent(entry.tsRecent), ecnEnabled(entry.ecnEnabled), ecePending(entry.ecePending) {}
 #else
-		:recvd(entry.recvd), win_shift(entry.win_shift), head(entry.head), offset(entry.offset), gap(entry.gap), head2(entry.head2), offset2(entry.offset2), gap2(entry.gap2), sackEnabled(entry.sackEnabled), tsEnabled(entry.tsEnabled), tsRecent(entry.tsRecent) {}
+		:recvd(entry.recvd), win_shift(entry.win_shift), head(entry.head), offset(entry.offset), gap(entry.gap), head2(entry.head2), offset2(entry.offset2), gap2(entry.gap2), sackEnabled(entry.sackEnabled), tsEnabled(entry.tsEnabled), tsRecent(entry.tsRecent), ecnEnabled(entry.ecnEnabled), ecePending(entry.ecePending) {}
 #endif
 };
 
@@ -215,6 +229,9 @@ struct rxSarRecvd
 	bool		tsEnabled;   //only valid on init (RFC 7323)
 	ap_uint<1>	tsWrite;     //update tsRecent with the value below
 	ap_uint<32>	tsRecent;
+	bool		ecnEnabled = false; //only valid on init (RFC 3168)
+	ap_uint<1>	eceWrite = 0;       //update ecePending with the value below
+	bool		ece = false;
 	ap_uint<1> write;
 	ap_uint<1> init;
 	ap_uint<32> head;
@@ -280,6 +297,12 @@ struct txSarEntry
 	ap_uint<32>	peerSackStart2;
 	ap_uint<32>	peerSackEnd2;
 	bool		peerSackValid2;
+	//ECN (RFC 3168) sender side: negotiated; CWR owed on the next new data
+	//segment; one reduction per window (hold until snd_una passes recover)
+	bool		ecnEnabled;
+	bool		cwrPending;
+	bool		ecnHold;
+	ap_uint<32>	ecnRecover;
 };
 
 struct rxTxSarQuery
@@ -304,6 +327,11 @@ struct rxTxSarQuery
 	ap_uint<32>	peerSackStart2;
 	ap_uint<32>	peerSackEnd2;
 	ap_uint<1>	peerSackValid2;
+	bool		ecnEnabled = false; //only valid on init
+	ap_uint<1>	ecnUpdate = 0;      //write ecnHold (and on ecnReduce the CWR state)
+	bool		ecnHold = false;
+	ap_uint<1>	ecnReduce = 0;      //cwnd was reduced for an ECE: owe CWR, hold until ecnRecover
+	ap_uint<32>	ecnRecover = 0;
 	ap_uint<1> write;
 	ap_uint<1>	init;
 	rxTxSarQuery () {}
@@ -328,6 +356,7 @@ struct txTxSarQuery
 	bool		finReady;
 	bool		finSent;
 	bool		isRtQuery;
+	ap_uint<1>	cwrClear = 0; //the CWR flag went out on this transmission
 	txTxSarQuery() {}
 	txTxSarQuery(ap_uint<16> id)
 				:sessionID(id), not_ackd(0), write(0), init(0), finReady(false), finSent(false), isRtQuery(false) {}
@@ -384,6 +413,9 @@ struct rxTxSarReply
 	ap_uint<32>	peerSackStart2;
 	ap_uint<32>	peerSackEnd2;
 	bool		peerSackValid2;
+	bool		ecnEnabled = false;
+	bool		ecnHold = false;
+	ap_uint<32>	ecnRecover = 0;
 	rxTxSarReply() {}
 	rxTxSarReply(ap_uint<32> ack, ap_uint<32> next, ap_uint<WINDOW_BITS> cong_win, ap_uint<WINDOW_BITS> sstresh, ap_uint<2> count, bool fastRetransmitted)
 			:prevAck(ack), nextByte(next), cong_window(cong_win), slowstart_threshold(sstresh), count(count), fastRetransmitted(fastRetransmitted), mss(MSS), ca_acc(0), peerSackStart(0), peerSackEnd(0), peerSackValid(false) {}
@@ -457,6 +489,8 @@ struct txTxSarReply
 	ap_uint<32>	peerSackStart2;
 	ap_uint<32>	peerSackEnd2;
 	bool		peerSackValid2;
+	bool		ecnEnabled = false;
+	bool		cwrPending = false;
 	txTxSarReply() {}
 	txTxSarReply(ap_uint<32> ack, ap_uint<32> nack, ap_uint<WINDOW_BITS> usableWindow, ap_uint<WINDOW_BITS> app, ap_uint<WINDOW_BITS> usedLength, bool finReady, bool finSent)
 		:ackd(ack), not_ackd(nack), usableWindow(usableWindow), app(app), usedLength(usedLength), finReady(finReady), finSent(finSent), mss(MSS) {}
@@ -772,6 +806,22 @@ public:
 	void setFinFlag(ap_uint<1> flag)
 	{
 		header[200] = flag;
+	}
+	ap_uint<1> getEceFlag()
+	{
+		return header[206];
+	}
+	void setEceFlag(ap_uint<1> flag)
+	{
+		header[206] = flag;
+	}
+	ap_uint<1> getCwrFlag()
+	{
+		return header[207];
+	}
+	void setCwrFlag(ap_uint<1> flag)
+	{
+		header[207] = flag;
 	}
 	void setWindowSize(const ap_uint<16>& size)
 	{

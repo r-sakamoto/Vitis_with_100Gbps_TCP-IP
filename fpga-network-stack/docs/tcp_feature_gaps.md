@@ -19,11 +19,11 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | 機能 | 現状 | Linux | 優先度 |
 |---|---|---|---|
 | MSSオプション(受信) | **実装済** (F4+P1, `mss_option`/`tx_segmentation`テスト): 実効MSS=min(peer,local)をセッション毎に保存し、初送・再送ともMSS超過書込みをDDR読出しで分割送信(バイパス複製ストリームは破棄モードで整合)。PMTUDは未 | 相手MSSとPMTUからMSSを決定 | ★(残: PMTUD) |
-| Window Scale(受信) | SYN時のみパース。**自側shiftは0か2の固定** (`rx_engine.cpp:1366,1429`)。相手shiftは**14超の値を無検証で格納** → `tx_sar_table.cpp:121` でビット範囲オーバーフロー(issue #42) | shift 0〜14を交渉、バッファサイズから導出 | ★★★ |
+| Window Scale(受信) | **対応済**: 自側shiftはバッファサイズから導出した`WINDOW_SCALE_BITS`(256KB→2、相手がWSを出さなければ0)。相手shiftの14超クランプはB5で修正済(`opt_parser_robust`テスト) | shift 0〜14を交渉、バッファサイズから導出 | 完了 |
 | SACK / SACK-Permitted | **実装済** (S1+S2+M1+C2, `sack_rx_gen`/`sack_selective_rtx`/`multi_gap_sack`/`sack_multi_rtx`テスト): 交渉+最大2ブロックのSACK生成(TS共存で32Bオプション)+相手SACK最大2ブロックの解釈と選択的再送(スキップ2ラウンド+2重クランプで順不同ブロック対応)。D-SACKは未 | あり(選択再送・D-SACK) | ★(残: D-SACK) |
 | Timestamps (RFC 7323) | **実装済** (T1, `ts_negotiate`/`paws_drop`テスト): SYN/SYN-ACKでTS交渉(常時提示/条件エコー)、全セグメント(データ含む)にNOP NOP TS 12B付与、64bitデータパスでボディを4Bシフト。TS.Recent追跡+PAWSで旧タイムスタンプのセグメントを破棄しdup ACK応答。実効MSSは-12B。TSval=~0.84ms粒度のフリーランカウンタ。RTT計測は既存rtt_estimator(Karn)のまま(TSecrベースRTTは未)。512bitデータパスはTS無効(TCP_TS_OPTIONゲート) | あり | 完了 |
-| ECN (ECE/CWR/ECT) | **なし**。フラグは常時0固定 (`toe_internals.hpp:522`) | あり | ★ |
-| オプションパーサの正当性 | dataOffsetの単位バグ(ワード vs バイト混在, issue #43)、不正オプション列でRXパイプラインがストールし得る (`rx_engine.cpp:645-700,730-738`) | — | ★★★(バグ修正) |
+| ECN (ECE/CWR/ECT) | **実装済** (R7, `ecn`テスト, Linux tcp_ecn=2相当): ECE+CWR付きSYNにのみECN-setup SYN-ACK(ECE)で応答し、自側SYNでは要求しない(`TCP_ECN_ACCEPT`)。ECNセッションでは新規データのみECT(0)(再送・純ACK・SYN/FIN・keepaliveはNot-ECT)。受信側はCEマーク付きデータで即時ACK+以後のACKにECEを付与しCWR受信で停止。送信側はECE受信でssthresh=max(cwnd/2,2MSS)、cwnd=ssthreshとし、次の新規データにCWR。削減は1ウィンドウ1回(snd_nxtまでのACKはhold)、ファストリカバリ中は削減しない。PRRによる漸減は未 | あり | 完了 |
+| オプションパーサの正当性 | **修正済** (B5, `opt_parser_robust`テスト): dataOffset単位バグ(issue #43)・len=0オプションでの停止を修正 | — | 完了 |
 | PSH / URG | PSHは常に0、URG・緊急ポインタ未対応 | あり | ★ |
 
 ## 2. 再送・RTT・輻輳制御(RFC 6298 / 5681)

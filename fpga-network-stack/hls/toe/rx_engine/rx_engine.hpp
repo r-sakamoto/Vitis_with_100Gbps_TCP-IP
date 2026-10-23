@@ -75,6 +75,9 @@ struct rxEngineMetaData
 	ap_uint<1>	rst;
 	ap_uint<1>	syn;
 	ap_uint<1>	fin;
+	ap_uint<1>	ece; //ECN-Echo flag (RFC 3168)
+	ap_uint<1>	cwr; //Congestion Window Reduced flag
+	ap_uint<1>	ce;  //the IP header carried the CE codepoint
 	ap_uint<4>	dataOffset;
 	//ap_uint<16> dstPort;
 };

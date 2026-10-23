@@ -107,12 +107,17 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 	else if(!rxEng2rxSar_upd_req.empty())
 	{
 		rxSarRecvd in_recvd = rxEng2rxSar_upd_req.read();
-		if (in_recvd.write || in_recvd.tsWrite)
+		if (in_recvd.write || in_recvd.tsWrite || in_recvd.eceWrite)
 		{
 			if (in_recvd.tsWrite)
 			{
 				//RFC 7323: advance TS.Recent (also possible on pure ACKs)
 				rx_table[in_recvd.sessionID].tsRecent = in_recvd.tsRecent;
+			}
+			if (in_recvd.eceWrite)
+			{
+				//RFC 3168: CE received / CWR received
+				rx_table[in_recvd.sessionID].ecePending = in_recvd.ece;
 			}
 			if (in_recvd.write)
 			{
@@ -128,6 +133,8 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 					rx_table[in_recvd.sessionID].appd = in_recvd.recvd;
 					rx_table[in_recvd.sessionID].sackEnabled = in_recvd.sackEnabled;
 					rx_table[in_recvd.sessionID].tsEnabled = in_recvd.tsEnabled;
+					rx_table[in_recvd.sessionID].ecnEnabled = in_recvd.ecnEnabled;
+					rx_table[in_recvd.sessionID].ecePending = false;
 					//initial advertised edge: the whole (empty) buffer
 					rx_table[in_recvd.sessionID].advEdge = in_recvd.recvd + (BUFFER_SIZE - 1);
 #if (WINDOW_SCALE)

@@ -37,6 +37,7 @@ template <int WIDTH>
 void toe_process_ipv4(	stream<net_axis<WIDTH> >&		dataIn,
 					stream<ap_uint<4> >&	process2dropLengthFifo,
 					stream<pseudoMeta>&		metaOut,
+					stream<ap_uint<1> >&	ceOut,
 					stream<net_axis<WIDTH> >&		dataOut)
 {
 #pragma HLS INLINE off
@@ -64,6 +65,9 @@ void toe_process_ipv4(	stream<net_axis<WIDTH> >&		dataIn,
 				#endif
 				process2dropLengthFifo.write(header.getHeaderLength() - headerWordsDropped);
 				metaOut.write(pseudoMeta(header.getSrcAddr(), header.getDstAddr(), header.getLength() - (header.getHeaderLength()*4)));
+				// ECN (RFC 3168): Congestion Experienced codepoint, one entry
+				// per packet for processPseudoHeader
+				ceOut.write(header.getECN() == 3);
 				metaWritten = true;
 			}
 		}
@@ -427,6 +431,7 @@ template <int WIDTH>
 void processPseudoHeader(stream<net_axis<WIDTH> >&					dataIn,
 							stream<net_axis<WIDTH> >&				dataOut,
 							stream<bool>&					validFifoIn,
+							stream<ap_uint<1> >&			ceFifoIn,
 							stream<rxEngineMetaData>&		metaDataFifoOut,
 							stream<fourTuple>&				tupleFifoOut,
 							stream<ap_uint<16> >&			portTableOut,
@@ -439,8 +444,9 @@ void processPseudoHeader(stream<net_axis<WIDTH> >&					dataIn,
 	static bool firstWord = true;
 	static bool pkgValid = false;
 	static bool metaWritten = false;
+	static ap_uint<1> pkgCe = 0;
 
-	if (!dataIn.empty() && (!firstWord || !validFifoIn.empty()))
+	if (!dataIn.empty() && (!firstWord || (!validFifoIn.empty() && !ceFifoIn.empty())))
 	{
 		net_axis<WIDTH> word = dataIn.read();
 		// std::cout << "PROCESS TCP: ";
@@ -450,6 +456,7 @@ void processPseudoHeader(stream<net_axis<WIDTH> >&					dataIn,
 		if (firstWord)
 		{
 			validFifoIn.read(pkgValid);
+			ceFifoIn.read(pkgCe);
 			firstWord = false;
 		}
 
@@ -475,6 +482,9 @@ void processPseudoHeader(stream<net_axis<WIDTH> >&					dataIn,
 				meta.rst = header.getRstFlag();
 				meta.syn = header.getSynFlag();
 				meta.fin = header.getFinFlag();
+				meta.ece = header.getEceFlag();
+				meta.cwr = header.getCwrFlag();
+				meta.ce = pkgCe;
 				meta.dataOffset = header.getDataOffset();
 				if (pkgValid)
 				{
@@ -1208,6 +1218,13 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				bool tsUpdate = rxSar.tsEnabled && fsm_meta.meta.tsValid && !pawsReject
 						&& seq_geq(fsm_meta.meta.tsVal, rxSar.tsRecent)
 						&& seq_leq(fsm_meta.meta.seqNumb, rxSar.recvd);
+				// RFC 3168 6.1.3: a CE mark on a data segment is echoed with
+				// ECE until the peer confirms it with CWR
+				bool ceMark = rxSar.ecnEnabled && fsm_meta.meta.ce && (fsm_meta.meta.length != 0);
+				bool eceNext = ceMark || (rxSar.ecePending && !fsm_meta.meta.cwr);
+				bool eceChange = rxSar.ecnEnabled && (eceNext != rxSar.ecePending);
+				// the first CE mark is acknowledged at once (cf. Linux quickack)
+				bool ceQuickAck = ceMark && !rxSar.ecePending;
 				// RFC 5961 5.2 ACK validation in the synchronized states:
 				// SND.UNA - MAX.SND.WND <= SEG.ACK <= SND.NXT. An ACK for data
 				// never sent (RFC 793) or one too old to belong to this
@@ -1254,6 +1271,17 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					// per-session effective MSS for congestion arithmetic
 					ap_uint<16> sessMSS = (txSar.mss == 0) ? (ap_uint<16>)MSS : txSar.mss;
 					bool enterFastRecovery = false;
+					// RFC 3168 6.1.2: an ECE halves cwnd (ssthresh = max(cwnd/2,
+					// 2*MSS), cwnd = ssthresh) at most once per window of data,
+					// and not while loss recovery already reduced it. Derived
+					// from the cwnd before this ACK's growth, in parallel. The
+					// hold covers ACKs up to and including snd_nxt at the
+					// reduction: those were sent before our CWR reached the peer.
+					bool ecnHoldNow = txSar.ecnHold && seq_leq(fsm_meta.meta.ackNumb, txSar.ecnRecover);
+					bool ecnReduce = txSar.ecnEnabled && fsm_meta.meta.ece && !ecnHoldNow
+							&& !txSar.fastRetransmitted && (txSar.count != 2);
+					ap_uint<WINDOW_BITS> ecnHalf = txSar.cong_window >> 1;
+					ap_uint<WINDOW_BITS> ecnSsthresh = (ecnHalf > (ap_uint<WINDOW_BITS>)(2*sessMSS)) ? ecnHalf : (ap_uint<WINDOW_BITS>)(2*sessMSS);
 					// track the peer's latest SACK blocks (RFC 2018, up to two)
 					ap_uint<32> newPeerSackStart = txSar.peerSackStart;
 					ap_uint<32> newPeerSackEnd = txSar.peerSackEnd;
@@ -1350,6 +1378,12 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						txSar.fastRetransmitted = false;
 					}
 					// else: stale ACK (older than snd_una) - ignore for congestion state
+					if (ecnReduce)
+					{
+						txSar.slowstart_threshold = ecnSsthresh;
+						txSar.cong_window = ecnSsthresh;
+						txSar.ca_acc = 0;
+					}
 					// TX SAR
 					// mod-2^32 form of "snd_una <= ack <= snd_nxt" (replaces the
 					// hand-rolled two-case wrap check)
@@ -1357,8 +1391,12 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					{
 						rxTxSarQuery txSarUpd(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, txSar.count, ((txSar.count == 3) || txSar.fastRetransmitted));
 						txSarUpd.ssthresh = txSar.slowstart_threshold;
-						txSarUpd.writeSsthresh = enterFastRecovery;
+						txSarUpd.writeSsthresh = enterFastRecovery || ecnReduce;
 						txSarUpd.ca_acc = enterFastRecovery ? (ap_uint<WINDOW_BITS>)0 : txSar.ca_acc;
+						txSarUpd.ecnUpdate = 1;
+						txSarUpd.ecnHold = ecnHoldNow || ecnReduce;
+						txSarUpd.ecnReduce = ecnReduce;
+						txSarUpd.ecnRecover = txSar.nextByte;
 						txSarUpd.peerSackStart = newPeerSackStart;
 						txSarUpd.peerSackEnd = newPeerSackEnd;
 						txSarUpd.peerSackValid = newPeerSackValid;
@@ -1380,11 +1418,13 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					}
 					// pure ACK: persist the TS.Recent advance here (segments
 					// with payload carry it on their rxSar update below)
-					if (tsUpdate && fsm_meta.meta.length == 0)
+					if ((tsUpdate || eceChange) && fsm_meta.meta.length == 0)
 					{
 						rxSarRecvd tsOnlyUpd(fsm_meta.sessionID);
-						tsOnlyUpd.tsWrite = 1;
+						tsOnlyUpd.tsWrite = tsUpdate;
 						tsOnlyUpd.tsRecent = fsm_meta.meta.tsVal;
+						tsOnlyUpd.eceWrite = eceChange;
+						tsOnlyUpd.ece = eceNext;
 						rxEng2rxSar_upd_req.write(tsOnlyUpd);
 					}
 
@@ -1540,6 +1580,8 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							sarUpd.gap2 = r1v;
 							sarUpd.tsWrite = tsUpdate;
 							sarUpd.tsRecent = fsm_meta.meta.tsVal;
+							sarUpd.eceWrite = eceChange;
+							sarUpd.ece = eceNext;
 							rxEng2rxSar_upd_req.write(sarUpd);
 							//write to memory
 							rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
@@ -1553,6 +1595,13 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						else
 						{
 							dropDataFifoOut.write(true);
+							if (eceChange)
+							{
+								rxSarRecvd eceOnlyUpd(fsm_meta.sessionID);
+								eceOnlyUpd.eceWrite = 1;
+								eceOnlyUpd.ece = eceNext;
+								rxEng2rxSar_upd_req.write(eceOnlyUpd);
+							}
 							#ifndef __SYNTHESIS__
 							std::cout<<"RX_DROP";
 							std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
@@ -1581,6 +1630,8 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							rxSarRecvd sarUpd3(fsm_meta.sessionID, newRecvd, newHead, rxSar.offset, rxSar.gap);
 							sarUpd3.tsWrite = tsUpdate;
 							sarUpd3.tsRecent = fsm_meta.meta.tsVal;
+							sarUpd3.eceWrite = eceChange;
+							sarUpd3.ece = eceNext;
 							rxEng2rxSar_upd_req.write(sarUpd3);
 							// Build memory address
 							ap_uint<32> pkgAddr;
@@ -1594,6 +1645,13 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						else
 						{
 							dropDataFifoOut.write(true);
+							if (eceChange)
+							{
+								rxSarRecvd eceOnlyUpd(fsm_meta.sessionID);
+								eceOnlyUpd.eceWrite = 1;
+								eceOnlyUpd.ece = eceNext;
+								rxEng2rxSar_upd_req.write(eceOnlyUpd);
+							}
 						}
 					}
 #endif
@@ -1616,7 +1674,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						if ((fsm_meta.meta.seqNumb == rxSar.recvd) && ((rxbuffer_max_data_count - rxbuffer_data_count) > 375))
 #endif
 						{
-							rxEng2eventEng_setEvent.write(event(ACK, fsm_meta.sessionID));
+							rxEng2eventEng_setEvent.write(event(ceQuickAck ? ACK_NODELAY : ACK, fsm_meta.sessionID));
 						}
 						//send duplicate ack with ack_nodelay
 						else 
@@ -1745,10 +1803,16 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					sarInit.tsEnabled = TCP_TS_OPTION && fsm_meta.meta.tsValid;
 					sarInit.tsWrite = sarInit.tsEnabled;
 					sarInit.tsRecent = fsm_meta.meta.tsVal;
+					// RFC 3168 6.1.1: an ECN-setup SYN carries ECE and CWR; a
+					// simultaneous open would need our SYN to have asked too
+					bool ecnOk = TCP_ECN_ACCEPT && fsm_meta.meta.ece && fsm_meta.meta.cwr && !simOpen;
+					sarInit.ecnEnabled = ecnOk;
 					rxEng2rxSar_upd_req.write(sarInit);
 					rxEng2timer_resetKeepalive.write(fsm_meta.sessionID);
 					// Initialize receive window
-					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, simOpen ? txSar.prevAck : (ap_uint<32>)0, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift, session_mss))); //TODO maybe include count check
+					rxTxSarQuery txSarInit(fsm_meta.sessionID, simOpen ? txSar.prevAck : (ap_uint<32>)0, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift, session_mss);
+					txSarInit.ecnEnabled = ecnOk;
+					rxEng2txSar_upd_req.write(txSarInit); //TODO maybe include count check
 #else
 					// Initialize rxSar, SEQ + phantom byte, last '1' for makes sure appd is initialized
 					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, 1));
@@ -2495,9 +2559,13 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 	#pragma HLS stream variable=rxEng_dataBuffer5 depth=8
 	static stream<ap_uint<4> > rx_process2dropLengthFifo("rx_process2dropLengthFifo");
 	#pragma HLS STREAM depth=2 variable=rx_process2dropLengthFifo
+	// per-packet CE bit, bypasses the checksum path (covers the packets in
+	// flight up to processPseudoHeader)
+	static stream<ap_uint<1> > rxEng_ipCeFifo("rxEng_ipCeFifo");
+	#pragma HLS STREAM depth=32 variable=rxEng_ipCeFifo
 
 
-	toe_process_ipv4<WIDTH>(ipRxData, rx_process2dropLengthFifo, rxEng_ipMetaFifo, rxEng_dataBuffer0);
+	toe_process_ipv4<WIDTH>(ipRxData, rx_process2dropLengthFifo, rxEng_ipMetaFifo, rxEng_ipCeFifo, rxEng_dataBuffer0);
 	//Assumes for WIDTH > 64 no optional fields
 	drop_optional_ip_header<WIDTH>(rx_process2dropLengthFifo, rxEng_dataBuffer0, rxEng_dataBuffer4);
 	//align
@@ -2537,6 +2605,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 	processPseudoHeader<WIDTH>(rxEng_dataBuffer2,
 								rxEng_dataBuffer3a,
 								rxEng_checksumValidFifo,
+								rxEng_ipCeFifo,
 #if !(WINDOW_SCALE)
 								rxEng_metaDataFifo,
 #else

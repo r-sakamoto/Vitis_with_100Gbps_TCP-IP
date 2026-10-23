@@ -69,6 +69,10 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			{
 				tx_table[tst_txEngUpdate.sessionID].not_ackd = tst_txEngUpdate.not_ackd;
 				tx_table[tst_txEngUpdate.sessionID].lastTxTime = nowUnits;
+				if (tst_txEngUpdate.cwrClear)
+				{
+					tx_table[tst_txEngUpdate.sessionID].cwrPending = false;
+				}
 				if (tst_txEngUpdate.init)
 				{
 					tx_table[tst_txEngUpdate.sessionID].app = tst_txEngUpdate.not_ackd;
@@ -178,6 +182,8 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			txEngReply.peerSackStart2 = entry.peerSackStart2;
 			txEngReply.peerSackEnd2 = entry.peerSackEnd2;
 			txEngReply.peerSackValid2 = entry.peerSackValid2;
+			txEngReply.ecnEnabled = entry.ecnEnabled;
+			txEngReply.cwrPending = entry.cwrPending;
 			txSar2txEng_upd_rsp.write(txEngReply);
 		}
 	}
@@ -205,6 +211,21 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			tx_table[tst_rxEngUpdate.sessionID].peerSackStart2 = tst_rxEngUpdate.peerSackStart2;
 			tx_table[tst_rxEngUpdate.sessionID].peerSackEnd2 = tst_rxEngUpdate.peerSackEnd2;
 			tx_table[tst_rxEngUpdate.sessionID].peerSackValid2 = tst_rxEngUpdate.peerSackValid2;
+			if (tst_rxEngUpdate.init)
+			{
+				tx_table[tst_rxEngUpdate.sessionID].ecnEnabled = tst_rxEngUpdate.ecnEnabled;
+				tx_table[tst_rxEngUpdate.sessionID].cwrPending = false;
+				tx_table[tst_rxEngUpdate.sessionID].ecnHold = false;
+			}
+			else if (tst_rxEngUpdate.ecnUpdate)
+			{
+				tx_table[tst_rxEngUpdate.sessionID].ecnHold = tst_rxEngUpdate.ecnHold;
+				if (tst_rxEngUpdate.ecnReduce)
+				{
+					tx_table[tst_rxEngUpdate.sessionID].cwrPending = true;
+					tx_table[tst_rxEngUpdate.sessionID].ecnRecover = tst_rxEngUpdate.ecnRecover;
+				}
+			}
 			// effective cwnd for the app-side min_window push (on init the
 			// query still carries a stale value, use the fresh IW instead)
 			ap_uint<WINDOW_BITS> effCongWindow = tst_rxEngUpdate.cong_window;
@@ -273,6 +294,9 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			rxEngReply.peerSackStart2 = tx_table[tst_rxEngUpdate.sessionID].peerSackStart2;
 			rxEngReply.peerSackEnd2 = tx_table[tst_rxEngUpdate.sessionID].peerSackEnd2;
 			rxEngReply.peerSackValid2 = tx_table[tst_rxEngUpdate.sessionID].peerSackValid2;
+			rxEngReply.ecnEnabled = tx_table[tst_rxEngUpdate.sessionID].ecnEnabled;
+			rxEngReply.ecnHold = tx_table[tst_rxEngUpdate.sessionID].ecnHold;
+			rxEngReply.ecnRecover = tx_table[tst_rxEngUpdate.sessionID].ecnRecover;
 			txSar2rxEng_upd_rsp.write(rxEngReply);
 		}
 	}
