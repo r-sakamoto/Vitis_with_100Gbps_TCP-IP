@@ -807,6 +807,14 @@ public:
 	{
 		header[200] = flag;
 	}
+	ap_uint<1> getPshFlag()
+	{
+		return header[203];
+	}
+	void setPshFlag(ap_uint<1> flag)
+	{
+		header[203] = flag;
+	}
 	ap_uint<1> getEceFlag()
 	{
 		return header[206];

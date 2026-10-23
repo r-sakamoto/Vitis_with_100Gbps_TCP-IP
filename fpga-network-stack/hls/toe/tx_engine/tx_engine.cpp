@@ -210,6 +210,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					// single segment: payload comes from the DDR-bypass
 					// duplicate stream (original fast path)
 					meta.length = ml_curEvent.length;
+					meta.psh = 1;
 
 					//this is hack, makes sure that probeTimer is never set.
 					//ProbeTimer is not used, since application checks space before transmitting
@@ -246,6 +247,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 					// by read_data_arbiter (code 2 on the first segment).
 					ap_uint<16> remaining = ml_curEvent.length - ml_segOffset;
 					meta.length = (remaining > sessionMSS) ? sessionMSS : remaining;
+					meta.psh = (remaining <= sessionMSS);
 
 					ap_uint<32> pkgAddr;
 					pkgAddr(31, 30) = 0x00;
@@ -353,9 +355,11 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 						// We stay in this state and sent immediately another packet
 						txSar.not_ackd += sessionMSS;
 						meta.length = sessionMSS;
+						meta.psh = (currLength == sessionMSS);
 					}
 					else
 					{
+						meta.psh = 1;
 						// If we sent all data, there might be a fin we have to sent too
 						if (txSar.finReady && (txSar.ackd == txSar.not_ackd || currLength == 0))
 						{
@@ -389,6 +393,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				else
 				{
 					// code duplication, but better timing..
+					meta.psh = 0;
 					if (txSar.usableWindow >= sessionMSS)
 					{
 						// We stay in this state and sent immediately another packet
@@ -528,6 +533,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.tsEcr = rxSar.tsRecent;
 				meta.ece = rxSar.ecePending; //retransmissions/ACKs/FINs: Not-ECT, no CWR
 				meta.cwr = 0;
+				meta.psh = 0;
 
 				ml_sarLoaded = true;
 				txSarReg = txSar;
@@ -558,6 +564,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.tsEcr = rxSar.tsRecent;
 				meta.ece = rxSar.ecePending; //retransmissions/ACKs/FINs: Not-ECT, no CWR
 				meta.cwr = 0;
+				meta.psh = 0;
 				// RFC 2018: advertise the buffered out-of-order ranges as
 				// SACK blocks while receive gaps are open (up to two blocks)
 				if (rxSar.gap && rxSar.sackEnabled)
@@ -628,6 +635,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.ts = 0;
 				meta.ece = 0; //ECN is never requested (cf. Linux tcp_ecn=2)
 				meta.cwr = 0;
+				meta.psh = 0;
 #if (WINDOW_SCALE)
 				meta.length = 12; // MSS(4) + SACKperm(2) + WS(3) + padding(3)
 				meta.win_shift = WINDOW_SCALE_BITS;
@@ -727,6 +735,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				// ECN-setup SYN-ACK (RFC 3168 6.1.1): ECE set, CWR clear
 				meta.ece = rxSar.ecnEnabled;
 				meta.cwr = 0;
+				meta.psh = 0;
 
 				txEng_ipMetaFifoOut.write(meta.length);
 				txEng_tcpMetaFifoOut.write(meta);
@@ -780,6 +789,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.tsEcr = rxSar.tsRecent;
 				meta.ece = rxSar.ecePending; //retransmissions/ACKs/FINs: Not-ECT, no CWR
 				meta.cwr = 0;
+				meta.psh = 0;
 
 				// Check if retransmission, in case of RT, we have to reuse not_ackd number
 				if (ml_curEvent.rt_count != 0)
@@ -894,6 +904,7 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 
 				meta.seqNumb = ml_rtSeq;
 				meta.length = segLen;
+				meta.psh = lastSegment;
 
 				// Construct address from the current retransmit position
 				ap_uint<32> pkgAddr;
@@ -1397,6 +1408,7 @@ void pseudoHeaderConstructionNew(stream<tx_engine_meta>&		tcpMetaDataFifoIn,
 			header.setAckFlag(meta.ack);
 			header.setEceFlag(meta.ece);
 			header.setCwrFlag(meta.cwr);
+			header.setPshFlag(meta.psh);
 
 			hasBody = meta.length != 0 && !meta.syn;
 			isSYN = meta.syn;

@@ -24,7 +24,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | Timestamps (RFC 7323) | **実装済** (T1, `ts_negotiate`/`paws_drop`テスト): SYN/SYN-ACKでTS交渉(常時提示/条件エコー)、全セグメント(データ含む)にNOP NOP TS 12B付与、64bitデータパスでボディを4Bシフト。TS.Recent追跡+PAWSで旧タイムスタンプのセグメントを破棄しdup ACK応答。実効MSSは-12B。TSval=~0.84ms粒度のフリーランカウンタ。RTT計測は既存rtt_estimator(Karn)のまま(TSecrベースRTTは未)。512bitデータパスはTS無効(TCP_TS_OPTIONゲート) | あり | 完了 |
 | ECN (ECE/CWR/ECT) | **実装済** (R7, `ecn`テスト, Linux tcp_ecn=2相当): ECE+CWR付きSYNにのみECN-setup SYN-ACK(ECE)で応答し、自側SYNでは要求しない(`TCP_ECN_ACCEPT`)。ECNセッションでは新規データのみECT(0)(再送・純ACK・SYN/FIN・keepaliveはNot-ECT)。受信側はCEマーク付きデータで即時ACK+以後のACKにECEを付与しCWR受信で停止。送信側はECE受信でssthresh=max(cwnd/2,2MSS)、cwnd=ssthreshとし、次の新規データにCWR。削減は1ウィンドウ1回(snd_nxtまでのACKはhold)、ファストリカバリ中は削減しない。PRRによる漸減は未 | あり | 完了 |
 | オプションパーサの正当性 | **修正済** (B5, `opt_parser_robust`テスト): dataOffset単位バグ(issue #43)・len=0オプションでの停止を修正 | — | 完了 |
-| PSH / URG | PSHは常に0、URG・緊急ポインタ未対応 | あり | ★ |
+| PSH / URG | **PSH実装済** (R8, `tx_segmentation`テスト): appの1回の書き込みの最終セグメント(Nagle時は未送信データを出し切るセグメント)と、再送で送信済み範囲の末尾に届くセグメントにPSHを立てる(Linuxのtcp_push相当)。受信側はPSHを無視(Linux同様に即時配送)。URG・緊急ポインタは未対応(RFC 6093で非推奨) | あり | ★(残: URG) |
 
 ## 2. 再送・RTT・輻輳制御(RFC 6298 / 5681)
 

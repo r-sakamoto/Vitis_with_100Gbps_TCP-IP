@@ -62,11 +62,13 @@ struct tx_engine_meta //same as rxEngine
 	// ECN (RFC 3168) header flags
 	ap_uint<1>	ece;
 	ap_uint<1>	cwr;
-	tx_engine_meta() : sack(0), sack2(0), ts(0), ece(0), cwr(0) {}
+	// PSH: set on the last segment of an app write / when the unsent data drains
+	ap_uint<1>	psh;
+	tx_engine_meta() : sack(0), sack2(0), ts(0), ece(0), cwr(0), psh(0) {}
 	tx_engine_meta(ap_uint<1> ack, ap_uint<1> rst, ap_uint<1> syn, ap_uint<1> fin)
-			:seqNumb(0), ackNumb(0), window_size(0), length(0), ack(ack), rst(rst), syn(syn), fin(fin), sack(0), sack2(0), ts(0), ece(0), cwr(0) {}
+			:seqNumb(0), ackNumb(0), window_size(0), length(0), ack(ack), rst(rst), syn(syn), fin(fin), sack(0), sack2(0), ts(0), ece(0), cwr(0), psh(0) {}
 	tx_engine_meta(ap_uint<32> seqNumb, ap_uint<32> ackNumb, ap_uint<1> ack, ap_uint<1> rst, ap_uint<1> syn, ap_uint<1> fin)
-			:seqNumb(seqNumb), ackNumb(ackNumb), window_size(0), length(0), ack(ack), rst(rst), syn(syn), fin(fin), sack(0), sack2(0), ts(0), ece(0), cwr(0) {}
+			:seqNumb(seqNumb), ackNumb(ackNumb), window_size(0), length(0), ack(ack), rst(rst), syn(syn), fin(fin), sack(0), sack2(0), ts(0), ece(0), cwr(0), psh(0) {}
 };
 
 /** @ingroup tx_engine

@@ -1496,6 +1496,8 @@ module tb_toe_top;
       if (f_payload_len(p) > 0) begin
         tb_check(f_seq(p) == d0_end,
           $sformatf("fast-rtx seq=%0d expected %0d", f_seq(p), d0_end));
+        // 4000B outstanding: the first retransmitted MSS is not the last
+        tb_check((f_flags(p) & F_PSH) == 0, "fast-rtx head segment has no PSH");
         got = 1;
       end
     end
@@ -1888,6 +1890,9 @@ module tb_toe_top;
           tb_check(0, $sformatf("segmented payload mismatch at offset %0d", soff + i));
           return;
         end
+      // PSH only on the segment that completes the app write
+      tb_check(((f_flags(p) & F_PSH) != 0) == (soff + d.size() == 1400),
+               $sformatf("PSH %s on segment ending at %0d", (f_flags(p) & F_PSH) ? "set" : "clear", soff + d.size()));
       got_bytes += d.size();
     end
     tb_check(got_bytes == 1400, "all 1400 bytes sent in MSS-sized segments");
@@ -1906,6 +1911,7 @@ module tb_toe_top;
       tb_check(f_payload_len(p) == 100, "single 100B bypass segment");
       d = f_payload(p);
       tb_check(f_seq(p) == data_base + 1400, "100B segment seq");
+      tb_check((f_flags(p) & F_PSH) != 0, "100B single-segment write carries PSH");
       for (int i = 0; i < d.size() && i < 100; i++)
         if (d[i] !== pay[i]) begin
           tb_check(0, $sformatf("bypass payload mismatch at %0d", i));
