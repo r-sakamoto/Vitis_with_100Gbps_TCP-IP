@@ -57,7 +57,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 | ハーフクローズ | **実装済** (N1, `half_close`テスト): 相手FINでCLOSE_WAITへ入りACKのみ返答、appはclose通知後も送信可能(tx_app_stream_ifがCLOSE_WAIT送信を許可)。app closeでFIN→LAST_ACK→解放 | shutdown(SHUT_WR)対応 | 完了 |
 | FIN_WAIT_2 | **実装済** (N1+R1, `time_wait_ack`テスト): FIN_WAIT_1→FIN_WAIT_2遷移、FIN_WAIT_2でのデータ受信・相手FIN→TIME_WAIT。TIME_WAIT中の迷子ACK/再送FINにはRSTでなくACKを返す(RFC 793) | 準拠 | 完了 |
 | ACKなしFIN | **実装済** (F3, `pure_fin_close`テスト): 純FINもFIN+ACKと同様に処理(ACK番号依存処理はACKフラグでガード) | 処理する | 完了 |
-| 同時オープン | 非対応(SYN_SENT中のSYNをパッシブオープン扱い) | 対応 | ★ |
+| 同時オープン | **実装済** (R6, `simultaneous_open`/`simopen_giveup`テスト): SYN_SENT中のSYNには自ISSを保ったSYN-ACKで応答しSYN_RECEIVEDへ。相手のSYN-ACKまたはACKで確立しアプリにopen成功を通知、RSTやSYN-ACK再送打切りではopen失敗を通知。併せてアプリ未通知のhalf-openセッションへのRSTではRESET通知を出さないよう修正 | 対応 | 完了 |
 | TIME_WAIT | 60秒固定(2MSLでない)。**再利用は実装済** (R4, `time_wait_reuse`テスト): listenポート宛てでバックログに空きがあれば、TIME_WAIT中の新SYNをTS有効ならTSval>TS.Recent(RFC 6191)、無効ならSEQ>RCV.NXT(RFC 1122 4.2.2.13)で受理し、新規接続として初期化+SYN-ACK、TIME_WAITタイマは取消。条件外のSYNはACK応答 | 60s + 再利用(RFC 1122) | 完了 |
 | listen解除 | **実装済** (L1, `listen_close`テスト): listen要求のbit15をclose-listenフラグとして解釈(listenポートは0..32767なので既存AXIS I/F互換)。閉鎖後のSYNにはRST、再listenで復旧 | close/bind準拠 | 完了 |
 | ISN生成 | **改善済** (R1, `isn_quality`テスト): ISN = LFSR ^ (sessionID<<16) + フリーランカウンタ。旧実装の「下位6bit常に0x3F」パターンを解消し時間成分を追加。RFC 6528完全準拠(秘密鍵+4タプルハッシュ)は未 | RFC 6528(秘密鍵+4タプルハッシュ+時刻) | ★(残) |

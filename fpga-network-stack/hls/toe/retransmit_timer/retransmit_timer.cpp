@@ -90,6 +90,7 @@ void retransmit_timer(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetrans
 		{
 			retransmitTimerTable[rt_update.sessionID].time = 0;
 			retransmitTimerTable[rt_update.sessionID].active = false;
+			retransmitTimerTable[rt_update.sessionID].activeOpen = false;
 		}
 		retransmitTimerTable[rt_update.sessionID].retries = 0;
 		rt_waitForWrite = false;
@@ -146,6 +147,27 @@ void retransmit_timer(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetrans
 		switch (operationSwitch)
 		{
 		case 1:
+			// a SYN-ACK replacing a running SYN timer is a simultaneous open;
+			// SYN-ACK retransmissions keep the flag
+			if (set.type == SYN)
+			{
+				currEntry.activeOpen = true;
+			}
+			else if (set.type == SYN_ACK)
+			{
+				if (currEntry.type == SYN && currEntry.active)
+				{
+					currEntry.activeOpen = true;
+				}
+				else if (currEntry.type != SYN_ACK)
+				{
+					currEntry.activeOpen = false;
+				}
+			}
+			else
+			{
+				currEntry.activeOpen = false;
+			}
 			currEntry.type = set.type;
 			if (!currEntry.active)
 			{
@@ -183,7 +205,9 @@ void retransmit_timer(	stream<rxRetransmitTimerUpdate>&	rxEng2timer_clearRetrans
 					{
 						currEntry.retries = 0;
 						rtTimer2stateTable_releaseState.write(currID);
-						if (currEntry.type == SYN)
+						bool openFailed = (currEntry.type == SYN) || (currEntry.type == SYN_ACK && currEntry.activeOpen);
+						currEntry.activeOpen = false;
+						if (openFailed)
 						{
 							rtTimer2txApp_notification.write(openStatus(currID, false));
 						}

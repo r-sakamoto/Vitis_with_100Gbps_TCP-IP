@@ -4141,6 +4141,147 @@ module tb_toe_top;
     expect_flags(F_SYN | F_ACK, "SYN-ACK for a new SYN", p, 100000, 1);
   endtask
 
+  // R6: simultaneous open (RFC 793 fig. 8). The app opens, the peer's SYN
+  // crosses ours; the TOE answers with a SYN-ACK that keeps its ISS.
+  // returns the TOE ISS; peer_* are set up for the crossing SYN
+  task automatic sim_open_start(input bit [15:0] rport, input bit [31:0] pseq,
+                                output bit [31:0] iss);
+    bytes_t p;
+    openrsp_t orsp;
+    while (openrsp_q.size() > 0) orsp = openrsp_q.pop_front();
+    app_open(PEER_IP, rport);
+    expect_flags(F_SYN, "SYN", p, 100000, 0);
+    if (err_count) return;
+    iss       = f_seq(p);
+    toe_port  = f_src_port(p);
+    peer_port = rport;
+    peer_seq  = pseq;
+    peer_win  = 16'hFFFF;
+    // crossing SYN (no ACK)
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port, peer_seq, 0, F_SYN, 16'hFFFF,
+                      syn_options(1), no_bytes()));
+    expect_flags(F_SYN | F_ACK, "SYN-ACK of simultaneous open", p, 100000, 1);
+    if (err_count) return;
+    tb_check(f_seq(p) == iss, $sformatf("SYN-ACK keeps the ISS (seq=%0d iss=%0d)", f_seq(p), iss));
+    tb_check(f_ack(p) == peer_seq + 1, $sformatf("SYN-ACK ack=%0d expected %0d", f_ack(p), peer_seq + 1));
+    peer_seq += 1;
+    peer_ack  = iss + 1;
+  endtask
+
+  task automatic expect_open_rsp(input string what, input bit success, output bit [15:0] sid);
+    openrsp_t orsp;
+    int n;
+    n = 0;
+    while (openrsp_q.size() == 0 && n < 100000) begin @(posedge ap_clk); n++; end
+    tb_check(openrsp_q.size() > 0, $sformatf("%s: openConnRsp received", what));
+    if (openrsp_q.size() == 0) return;
+    orsp = openrsp_q.pop_front();
+    tb_check((orsp.success != 0) == success, $sformatf("%s: openConnRsp success=%0d expected %0d", what, orsp.success, success));
+    sid = orsp.sessionID;
+  endtask
+
+  // data in both directions on an opened connection
+  task automatic sim_open_data(input string what, input bit [15:0] sid);
+    bytes_t p, pay;
+    bit ok;
+    notif_t n;
+    txrsp_t rsp;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h61));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, $sformatf("%s: rx data notification", what));
+    if (ok) tb_check(n.sessionID == sid, $sformatf("%s: rx notification session", what));
+    peer_seq += 8;
+    expect_flags(F_ACK, $sformatf("%s: ACK of rx data", what), p, 400000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq, $sformatf("%s: ack=%0d expected %0d", what, f_ack(p), peer_seq));
+    pay = gen_payload(32, 8'h71);
+    app_send(sid, pay, rsp);
+    tb_check(rsp.error == 0, $sformatf("%s: app_send accepted (err=%0d)", what, rsp.error));
+    ok = 0;
+    while (!ok) begin
+      wait_pkt(p, 300000, ok);
+      if (!ok) begin tb_error($sformatf("%s: timeout waiting for tx data", what)); return; end
+      if (f_payload_len(p) == 0) ok = 0;
+    end
+    tb_check(f_payload_len(p) == 32 && f_seq(p) == peer_ack,
+             $sformatf("%s: tx data len=%0d seq=%0d expected 32/%0d", what, f_payload_len(p), f_seq(p), peer_ack));
+    peer_ack += 32;
+    peer_send_seg(F_ACK, no_bytes());
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
+  task automatic test_simultaneous_open();
+    bytes_t p;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    bit [31:0] iss;
+
+    // (A) the peer's SYN-ACK completes the handshake -> ACK + open success
+    sim_open_start(16'd60100, 32'h8000_0000, iss);
+    if (err_count) return;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port, peer_seq - 1, peer_ack,
+                      F_SYN | F_ACK, 16'hFFFF, syn_options(1), no_bytes()));
+    expect_flags(F_ACK, "ACK of the peer's SYN-ACK", p, 100000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == peer_seq && f_seq(p) == peer_ack,
+             $sformatf("(A) ACK seq/ack %0d/%0d expected %0d/%0d", f_seq(p), f_ack(p), peer_ack, peer_seq));
+    expect_open_rsp("(A)", 1, sid);
+    if (err_count) return;
+    sim_open_data("(A)", sid);
+    if (err_count) return;
+
+    // (B) a plain ACK of our SYN completes it
+    sim_open_start(16'd60101, 32'h8100_0000, iss);
+    if (err_count) return;
+    peer_send_seg(F_ACK, no_bytes());
+    expect_open_rsp("(B)", 1, sid);
+    if (err_count) return;
+    sim_open_data("(B)", sid);
+    if (err_count) return;
+
+    // (C) a RST refuses it -> open failure, no rx notification
+    sim_open_start(16'd60102, 32'h8200_0000, iss);
+    if (err_count) return;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port, peer_seq, 0, F_RST, 16'h0,
+                      no_bytes(), no_bytes()));
+    expect_open_rsp("(C)", 0, sid);
+    wait_notif(n, 100000, ok);
+    tb_check(!ok, "(C) no rx notification for the refused open");
+    repeat (1000) @(posedge ap_clk);
+    tb_check(dut.state_table_U0.stt_halfOpen == 0,
+             $sformatf("half-open count %0d expected 0", dut.state_table_U0.stt_halfOpen));
+  endtask
+
+  // R6: a simultaneous open whose SYN-ACK is never answered reports a
+  // failed open to the application after the retries (timer-scaled build)
+  task automatic test_simopen_giveup();
+    bytes_t p;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    bit [31:0] iss;
+    int rtx;
+
+    sim_open_start(16'd60200, 32'h8300_0000, iss);
+    if (err_count) return;
+    for (rtx = 1; rtx <= 4; rtx++) begin
+      ok = 0;
+      while (!ok) begin
+        wait_pkt(p, 6_000_000, ok);
+        if (!ok) begin tb_error($sformatf("timeout waiting for SYN-ACK retransmission %0d", rtx)); return; end
+        if (f_flags(p) != (F_SYN | F_ACK)) ok = 0;
+      end
+      tb_check(f_seq(p) == iss, $sformatf("SYN-ACK rtx %0d keeps the ISS", rtx));
+    end
+    // give-up: failed open reported (wait past the last backoff)
+    rtx = 0;
+    while (openrsp_q.size() == 0 && rtx < 8_000_000) begin @(posedge ap_clk); rtx++; end
+    expect_open_rsp("give-up", 0, sid);
+    wait_notif(n, 100000, ok);
+    tb_check(!ok, "no rx notification for the failed simultaneous open");
+  endtask
+
   // G2: idle restart (RFC 5681 4.1). Requires the timer-scaled build: the
   // idle threshold is ~153 units of 1024 cycles ~= 157k cycles. After the
   // connection sits idle with nothing outstanding, the next transmission
@@ -4321,6 +4462,8 @@ module tb_toe_top;
       "syn_backlog"    : test_syn_backlog();
       "time_wait_reuse": test_time_wait_reuse();
       "synack_giveup"  : test_synack_giveup();
+      "simultaneous_open": test_simultaneous_open();
+      "simopen_giveup" : test_simopen_giveup();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 
@@ -4335,7 +4478,7 @@ module tb_toe_top;
   // global watchdog (keepalive needs ~18M cycles of protocol silence)
   initial begin
     #1;
-    if (testname == "keepalive" || testname == "rt_abort" || testname == "synack_giveup") #(CLK_PERIOD * 40_000_000);
+    if (testname == "keepalive" || testname == "rt_abort" || testname == "synack_giveup" || testname == "simopen_giveup") #(CLK_PERIOD * 40_000_000);
     else                                                   #(CLK_PERIOD * 10_000_000);
     $display("[%0t] TB-ERROR: global watchdog expired", $time);
     $display("  TEST %s : FAIL (watchdog)", testname);

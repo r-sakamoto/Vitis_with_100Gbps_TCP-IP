@@ -41,6 +41,7 @@ struct retransmitTimerEntry
 	ap_uint<3>		retries;
 	bool			active;
 	eventType		type;
+	bool			activeOpen; //SYN-ACK of a simultaneous open: report a failed open on give-up
 };
 
 /** @ingroup retransmit_timer

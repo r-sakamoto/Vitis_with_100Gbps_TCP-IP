@@ -1163,7 +1163,9 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 			// (also for a pure FIN without ACK, so the FIN handler can run;
 			//  the TRANSITION state waits for the response, and the default
 			//  handler consumes it with read_nb for odd flag combinations)
-			if (fsm_meta.meta.ack || fsm_meta.meta.fin) // Do not read for SYN
+			// (and for a SYN: a simultaneous open answers with the ISS of
+			//  its own SYN)
+			if (fsm_meta.meta.ack || fsm_meta.meta.fin || fsm_meta.meta.syn)
 			{
 				rxEng2txSar_upd_req.write(rxTxSarQuery(fsm_meta.sessionID));
 				fsm_txSarRequest  = true;
@@ -1633,6 +1635,12 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						{
 						case SYN_RECEIVED:
 							rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, ESTABLISHED, 1)); //TODO MAYBE REARRANGE
+							// a locally opened session reaches SYN_RECEIVED only
+							// through a simultaneous open: report the open now
+							if (fsm_meta.dstIpPort[15] == 1)
+							{
+								openConStatusOut.write(openStatus(fsm_meta.sessionID, 1, fsm_meta.srcIpAddress, fsm_meta.srcIpPort));
+							}
 							break;
 						case FIN_WAIT_1: //our FIN got ACKed
 							rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, FIN_WAIT_2, 1));
@@ -1689,6 +1697,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 			{
 				stateTable2rxEng_upd_rsp.read(tcpState);
 				rxSar2rxEng_upd_rsp.read(rxSar);
+				txSar2rxEng_upd_rsp.read(txSar);
 				#ifndef __SYNTHESIS__
 				std::cout<<"RX_SYN: ";
 				std::cout<<std::dec<<" session id:"<<fsm_meta.sessionID;
@@ -1717,6 +1726,9 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 				}
 				else if (tcpState == CLOSED || tcpState == SYN_SENT || twReuse) // Actually this is LISTEN || SYN_SENT
 				{
+					// simultaneous open (RFC 793 fig. 8): our SYN is still
+					// unacknowledged; answer with a SYN-ACK that keeps its ISS
+					bool simOpen = (tcpState == SYN_SENT);
 					if (twReuse)
 					{
 						// the old connection's TIME_WAIT timer must not close the new one
@@ -1736,15 +1748,15 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					rxEng2rxSar_upd_req.write(sarInit);
 					rxEng2timer_resetKeepalive.write(fsm_meta.sessionID);
 					// Initialize receive window
-					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, 0, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift, session_mss))); //TODO maybe include count check
+					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, simOpen ? txSar.prevAck : (ap_uint<32>)0, fsm_meta.meta.winSize, txSar.cong_window, 0, false, tx_win_shift, session_mss))); //TODO maybe include count check
 #else
 					// Initialize rxSar, SEQ + phantom byte, last '1' for makes sure appd is initialized
 					rxEng2rxSar_upd_req.write(rxSarRecvd(fsm_meta.sessionID, fsm_meta.meta.seqNumb+1, fsm_meta.meta.seqNumb+1, 0, false, 1));
 					// Initialize receive window
-					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, 0, fsm_meta.meta.winSize, txSar.cong_window, 0, false))); //TODO maybe include count check
+					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, simOpen ? txSar.prevAck : (ap_uint<32>)0, fsm_meta.meta.winSize, txSar.cong_window, 0, false))); //TODO maybe include count check
 #endif
-					// Set SYN_ACK event
-					rxEng2eventEng_setEvent.write(event(SYN_ACK, fsm_meta.sessionID));
+					// Set SYN_ACK event (rt_count != 0: reuse the ISS in txSar.ackd)
+					rxEng2eventEng_setEvent.write(event(SYN_ACK, fsm_meta.sessionID, simOpen ? 1 : 0));
 					// Change State to SYN_RECEIVED
 					rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, SYN_RECEIVED, 1));
 				}
@@ -1824,6 +1836,18 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 
 					rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, ESTABLISHED, 1));
 					openConStatusOut.write(openStatus(fsm_meta.sessionID, 1, fsm_meta.srcIpAddress, fsm_meta.srcIpPort));
+				}
+				else if ((tcpState == SYN_RECEIVED) && (fsm_meta.meta.ackNumb == txSar.nextByte)
+						&& (fsm_meta.meta.seqNumb+1 == rxSar.recvd))
+				{
+					// simultaneous open: the peer's SYN-ACK acknowledges our SYN
+					rxEng2txSar_upd_req.write((rxTxSarQuery(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, 0, false)));
+					rxEng2eventEng_setEvent.write(event(ACK_NODELAY, fsm_meta.sessionID));
+					rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, ESTABLISHED, 1));
+					if (fsm_meta.dstIpPort[15] == 1) // locally opened (ephemeral port)
+					{
+						openConStatusOut.write(openStatus(fsm_meta.sessionID, 1, fsm_meta.srcIpAddress, fsm_meta.srcIpPort));
+					}
 				}
 				else if (tcpState == SYN_SENT) //TODO correct answer?
 				{
@@ -1977,7 +2001,15 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						if (fsm_meta.meta.seqNumb == rxSar.recvd)
 						{
 							//tell application, RST occurred, abort
-							rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, fsm_meta.srcIpAddress, fsm_meta.dstIpPort, true)); //RESET
+							if (tcpState != SYN_RECEIVED)
+							{
+								rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, fsm_meta.srcIpAddress, fsm_meta.dstIpPort, true)); //RESET
+							}
+							else if (fsm_meta.dstIpPort[15] == 1)
+							{
+								// simultaneous open refused
+								openConStatusOut.write(openStatus(fsm_meta.sessionID, 0, fsm_meta.srcIpAddress, fsm_meta.srcIpPort));
+							}
 							rxEng2stateTable_upd_req.write(stateQuery(fsm_meta.sessionID, CLOSED, 1)); //TODO maybe some TIME_WAIT state
 							rxEng2timer_clearRetransmitTimer.write(rxRetransmitTimerUpdate(fsm_meta.sessionID, true));
 						}
