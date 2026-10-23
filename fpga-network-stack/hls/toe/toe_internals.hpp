@@ -189,6 +189,11 @@ struct rxSarEntry
 	//be echoed (ECE on every outgoing segment until the peer sends CWR)
 	bool ecnEnabled;
 	bool ecePending;
+	//D-SACK (RFC 2883): a duplicate segment [dsackStart, +dsackLen) waits to
+	//be reported as the first SACK block of the next ACK
+	bool dsackValid;
+	ap_uint<32> dsackStart;
+	ap_uint<16> dsackLen;
 };
 
 struct rxSarReply
@@ -211,12 +216,15 @@ struct rxSarReply
 	ap_uint<32>	tsRecent; //echoed as TSecr on outgoing segments
 	bool		ecnEnabled;
 	bool		ecePending;
+	bool		dsackValid;
+	ap_uint<32>	dsackStart;
+	ap_uint<16>	dsackLen;
 	rxSarReply() {}
 	rxSarReply(rxSarEntry entry)
 #if !(WINDOW_SCALE)
-		:recvd(entry.recvd), head(entry.head), offset(entry.offset), gap(entry.gap), head2(entry.head2), offset2(entry.offset2), gap2(entry.gap2), sackEnabled(entry.sackEnabled), tsEnabled(entry.tsEnabled), tsRecent(entry.tsRecent), ecnEnabled(entry.ecnEnabled), ecePending(entry.ecePending) {}
+		:recvd(entry.recvd), head(entry.head), offset(entry.offset), gap(entry.gap), head2(entry.head2), offset2(entry.offset2), gap2(entry.gap2), sackEnabled(entry.sackEnabled), tsEnabled(entry.tsEnabled), tsRecent(entry.tsRecent), ecnEnabled(entry.ecnEnabled), ecePending(entry.ecePending), dsackValid(entry.dsackValid), dsackStart(entry.dsackStart), dsackLen(entry.dsackLen) {}
 #else
-		:recvd(entry.recvd), win_shift(entry.win_shift), head(entry.head), offset(entry.offset), gap(entry.gap), head2(entry.head2), offset2(entry.offset2), gap2(entry.gap2), sackEnabled(entry.sackEnabled), tsEnabled(entry.tsEnabled), tsRecent(entry.tsRecent), ecnEnabled(entry.ecnEnabled), ecePending(entry.ecePending) {}
+		:recvd(entry.recvd), win_shift(entry.win_shift), head(entry.head), offset(entry.offset), gap(entry.gap), head2(entry.head2), offset2(entry.offset2), gap2(entry.gap2), sackEnabled(entry.sackEnabled), tsEnabled(entry.tsEnabled), tsRecent(entry.tsRecent), ecnEnabled(entry.ecnEnabled), ecePending(entry.ecePending), dsackValid(entry.dsackValid), dsackStart(entry.dsackStart), dsackLen(entry.dsackLen) {}
 #endif
 };
 
@@ -232,6 +240,9 @@ struct rxSarRecvd
 	bool		ecnEnabled = false; //only valid on init (RFC 3168)
 	ap_uint<1>	eceWrite = 0;       //update ecePending with the value below
 	bool		ece = false;
+	ap_uint<1>	dsackWrite = 0;     //record a D-SACK block (RFC 2883)
+	ap_uint<32>	dsackStart = 0;
+	ap_uint<16>	dsackLen = 0;
 	ap_uint<1> write;
 	ap_uint<1> init;
 	ap_uint<32> head;

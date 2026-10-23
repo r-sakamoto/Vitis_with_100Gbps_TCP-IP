@@ -101,7 +101,7 @@ void tx_engine(	stream<extendedEvent>&			eventEng2txEng_event,
 				stream<net_axis<WIDTH> >&			txApp2txEng_data_stream,
 #endif
 				stream<fourTuple>&				sLookup2txEng_rev_rsp,
-				stream<ap_uint<16> >&			txEng2rxSar_upd_req,
+				stream<ap_uint<17> >&			txEng2rxSar_upd_req,
 				stream<txTxSarQuery>&			txEng2txSar_upd_req,
 				stream<txRetransmitTimerSet>&	txEng2timer_setRetransmitTimer,
 				stream<ap_uint<16> >&			txEng2timer_setProbeTimer,

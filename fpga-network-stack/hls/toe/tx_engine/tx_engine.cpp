@@ -58,7 +58,7 @@
 void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				hls::stream<rxSarReply>&				rxSar2txEng_rsp,
 				hls::stream<txTxSarReply>&				txSar2txEng_upd_rsp,
-				hls::stream<ap_uint<16> >&				txEng2rxSar_req,
+				hls::stream<ap_uint<17> >&				txEng2rxSar_req,
 				hls::stream<txTxSarQuery>&				txEng2txSar_upd_req,
 				hls::stream<txRetransmitTimerSet>&		txEng2timer_setRetransmitTimer,
 				hls::stream<ap_uint<16> >&				txEng2timer_setProbeTimer,
@@ -140,7 +140,8 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 			case ACK_NODELAY:
 			case ACK:
 			case KEEPALIVE:
-				txEng2rxSar_req.write(ml_curEvent.sessionID);
+				// an ACK reports (and so consumes) a pending D-SACK block
+				txEng2rxSar_req.write((ap_uint<17>)ml_curEvent.sessionID | ((ap_uint<17>)(ml_curEvent.type != KEEPALIVE) << 16));
 				txEng2txSar_upd_req.write(txTxSarQuery(ml_curEvent.sessionID));
 				break;
 			case SYN:
@@ -566,8 +567,22 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				meta.cwr = 0;
 				meta.psh = 0;
 				// RFC 2018: advertise the buffered out-of-order ranges as
-				// SACK blocks while receive gaps are open (up to two blocks)
-				if (rxSar.gap && rxSar.sackEnabled)
+				// SACK blocks while receive gaps are open (up to two blocks).
+				// RFC 2883: a pending D-SACK block goes first, followed by
+				// the first out-of-order range.
+				if (rxSar.dsackValid && rxSar.sackEnabled && ml_curEvent.type != KEEPALIVE)
+				{
+					meta.sack = 1;
+					meta.sackStart = rxSar.dsackStart;
+					meta.sackEnd = rxSar.dsackStart + rxSar.dsackLen;
+					if (rxSar.gap)
+					{
+						meta.sack2 = 1;
+						meta.sackStart2 = rxSar.offset;
+						meta.sackEnd2 = rxSar.head;
+					}
+				}
+				else if (rxSar.gap && rxSar.sackEnabled)
 				{
 					meta.sack = 1;
 					meta.sackStart = rxSar.offset;
@@ -2248,7 +2263,7 @@ void tx_engine(	stream<extendedEvent>&			eventEng2txEng_event,
 				stream<net_axis<WIDTH> >&			txApp2txEng_data_stream,
 #endif
 				stream<fourTuple>&				sLookup2txEng_rev_rsp,
-				stream<ap_uint<16> >&			txEng2rxSar_req,
+				stream<ap_uint<17> >&			txEng2rxSar_req,
 				stream<txTxSarQuery>&			txEng2txSar_upd_req,
 				stream<txRetransmitTimerSet>&	txEng2timer_setRetransmitTimer,
 				stream<ap_uint<16> >&			txEng2timer_setProbeTimer,
@@ -2398,7 +2413,7 @@ template void tx_engine<DATA_WIDTH>(	stream<extendedEvent>&			eventEng2txEng_eve
 				stream<net_axis<DATA_WIDTH> >&			txApp2txEng_data_stream,
 #endif
 				stream<fourTuple>&				sLookup2txEng_rev_rsp,
-				stream<ap_uint<16> >&			txEng2rxSar_req,
+				stream<ap_uint<17> >&			txEng2rxSar_req,
 				stream<txTxSarQuery>&			txEng2txSar_upd_req,
 				stream<txRetransmitTimerSet>&	txEng2timer_setRetransmitTimer,
 				stream<ap_uint<16> >&			txEng2timer_setProbeTimer,

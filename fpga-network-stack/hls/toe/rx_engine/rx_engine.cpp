@@ -1289,7 +1289,22 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					ap_uint<32> newPeerSackStart2 = txSar.peerSackStart2;
 					ap_uint<32> newPeerSackEnd2 = txSar.peerSackEnd2;
 					ap_uint<1> newPeerSackValid2 = txSar.peerSackValid2;
-					if (fsm_meta.meta.sackValid)
+					// RFC 2883: a first block below the cumulative ACK, or inside
+					// the second block, is a D-SACK (a duplicate the peer got,
+					// e.g. after a spurious retransmit); it says nothing about
+					// holes, so the scoreboard uses the remaining block only
+					bool peerDsack = fsm_meta.meta.sackValid
+							&& (seq_leq(fsm_meta.meta.sackEnd, fsm_meta.meta.ackNumb)
+								|| (fsm_meta.meta.sackValid2 && seq_geq(fsm_meta.meta.sackStart, fsm_meta.meta.sackStart2)
+									&& seq_leq(fsm_meta.meta.sackEnd, fsm_meta.meta.sackEnd2)));
+					if (peerDsack && fsm_meta.meta.sackValid2)
+					{
+						newPeerSackStart = fsm_meta.meta.sackStart2;
+						newPeerSackEnd = fsm_meta.meta.sackEnd2;
+						newPeerSackValid = 1;
+						newPeerSackValid2 = 0;
+					}
+					else if (fsm_meta.meta.sackValid && !peerDsack)
 					{
 						newPeerSackStart = fsm_meta.meta.sackStart;
 						newPeerSackEnd = fsm_meta.meta.sackEnd;
@@ -1595,11 +1610,20 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						else
 						{
 							dropDataFifoOut.write(true);
-							if (eceChange)
+							// RFC 2883: a segment starting below rcv_nxt is a
+							// duplicate (fully, or its already received head);
+							// report it as a D-SACK block in the next ACK
+							bool dsackHit = rxSar.sackEnabled && seq_lt(segStart, rxSar.recvd)
+									&& ((ap_uint<32>)(rxSar.recvd - segStart) < (ap_uint<32>)BUFFER_SIZE);
+							ap_uint<32> dsackEnd = seq_lt(segEnd, rxSar.recvd) ? segEnd : rxSar.recvd;
+							if (eceChange || dsackHit)
 							{
 								rxSarRecvd eceOnlyUpd(fsm_meta.sessionID);
-								eceOnlyUpd.eceWrite = 1;
+								eceOnlyUpd.eceWrite = eceChange;
 								eceOnlyUpd.ece = eceNext;
+								eceOnlyUpd.dsackWrite = dsackHit;
+								eceOnlyUpd.dsackStart = segStart;
+								eceOnlyUpd.dsackLen = dsackEnd - segStart;
 								rxEng2rxSar_upd_req.write(eceOnlyUpd);
 							}
 							#ifndef __SYNTHESIS__
@@ -1645,11 +1669,19 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						else
 						{
 							dropDataFifoOut.write(true);
-							if (eceChange)
+							// RFC 2883 D-SACK for a duplicate (see the OOO path)
+							ap_uint<32> segStart = fsm_meta.meta.seqNumb;
+							bool dsackHit = rxSar.sackEnabled && seq_lt(segStart, rxSar.recvd)
+									&& ((ap_uint<32>)(rxSar.recvd - segStart) < (ap_uint<32>)BUFFER_SIZE);
+							ap_uint<32> dsackEnd = seq_lt(newRecvd, rxSar.recvd) ? newRecvd : rxSar.recvd;
+							if (eceChange || dsackHit)
 							{
 								rxSarRecvd eceOnlyUpd(fsm_meta.sessionID);
-								eceOnlyUpd.eceWrite = 1;
+								eceOnlyUpd.eceWrite = eceChange;
 								eceOnlyUpd.ece = eceNext;
+								eceOnlyUpd.dsackWrite = dsackHit;
+								eceOnlyUpd.dsackStart = segStart;
+								eceOnlyUpd.dsackLen = dsackEnd - segStart;
 								rxEng2rxSar_upd_req.write(eceOnlyUpd);
 							}
 						}

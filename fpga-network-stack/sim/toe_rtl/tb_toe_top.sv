@@ -3865,6 +3865,157 @@ module tb_toe_top;
     peer_ack += len;
   endtask
 
+  // R9: D-SACK (RFC 2883).
+  // Receiver: a duplicate segment is reported as the first SACK block of the
+  // next ACK (once), a partly old segment reports its old head, and with a
+  // receive gap open the D-SACK block is followed by the out-of-order range.
+  // Sender: a peer D-SACK block (below the cumulative ACK) must not replace
+  // the real SACK scoreboard.
+  task automatic test_dsack();
+    bytes_t p, segA, pay;
+    bit ok, found;
+    byte unsigned val;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] base_seq, s0, e0, s1, e1, d0_seq, d0_end;
+    int nb, got;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+
+    peer_port = 16'd41300; toe_port = 16'd80;
+    peer_seq  = 32'h9000_0000; peer_win = 16'hFFFF;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, 0, F_SYN, 16'hFFFF, syn_options_sack(), no_bytes()));
+    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 100000, 1);
+    if (err_count) return;
+    found = find_option(p, 8'h04, val);
+    tb_check(found, "SYN-ACK echoes SACK-Permitted");
+    peer_ack = f_seq(p) + 1;
+    peer_seq += 1;
+    peer_send_seg(F_ACK, no_bytes());
+    base_seq = peer_seq;
+
+    // in-order 1000B
+    segA = gen_payload(1000, 8'h51);
+    peer_send_seg(F_ACK, segA);
+    wait_notif(n, 200000, ok);
+    tb_check(ok && n.length == 1000, "in-order 1000B notified");
+    if (!ok) return;
+    sid = n.sessionID;
+    expect_flags(F_ACK, "ACK of 1000B", p, 400000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == base_seq + 1000, "ACK covers 1000B");
+    tb_check(get_sack_blocks(p, s0, e0, s1, e1) == 0, "no SACK block on a plain ACK");
+
+    // full duplicate -> D-SACK [base, base+1000)
+    peer_seq = base_seq;
+    peer_send_seg(F_ACK, segA);
+    expect_flags(F_ACK, "ACK of duplicate", p, 200000, 0);
+    if (err_count) return;
+    nb = get_sack_blocks(p, s0, e0, s1, e1);
+    tb_check(f_ack(p) == base_seq + 1000, "duplicate ACK number");
+    tb_check(nb == 1 && s0 == base_seq && e0 == base_seq + 1000,
+             $sformatf("D-SACK block n=%0d [%0d,%0d) expected [%0d,%0d)",
+                       nb, s0 - base_seq, e0 - base_seq, 0, 1000));
+
+    // next ACK no longer carries it
+    peer_seq = base_seq + 1000;
+    peer_send_seg(F_ACK, gen_payload(500, 8'h52));
+    wait_notif(n, 200000, ok);
+    tb_check(ok && n.length == 500, "in-order 500B notified");
+    expect_flags(F_ACK, "ACK of 500B", p, 400000, 0);
+    if (err_count) return;
+    tb_check(f_ack(p) == base_seq + 1500, "ACK covers 1500B");
+    tb_check(get_sack_blocks(p, s0, e0, s1, e1) == 0, "D-SACK reported only once");
+
+    // partly old segment [1200,1800) -> D-SACK of its old head [1200,1500)
+    peer_seq = base_seq + 1200;
+    peer_send_seg(F_ACK, gen_payload(600, 8'h53));
+    expect_flags(F_ACK, "ACK of partly old segment", p, 200000, 0);
+    if (err_count) return;
+    nb = get_sack_blocks(p, s0, e0, s1, e1);
+    tb_check(nb >= 1 && s0 == base_seq + 1200 && e0 == base_seq + 1500,
+             $sformatf("partial D-SACK n=%0d [%0d,%0d) expected [1200,1500)",
+                       nb, s0 - base_seq, e0 - base_seq));
+    peer_seq = f_ack(p);
+`ifdef NO_RX_BYPASS
+    // gap open: OOO [+500 .. +1000) beyond rcv_nxt, then a duplicate
+    // -> blocks: D-SACK first, then the out-of-order range
+    begin
+      bit [31:0] rn;
+      rn = f_ack(p);
+      peer_seq = rn + 500;
+      peer_send_seg(F_ACK, gen_payload(500, 8'h54));
+      expect_flags(F_ACK, "dup ACK (gap open)", p, 200000, 0);
+      if (err_count) return;
+      nb = get_sack_blocks(p, s0, e0, s1, e1);
+      tb_check(nb == 1 && s0 == rn + 500 && e0 == rn + 1000, "SACK block of the OOO range");
+      peer_seq = base_seq;
+      peer_send_seg(F_ACK, gen_payload(500, 8'h55));
+      expect_flags(F_ACK, "ACK of duplicate with gap", p, 200000, 0);
+      if (err_count) return;
+      nb = get_sack_blocks(p, s0, e0, s1, e1);
+      tb_check(nb == 2 && s0 == base_seq && e0 == base_seq + 500
+               && s1 == rn + 500 && e1 == rn + 1000,
+               $sformatf("D-SACK + SACK n=%0d [%0d,%0d) [%0d,%0d)",
+                         nb, s0 - base_seq, e0 - base_seq, s1 - base_seq, e1 - base_seq));
+      // fill the gap
+      peer_seq = rn;
+      peer_send_seg(F_ACK, gen_payload(500, 8'h56));
+      expect_flags(F_ACK, "ACK after gap fill", p, 400000, 0);
+      if (err_count) return;
+      tb_check(f_ack(p) == rn + 1000, "gap filled");
+      tb_check(get_sack_blocks(p, s0, e0, s1, e1) == 0, "no SACK block after gap fill");
+      peer_seq = rn + 1000;
+    end
+`endif
+    notif_q.delete();
+
+    // --- sender side: peer D-SACK must not clobber the SACK scoreboard ---
+    for (int i = 0; i < 5; i++) begin
+      pay = gen_payload(1000, 8'h60 + i[7:0]);
+      app_send(sid, pay, rsp);
+      tb_check(rsp.error == 0, $sformatf("app_send %0d accepted", i));
+    end
+    got = 0; d0_seq = 0;
+    while (got < 5) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout collecting data segments"); return; end
+      if (f_payload_len(p) == 1000) begin
+        if (got == 0) d0_seq = f_seq(p);
+        got++;
+      end
+    end
+    d0_end = d0_seq + 1000;
+    // new ACK with a real SACK block [2000,3000)
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port, peer_seq, d0_end, F_ACK, peer_win,
+                      sack_opt(d0_seq + 2000, d0_seq + 3000), no_bytes()));
+    repeat (100) @(posedge ap_clk);
+    // 3 dup ACKs that carry only a D-SACK block below the ACK
+    for (int i = 0; i < 3; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port, peer_seq, d0_end, F_ACK, peer_win,
+                        sack_opt(d0_seq, d0_end), no_bytes()));
+      repeat (50) @(posedge ap_clk);
+    end
+    // fast retransmit at d0_end, clamped at the (kept) SACK block start
+    got = 0;
+    while (got == 0) begin
+      wait_pkt(p, 500000, ok);
+      if (!ok) begin tb_error("timeout waiting for fast retransmit"); return; end
+      if (f_payload_len(p) > 0) begin
+        tb_check(f_seq(p) == d0_end, $sformatf("fast-rtx seq offset %0d expected 1000", f_seq(p) - d0_seq));
+        tb_check(f_payload_len(p) == 1000,
+                 $sformatf("fast-rtx len=%0d expected 1000 (stops at the SACKed block)", f_payload_len(p)));
+        got = 1;
+      end
+    end
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0_seq + 5000, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   task automatic test_ecn();
     bytes_t p;
     bit ok;
@@ -4633,6 +4784,7 @@ module tb_toe_top;
       "simultaneous_open": test_simultaneous_open();
       "simopen_giveup" : test_simopen_giveup();
       "ecn"            : test_ecn();
+      "dsack"          : test_dsack();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 

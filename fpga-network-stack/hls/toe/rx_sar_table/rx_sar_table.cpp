@@ -42,7 +42,7 @@ using namespace hls;
  */
 void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 					stream<rxSarAppd>&			rxApp2rxSar_upd_req,
-					stream<ap_uint<16> >&		txEng2rxSar_req, //read only
+					stream<ap_uint<17> >&		txEng2rxSar_req, //read; [16] = consume the D-SACK block
 					stream<rxSarEntry>&			rxSar2rxEng_upd_rsp,
 					stream<rxSarAppd>&			rxSar2rxApp_upd_rsp,
 					stream<rxSarReply>&			rxSar2txEng_rsp)
@@ -59,8 +59,10 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 	// SWS-avoidance advertised edge
 	if(!txEng2rxSar_req.empty())
 	{
-		ap_uint<16> addr = txEng2rxSar_req.read();
+		ap_uint<17> req = txEng2rxSar_req.read();
+		ap_uint<16> addr = req(15, 0);
 		rxSarEntry entry = rx_table[addr];
+		rxSarEntry updEntry = entry;
 		rxSarReply reply (entry);
 
 		//Pre-calculated usedLength, windowSize to improve timing in metaLoader
@@ -74,10 +76,18 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 		//moves left, the window still shrinks naturally as recvd advances
 		ap_uint<32> newEdge = entry.recvd + actualWindowSize;
 		ap_uint<32> advEdge = entry.advEdge;
-		if (seq_geq(newEdge, advEdge + (ap_uint<32>)MSS))
+		bool advance = seq_geq(newEdge, advEdge + (ap_uint<32>)MSS);
+		if (advance)
 		{
 			advEdge = newEdge;
-			rx_table[addr].advEdge = newEdge;
+			updEntry.advEdge = newEdge;
+		}
+		//req[16]: this read builds an ACK, which reports (consumes) the D-SACK block
+		bool dsackConsume = req[16] && entry.dsackValid;
+		updEntry.dsackValid = entry.dsackValid && !req[16];
+		if (advance || dsackConsume)
+		{
+			rx_table[addr] = updEntry;
 		}
 		ap_uint<WINDOW_BITS> advWindow = seq_lt(advEdge, entry.recvd)
 				? (ap_uint<WINDOW_BITS>)0
@@ -107,8 +117,15 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 	else if(!rxEng2rxSar_upd_req.empty())
 	{
 		rxSarRecvd in_recvd = rxEng2rxSar_upd_req.read();
-		if (in_recvd.write || in_recvd.tsWrite || in_recvd.eceWrite)
+		if (in_recvd.write || in_recvd.tsWrite || in_recvd.eceWrite || in_recvd.dsackWrite)
 		{
+			if (in_recvd.dsackWrite)
+			{
+				//RFC 2883: duplicate segment received
+				rx_table[in_recvd.sessionID].dsackValid = true;
+				rx_table[in_recvd.sessionID].dsackStart = in_recvd.dsackStart;
+				rx_table[in_recvd.sessionID].dsackLen = in_recvd.dsackLen;
+			}
 			if (in_recvd.tsWrite)
 			{
 				//RFC 7323: advance TS.Recent (also possible on pure ACKs)
@@ -135,6 +152,7 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 					rx_table[in_recvd.sessionID].tsEnabled = in_recvd.tsEnabled;
 					rx_table[in_recvd.sessionID].ecnEnabled = in_recvd.ecnEnabled;
 					rx_table[in_recvd.sessionID].ecePending = false;
+					rx_table[in_recvd.sessionID].dsackValid = false;
 					//initial advertised edge: the whole (empty) buffer
 					rx_table[in_recvd.sessionID].advEdge = in_recvd.recvd + (BUFFER_SIZE - 1);
 #if (WINDOW_SCALE)
