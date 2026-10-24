@@ -3872,7 +3872,7 @@ module tb_toe_top;
   // Sender: a peer D-SACK block (below the cumulative ACK) must not replace
   // the real SACK scoreboard.
   task automatic test_dsack();
-    bytes_t p, segA, pay;
+    bytes_t p, segA, pay, segOv;
     bit ok, found;
     byte unsigned val;
     notif_t n;
@@ -3930,15 +3930,48 @@ module tb_toe_top;
     tb_check(f_ack(p) == base_seq + 1500, "ACK covers 1500B");
     tb_check(get_sack_blocks(p, s0, e0, s1, e1) == 0, "D-SACK reported only once");
 
-    // partly old segment [1200,1800) -> D-SACK of its old head [1200,1500)
+    // partly old segment [1200,1800) -> D-SACK of its old head [1200,1500);
+    // the old head repeats the original bytes, as a retransmission does
+    segOv = gen_payload(600, 8'h53);
+    pay = gen_payload(500, 8'h52);
+    for (int i = 0; i < 300; i++) segOv[i] = pay[200 + i];
     peer_seq = base_seq + 1200;
-    peer_send_seg(F_ACK, gen_payload(600, 8'h53));
+    peer_send_seg(F_ACK, segOv);
     expect_flags(F_ACK, "ACK of partly old segment", p, 200000, 0);
     if (err_count) return;
     nb = get_sack_blocks(p, s0, e0, s1, e1);
     tb_check(nb >= 1 && s0 == base_seq + 1200 && e0 == base_seq + 1500,
              $sformatf("partial D-SACK n=%0d [%0d,%0d) expected [1200,1500)",
                        nb, s0 - base_seq, e0 - base_seq));
+`ifdef NO_RX_BYPASS
+    // DDR path: the new tail of the overlapping segment is accepted (the
+    // unread head is rewritten with the same bytes)
+    tb_check(f_ack(p) == base_seq + 1800, $sformatf("overlap accepted: ACK %0d expected 1800", f_ack(p) - base_seq));
+    begin
+      byte unsigned rdata[$];
+      bytes_t pb, pc;
+      pb = gen_payload(500, 8'h52);
+      pc = segOv;
+      app_read(sid, 1800, rdata);
+      tb_check(rdata.size() == 1800, "read 1800 bytes");
+      for (int i = 0; i < 1800 && i < rdata.size(); i++)
+        if (rdata[i] != ((i < 1000) ? segA[i] : (i < 1500) ? pb[i-1000] : pc[i-1200])) begin
+          tb_check(0, $sformatf("data mismatch at byte %0d after overlap accept", i));
+          break;
+        end
+    end
+    // head already read by the app: rewriting it could alias onto the far
+    // end of the window, so the segment is dropped (D-SACK of the old head)
+    peer_seq = base_seq + 1700;
+    peer_send_seg(F_ACK, gen_payload(400, 8'h57));
+    expect_flags(F_ACK, "ACK of overlap with a read head", p, 200000, 0);
+    if (err_count) return;
+    nb = get_sack_blocks(p, s0, e0, s1, e1);
+    tb_check(f_ack(p) == base_seq + 1800, "overlap with a read head is dropped");
+    tb_check(nb >= 1 && s0 == base_seq + 1700 && e0 == base_seq + 1800, "D-SACK [1700,1800)");
+`else
+    tb_check(f_ack(p) == base_seq + 1500, "bypass path drops the overlapping segment");
+`endif
     peer_seq = f_ack(p);
 `ifdef NO_RX_BYPASS
     // gap open: OOO [+500 .. +1000) beyond rcv_nxt, then a duplicate

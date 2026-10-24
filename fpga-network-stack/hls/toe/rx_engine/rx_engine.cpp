@@ -1510,12 +1510,24 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						bool inWindow = seq_leq(segEnd, winRight);
 						bool accepted = false;
 						ap_uint<WINDOW_BITS> notifyLen = 0;
+						// A segment that starts below rcv_nxt but carries new data
+						// (e.g. a repacketized retransmission) is accepted like an
+						// in-order one when its old head is still unread: the whole
+						// segment is written at its seq address, rewriting the
+						// unread head with the same bytes. An already read head
+						// would alias onto the far end of the window, so such a
+						// segment is still dropped (the peer resends from the ACK).
+						ap_uint<WINDOW_BITS> unread = rxSar.recvd(WINDOW_BITS-1, 0) - rxSar.appd;
+						ap_uint<32> oldHead = rxSar.recvd - segStart;
+						bool overlapHead = seq_lt(segStart, rxSar.recvd) && seq_gt(segEnd, rxSar.recvd)
+								&& (oldHead <= (ap_uint<32>)unread);
+						bool atRecvd = (segStart == rxSar.recvd) || overlapHead;
 
-						if (!r0v && (segStart == rxSar.recvd) && (free_space > fsm_meta.meta.length))
+						if (!r0v && atRecvd && (free_space > fsm_meta.meta.length))
 						{
 							// ### in order, no gap
 							newRecvd = segEnd;
-							notifyLen = fsm_meta.meta.length;
+							notifyLen = (ap_uint<WINDOW_BITS>)(segEnd - rxSar.recvd);
 							accepted = true;
 						}
 						else if (!r0v && seq_gt(segStart, rxSar.recvd) && inWindow)
@@ -1524,7 +1536,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							r0s = segStart; r0e = segEnd; r0v = true;
 							accepted = true;
 						}
-						else if (r0v && (segStart == rxSar.recvd))
+						else if (r0v && atRecvd)
 						{
 							// ### fill (or partly fill) the first gap; a merge may
 							// cascade through both buffered ranges. This also covers
@@ -1549,7 +1561,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							{
 								newRecvd = segEnd;
 							}
-							notifyLen = (ap_uint<WINDOW_BITS>)(newRecvd - segStart);
+							notifyLen = (ap_uint<WINDOW_BITS>)(newRecvd - rxSar.recvd);
 							accepted = true;
 						}
 						else if (r0v && (segStart == r0e) && (free_space > fsm_meta.meta.length))
@@ -1597,6 +1609,10 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							sarUpd.tsRecent = fsm_meta.meta.tsVal;
 							sarUpd.eceWrite = eceChange;
 							sarUpd.ece = eceNext;
+							// RFC 2883: report the duplicate head of an overlapping segment
+							sarUpd.dsackWrite = overlapHead && rxSar.sackEnabled;
+							sarUpd.dsackStart = segStart;
+							sarUpd.dsackLen = oldHead(15, 0);
 							rxEng2rxSar_upd_req.write(sarUpd);
 							//write to memory
 							rxBufferWriteCmd.write(mmCmd(pkgAddr, fsm_meta.meta.length));
