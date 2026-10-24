@@ -42,11 +42,16 @@ void ack_delay(	stream<extendedEvent>&	input,
 	#pragma HLS bind_storage variable=ack_table type=RAM_2P impl=BRAM
 	#pragma HLS DEPENDENCE variable=ack_table inter false
 	static ap_uint<16>	ad_pointer = 0;
+	// consecutive cycles spent on input events; every 4th busy cycle goes to
+	// the timer scan so a pending delayed ACK cannot be postponed forever by
+	// a continuous event stream (the scan used to run only on idle cycles)
+	static ap_uint<2>	ad_busyCount = 0;
 	//static ap_uint<4>	ad_readCounter = 0;
 	extendedEvent ev;
 
-	if (!input.empty())
+	if (!input.empty() && ad_busyCount != 3)
 	{
+		ad_busyCount++;
 		input.read(ev);
 		readCountFifo.write(1);
 		// Check if there is a delayed ACK
@@ -64,6 +69,7 @@ void ack_delay(	stream<extendedEvent>&	input,
 	}
 	else
 	{
+		ad_busyCount = 0;
 		if (ack_table[ad_pointer] > 0 && !output.full())
 		{
 			if (ack_table[ad_pointer] == 1)
