@@ -1271,6 +1271,9 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					// per-session effective MSS for congestion arithmetic
 					ap_uint<16> sessMSS = (txSar.mss == 0) ? (ap_uint<16>)MSS : txSar.mss;
 					bool enterFastRecovery = false;
+					// congestion state before this ACK, saved on recovery entry
+					ap_uint<WINDOW_BITS> priorCwnd = txSar.cong_window;
+					ap_uint<WINDOW_BITS> priorSsthresh = txSar.slowstart_threshold;
 					// RFC 3168 6.1.2: an ECE halves cwnd (ssthresh = max(cwnd/2,
 					// 2*MSS), cwnd = ssthresh) at most once per window of data,
 					// and not while loss recovery already reduced it. Derived
@@ -1399,6 +1402,30 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						txSar.cong_window = ecnSsthresh;
 						txSar.ca_acc = 0;
 					}
+					// RFC 2883 / Linux tcp_try_undo_dsack: a D-SACK covering the
+					// first byte retransmitted by the last fast recovery shows
+					// that the original segment was only reordered, so the
+					// window reduction is undone (once). A timeout or an ECN
+					// reduction cancels the undo. Only outside recovery (or on
+					// the ACK that ends it): exiting recovery deflates cwnd to
+					// ssthresh, which the undo may have raised to its initial
+					// value.
+					bool undoHit = txSar.undoValid && peerDsack && !enterFastRecovery && !ecnReduce
+							&& !txSar.fastRetransmitted
+							&& seq_leq(fsm_meta.meta.sackStart, txSar.undoSeq)
+							&& seq_lt(txSar.undoSeq, fsm_meta.meta.sackEnd);
+					if (undoHit)
+					{
+						if (txSar.cong_window < txSar.undoCwnd)
+						{
+							txSar.cong_window = txSar.undoCwnd;
+						}
+						if (txSar.slowstart_threshold < txSar.undoSsthresh)
+						{
+							txSar.slowstart_threshold = txSar.undoSsthresh;
+						}
+						txSar.ca_acc = 0;
+					}
 					// TX SAR
 					// mod-2^32 form of "snd_una <= ack <= snd_nxt" (replaces the
 					// hand-rolled two-case wrap check)
@@ -1406,7 +1433,12 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					{
 						rxTxSarQuery txSarUpd(fsm_meta.sessionID, fsm_meta.meta.ackNumb, fsm_meta.meta.winSize, txSar.cong_window, txSar.count, ((txSar.count == 3) || txSar.fastRetransmitted));
 						txSarUpd.ssthresh = txSar.slowstart_threshold;
-						txSarUpd.writeSsthresh = enterFastRecovery || ecnReduce;
+						txSarUpd.writeSsthresh = enterFastRecovery || ecnReduce || undoHit;
+						txSarUpd.undoUpdate = enterFastRecovery || ecnReduce || undoHit;
+						txSarUpd.undoValid = enterFastRecovery;
+						txSarUpd.undoCwnd = priorCwnd;
+						txSarUpd.undoSsthresh = priorSsthresh;
+						txSarUpd.undoSeq = txSar.prevAck;
 						txSarUpd.ca_acc = enterFastRecovery ? (ap_uint<WINDOW_BITS>)0 : txSar.ca_acc;
 						txSarUpd.ecnUpdate = 1;
 						txSarUpd.ecnHold = ecnHoldNow || ecnReduce;

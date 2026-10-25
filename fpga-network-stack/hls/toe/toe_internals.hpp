@@ -314,6 +314,12 @@ struct txSarEntry
 	bool		cwrPending;
 	bool		ecnHold;
 	ap_uint<32>	ecnRecover;
+	//congestion state before the last fast recovery entry, restored when a
+	//D-SACK shows that the first retransmitted segment had arrived (RFC 2883)
+	bool		undoValid;
+	ap_uint<WINDOW_BITS> undoCwnd;
+	ap_uint<WINDOW_BITS> undoSsthresh;
+	ap_uint<32>	undoSeq;
 };
 
 struct rxTxSarQuery
@@ -343,6 +349,11 @@ struct rxTxSarQuery
 	bool		ecnHold = false;
 	ap_uint<1>	ecnReduce = 0;      //cwnd was reduced for an ECE: owe CWR, hold until ecnRecover
 	ap_uint<32>	ecnRecover = 0;
+	ap_uint<1>	undoUpdate = 0;     //write the undo state below
+	bool		undoValid = false;
+	ap_uint<WINDOW_BITS> undoCwnd = 0;
+	ap_uint<WINDOW_BITS> undoSsthresh = 0;
+	ap_uint<32>	undoSeq = 0;
 	ap_uint<1> write;
 	ap_uint<1>	init;
 	rxTxSarQuery () {}
@@ -427,6 +438,10 @@ struct rxTxSarReply
 	bool		ecnEnabled = false;
 	bool		ecnHold = false;
 	ap_uint<32>	ecnRecover = 0;
+	bool		undoValid = false;
+	ap_uint<WINDOW_BITS> undoCwnd = 0;
+	ap_uint<WINDOW_BITS> undoSsthresh = 0;
+	ap_uint<32>	undoSeq = 0;
 	rxTxSarReply() {}
 	rxTxSarReply(ap_uint<32> ack, ap_uint<32> next, ap_uint<WINDOW_BITS> cong_win, ap_uint<WINDOW_BITS> sstresh, ap_uint<2> count, bool fastRetransmitted)
 			:prevAck(ack), nextByte(next), cong_window(cong_win), slowstart_threshold(sstresh), count(count), fastRetransmitted(fastRetransmitted), mss(MSS), ca_acc(0), peerSackStart(0), peerSackEnd(0), peerSackValid(false) {}

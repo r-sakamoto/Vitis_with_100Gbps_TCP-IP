@@ -4104,6 +4104,103 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // R13: D-SACK undo (RFC 2883, Linux tcp_try_undo_dsack). Three duplicate
+  // ACKs cause a fast recovery; the peer later reports a D-SACK for the first
+  // retransmitted segment (the original was only reordered), which restores
+  // the cwnd/ssthresh from before the recovery. A D-SACK for another range
+  // must not undo.
+  task automatic test_dsack_undo();
+    bytes_t p, pay;
+    bit ok, ok2;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] d0;
+    int got;
+    int unsigned cw, ssth, cw0, ssth0, cwr, ssthr;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+    peer_port = 16'd42600; toe_port = 16'd80;
+    peer_seq  = 32'hA100_0000; peer_win = 16'hFFFF;
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, 0, F_SYN, 16'hFFFF, syn_options_sack(), no_bytes()));
+    expect_flags(F_SYN | F_ACK, "SYN-ACK", p, 100000, 1);
+    if (err_count) return;
+    peer_ack = f_seq(p) + 1;
+    peer_seq += 1;
+    peer_send_seg(F_ACK, no_bytes());
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    for (int i = 0; i < 8; i++) begin
+      pay = gen_payload(1400, 8'h70 + i[7:0]);
+      app_send(sid, pay, rsp);
+      tb_check(rsp.error == 0, $sformatf("app_send %0d accepted", i));
+    end
+    got = 0;
+    while (got < 8) begin
+      wait_pkt(p, 400000, ok2);
+      if (!ok2) begin tb_error("timeout collecting data segments"); return; end
+      if (f_payload_len(p) == 1400) begin
+        if (got == 0) d0 = f_seq(p);
+        got++;
+      end
+    end
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 1400, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    cw0   = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    ssth0 = dut.tx_sar_table_U0.tx_table_slowstart_threshold_V_U.ram[sid];
+
+    // 3 duplicate ACKs -> fast recovery (retransmits from d0+1400)
+    for (int i = 0; i < 3; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, d0 + 1400, F_ACK, peer_win, no_bytes(), no_bytes()));
+      repeat (100) @(posedge ap_clk);
+    end
+    repeat (3000) @(posedge ap_clk);
+    ssthr = dut.tx_sar_table_U0.tx_table_slowstart_threshold_V_U.ram[sid];
+    tb_check(ssthr == 4900, $sformatf("ssthresh=%0d expected 4900 on recovery entry", ssthr));
+    // full ACK ends the recovery: cwnd deflates to ssthresh
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 11200, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    cwr = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cwr == 4900, $sformatf("cwnd=%0d expected 4900 after recovery", cwr));
+
+    // D-SACK of a later segment: no undo
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 11200, F_ACK, peer_win,
+                      sack_opt(d0 + 2800, d0 + 4200), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    cw   = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    ssth = dut.tx_sar_table_U0.tx_table_slowstart_threshold_V_U.ram[sid];
+    tb_check(cw == cwr && ssth == ssthr,
+             $sformatf("D-SACK of another range keeps cwnd=%0d ssthresh=%0d", cw, ssth));
+
+    // D-SACK of the first retransmitted segment: undo
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 11200, F_ACK, peer_win,
+                      sack_opt(d0 + 1400, d0 + 2800), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    cw   = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    ssth = dut.tx_sar_table_U0.tx_table_slowstart_threshold_V_U.ram[sid];
+    tb_check(cw == cw0, $sformatf("undo restores cwnd=%0d expected %0d", cw, cw0));
+    tb_check(ssth == ssth0, $sformatf("undo restores ssthresh=%0d expected %0d", ssth, ssth0));
+
+    // the undo is applied once
+    tb_check(dut.tx_sar_table_U0.tx_table_undoValid_U.ram[sid] == 0, "undo state cleared");
+
+    while (net_pkts.size() > 0) void'(net_pkts.pop_front());
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   task automatic test_ecn();
     bytes_t p;
     bit ok;
@@ -4873,6 +4970,7 @@ module tb_toe_top;
       "simopen_giveup" : test_simopen_giveup();
       "ecn"            : test_ecn();
       "dsack"          : test_dsack();
+      "dsack_undo"     : test_dsack_undo();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 
