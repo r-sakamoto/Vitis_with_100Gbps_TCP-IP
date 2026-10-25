@@ -3871,6 +3871,14 @@ module tb_toe_top;
   // receive gap open the D-SACK block is followed by the out-of-order range.
   // Sender: a peer D-SACK block (below the cumulative ACK) must not replace
   // the real SACK scoreboard.
+  // deterministic stream bytes by stream offset (retransmissions repeat them)
+  function automatic bytes_t dsack_stream(input int off, input int len);
+    bytes_t b;
+    b = new[len];
+    for (int i = 0; i < len; i++) b[i] = ((off + i) * 13 + 5) & 8'hFF;
+    return b;
+  endfunction
+
   task automatic test_dsack();
     bytes_t p, segA, pay, segOv;
     bit ok, found;
@@ -3943,16 +3951,29 @@ module tb_toe_top;
     tb_check(nb >= 1 && s0 == base_seq + 1200 && e0 == base_seq + 1500,
              $sformatf("partial D-SACK n=%0d [%0d,%0d) expected [1200,1500)",
                        nb, s0 - base_seq, e0 - base_seq));
-`ifdef NO_RX_BYPASS
-    // DDR path: the new tail of the overlapping segment is accepted (the
-    // unread head is rewritten with the same bytes)
+    // the new tail of the overlapping segment is accepted: the DDR path
+    // rewrites the unread head with the same bytes, the bypass path trims it
     tb_check(f_ack(p) == base_seq + 1800, $sformatf("overlap accepted: ACK %0d expected 1800", f_ack(p) - base_seq));
     begin
       byte unsigned rdata[$];
       bytes_t pb, pc;
       pb = gen_payload(500, 8'h52);
       pc = segOv;
+`ifdef NO_RX_BYPASS
       app_read(sid, 1800, rdata);
+`else
+      // bypass: one read request releases one received segment
+      begin
+        byte unsigned part[$];
+        int lens[3];
+        lens = '{1000, 500, 300};
+        rdata.delete();
+        foreach (lens[k]) begin
+          app_read(sid, lens[k], part);
+          foreach (part[m]) rdata.push_back(part[m]);
+        end
+      end
+`endif
       tb_check(rdata.size() == 1800, "read 1800 bytes");
       for (int i = 0; i < 1800 && i < rdata.size(); i++)
         if (rdata[i] != ((i < 1000) ? segA[i] : (i < 1500) ? pb[i-1000] : pc[i-1200])) begin
@@ -3960,17 +3981,51 @@ module tb_toe_top;
           break;
         end
     end
-    // head already read by the app: rewriting it could alias onto the far
-    // end of the window, so the segment is dropped (D-SACK of the old head)
+    // let the window-update ACKs of the reads go out first
+    repeat (30000) @(posedge ap_clk);
+    net_pkts.delete();
     peer_seq = base_seq + 1700;
-    peer_send_seg(F_ACK, gen_payload(400, 8'h57));
+    peer_send_seg(F_ACK, dsack_stream(1700, 400));
     expect_flags(F_ACK, "ACK of overlap with a read head", p, 200000, 0);
     if (err_count) return;
     nb = get_sack_blocks(p, s0, e0, s1, e1);
-    tb_check(f_ack(p) == base_seq + 1800, "overlap with a read head is dropped");
     tb_check(nb >= 1 && s0 == base_seq + 1700 && e0 == base_seq + 1800, "D-SACK [1700,1800)");
+`ifdef NO_RX_BYPASS
+    // head already read by the app: rewriting it could alias onto the far
+    // end of the window, so the segment is dropped
+    tb_check(f_ack(p) == base_seq + 1800, "overlap with a read head is dropped");
 `else
-    tb_check(f_ack(p) == base_seq + 1500, "bypass path drops the overlapping segment");
+    // bypass: trimmed regardless of the app read pointer. Cases exercise the
+    // package dropper paths: skip+shift (100), shift only (4), skip only (8),
+    // a single-word payload with shift (4 of 6)
+    begin
+      int cs[4], cl[4], prev_end;
+      byte unsigned rdata[$];
+      bytes_t exp;
+      cs = '{1700, 2096, 2192, 2296}; cl = '{400, 104, 108, 6};
+      prev_end = 1800;
+      for (int c = 0; c < 4; c++) begin
+        if (c != 0) begin
+          repeat (30000) @(posedge ap_clk);
+          net_pkts.delete();
+          peer_seq = base_seq + cs[c];
+          peer_send_seg(F_ACK, dsack_stream(cs[c], cl[c]));
+          expect_flags(F_ACK, $sformatf("ACK of overlap case %0d", c), p, 200000, 0);
+          if (err_count) return;
+        end
+        tb_check(f_ack(p) == base_seq + cs[c] + cl[c],
+                 $sformatf("trim case %0d: ACK %0d expected %0d", c, f_ack(p) - base_seq, cs[c] + cl[c]));
+        exp = dsack_stream(prev_end, cs[c] + cl[c] - prev_end);
+        app_read(sid, exp.size(), rdata);
+        tb_check(rdata.size() == exp.size(), $sformatf("trim case %0d: read %0d bytes", c, exp.size()));
+        for (int i = 0; i < exp.size() && i < rdata.size(); i++)
+          if (rdata[i] != exp[i]) begin
+            tb_check(0, $sformatf("trim case %0d: data mismatch at byte %0d (%h != %h)", c, i, rdata[i], exp[i]));
+            break;
+          end
+        prev_end = cs[c] + cl[c];
+      end
+    end
 `endif
     peer_seq = f_ack(p);
 `ifdef NO_RX_BYPASS

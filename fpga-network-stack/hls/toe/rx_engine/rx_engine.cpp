@@ -1118,7 +1118,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						stream<ap_uint<16> >&					rxEng2timer_setCloseTimer,
 						stream<openStatus>&						openConStatusOut,
 						stream<event>&							rxEng2eventEng_setEvent,
-						stream<bool>&							dropDataFifoOut,
+						stream<ap_uint<17> >&					dropDataFifoOut, //[0] drop, [16:1] head bytes to trim
 						stream<rttAck>&							rxEng2rtt_ack,
 						stream<ap_uint<16> >&					rxEng2timer_resetKeepalive,
 						stream<bool>&						stateTable2rxEng_synBacklogFull,
@@ -1663,15 +1663,24 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					{
 						ap_uint<32> newRecvd = fsm_meta.meta.seqNumb+fsm_meta.meta.length;
 						ap_uint<32> newHead = fsm_meta.meta.seqNumb+fsm_meta.meta.length;
+						// A segment that starts below rcv_nxt but carries new data
+						// (e.g. a repacketized retransmission) is accepted with its
+						// already received head trimmed off by the package dropper
+						ap_uint<32> oldHead = rxSar.recvd - fsm_meta.meta.seqNumb;
+						bool overlapHead = seq_lt(fsm_meta.meta.seqNumb, rxSar.recvd) && seq_gt(newRecvd, rxSar.recvd);
 						// Second part makes sure that app pointer is not overtaken
 						// Check if segment in order and if enough free space is available
-						if ((fsm_meta.meta.seqNumb == rxSar.recvd) && ((rxbuffer_max_data_count - rxbuffer_data_count) > 375))
+						if (((fsm_meta.meta.seqNumb == rxSar.recvd) || overlapHead) && ((rxbuffer_max_data_count - rxbuffer_data_count) > 375))
 						{
 							rxSarRecvd sarUpd3(fsm_meta.sessionID, newRecvd, newHead, rxSar.offset, rxSar.gap);
 							sarUpd3.tsWrite = tsUpdate;
 							sarUpd3.tsRecent = fsm_meta.meta.tsVal;
 							sarUpd3.eceWrite = eceChange;
 							sarUpd3.ece = eceNext;
+							// RFC 2883: report the trimmed duplicate head
+							sarUpd3.dsackWrite = overlapHead && rxSar.sackEnabled;
+							sarUpd3.dsackStart = fsm_meta.meta.seqNumb;
+							sarUpd3.dsackLen = oldHead(15, 0);
 							rxEng2rxSar_upd_req.write(sarUpd3);
 							// Build memory address
 							ap_uint<32> pkgAddr;
@@ -1679,8 +1688,9 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							pkgAddr(29, WINDOW_BITS) = fsm_meta.sessionID(13, 0);
 							pkgAddr(WINDOW_BITS-1, 0) = fsm_meta.meta.seqNumb(WINDOW_BITS-1, 0);
 							// Only notify about new data available
-							rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, fsm_meta.meta.length, fsm_meta.srcIpAddress, fsm_meta.dstIpPort));
-							dropDataFifoOut.write(false);
+							ap_uint<16> trim = overlapHead ? oldHead(15, 0) : (ap_uint<16>)0;
+							rxEng2rxApp_notification.write(appNotification(fsm_meta.sessionID, fsm_meta.meta.length - trim, fsm_meta.srcIpAddress, fsm_meta.dstIpPort));
+							dropDataFifoOut.write((ap_uint<17>)trim << 1);
 						}
 						else
 						{
@@ -2180,15 +2190,22 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 template <int WIDTH>
 void rxPackageDropper(stream<net_axis<WIDTH> >&		dataIn,
 					  stream<bool>&			dropFifoIn1,
-					  stream<bool>&			dropFifoIn2,
+					  stream<ap_uint<17> >&	dropFifoIn2, //[0] drop, [16:1] head bytes to trim
 					  stream<net_axis<WIDTH> >&		rxBufferDataOut) {
 #pragma HLS INLINE off
 #pragma HLS pipeline II=1
 
-	enum tpfStateType {READ_DROP1, READ_DROP2, FWD, DROP};
+	enum tpfStateType {READ_DROP1, READ_DROP2, FWD, DROP, SKIP, SHIFT, REMAINDER};
 	static tpfStateType tpf_state = READ_DROP1;
+	// head trimming: SKIP discards whole words, SHIFT realigns the rest by
+	// tpf_off bytes (tpf_first: the first realigned word is still pending)
+	static ap_uint<16> tpf_trim = 0;
+	static ap_uint<8> tpf_off = 0;
+	static bool tpf_first = true;
+	static net_axis<WIDTH> tpf_prev;
 
 	bool drop;
+	ap_uint<17> drop2;
 
 	switch (tpf_state) {
 	case READ_DROP1: //Drop1
@@ -2208,15 +2225,79 @@ void rxPackageDropper(stream<net_axis<WIDTH> >&		dataIn,
 	case READ_DROP2:
 		if (!dropFifoIn2.empty())
 		{
-			dropFifoIn2.read(drop);
-			if (drop)
+			dropFifoIn2.read(drop2);
+			tpf_trim = drop2(16, 1);
+			tpf_off = drop2(16, 1) % (WIDTH/8);
+			tpf_first = true;
+			if (drop2[0])
 			{
 				tpf_state = DROP;
+			}
+			else if (drop2(16, 1) >= (WIDTH/8))
+			{
+				tpf_state = SKIP;
+			}
+			else if (drop2(16, 1) != 0)
+			{
+				tpf_state = SHIFT;
 			}
 			else
 			{
 				tpf_state = FWD;
 			}
+		}
+		break;
+	case SKIP:
+		// the trimmed head is shorter than the payload: never the last word
+		if (!dataIn.empty())
+		{
+			dataIn.read();
+			tpf_trim -= (WIDTH/8);
+			if (tpf_trim < (WIDTH/8))
+			{
+				tpf_state = (tpf_off == 0) ? FWD : SHIFT;
+			}
+		}
+		break;
+	case SHIFT:
+		if (!dataIn.empty())
+		{
+			net_axis<WIDTH> currWord = dataIn.read();
+			net_axis<WIDTH> sendWord;
+			if (tpf_first)
+			{
+				if (currWord.last)
+				{
+					sendWord.data = currWord.data >> (8*tpf_off);
+					sendWord.keep = currWord.keep >> tpf_off;
+					sendWord.last = 1;
+					rxBufferDataOut.write(sendWord);
+					tpf_state = READ_DROP1;
+				}
+				tpf_first = false;
+			}
+			else
+			{
+				sendWord.data = (tpf_prev.data >> (8*tpf_off)) | (currWord.data << (WIDTH - 8*tpf_off));
+				sendWord.keep = (tpf_prev.keep >> tpf_off) | (currWord.keep << (WIDTH/8 - tpf_off));
+				sendWord.last = currWord.last && ((currWord.keep >> tpf_off) == 0);
+				rxBufferDataOut.write(sendWord);
+				if (currWord.last)
+				{
+					tpf_state = sendWord.last ? READ_DROP1 : REMAINDER;
+				}
+			}
+			tpf_prev = currWord;
+		}
+		break;
+	case REMAINDER:
+		{
+			net_axis<WIDTH> sendWord;
+			sendWord.data = tpf_prev.data >> (8*tpf_off);
+			sendWord.keep = tpf_prev.keep >> tpf_off;
+			sendWord.last = 1;
+			rxBufferDataOut.write(sendWord);
+			tpf_state = READ_DROP1;
 		}
 		break;
 	case FWD:
@@ -2576,7 +2657,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 	#pragma HLS aggregate  variable=rxEng_fsmEventFifo compact=bit
 
 	static stream<bool>					rxEng_metaHandlerDropFifo("rxEng_metaHandlerDropFifo");
-	static stream<bool>					rxEng_fsmDropFifo("rxEng_fsmDropFifo");
+	static stream<ap_uint<17> >			rxEng_fsmDropFifo("rxEng_fsmDropFifo");
 	#pragma HLS stream variable=rxEng_metaHandlerDropFifo depth=2
 	#pragma HLS stream variable=rxEng_fsmDropFifo depth=2
 	#pragma HLS aggregate  variable=rxEng_metaHandlerDropFifo compact=bit
