@@ -1107,7 +1107,7 @@ void rxMetadataHandler(	stream<rxEngineMetaData>&				metaDataFifoIn,
 
 void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						stream<sessionState>&					stateTable2rxEng_upd_rsp,
-						stream<rxSarEntry>&						rxSar2rxEng_upd_rsp,
+						stream<rxSarEngReply>&					rxSar2rxEng_upd_rsp,
 						stream<rxTxSarReply>&					txSar2rxEng_upd_rsp,
 						stream<stateQuery>&						rxEng2stateTable_upd_req,
 						stream<rxSarRecvd>&						rxEng2rxSar_upd_req,
@@ -1155,7 +1155,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 
 	ap_uint<4> control_bits = 0;
 	sessionState tcpState;
-	rxSarEntry rxSar;
+	rxSarEngReply rxSar;
 	rxTxSarReply txSar;
 
 
@@ -1514,7 +1514,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 #if !(RX_DDR_BYPASS) //if enable DDR, OOO is enabled
 					// Check if packet contains payload
 					// Second part makes sure that app pointer is not overtaken
-					ap_uint<WINDOW_BITS> free_space = ((rxSar.appd - (rxSar.gap2 ? rxSar.head2(WINDOW_BITS-1, 0) : rxSar.head(WINDOW_BITS-1, 0))) - 1);
+					ap_uint<WINDOW_BITS> free_space = rxSar.freeSpace; //appd - highest buffered byte - 1
 					
 					if (fsm_meta.meta.length != 0)
 					{
@@ -1537,9 +1537,10 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						ap_uint<32> segStart = fsm_meta.meta.seqNumb;
 						ap_uint<32> segEnd = fsm_meta.meta.seqNumb + fsm_meta.meta.length;
 						// wrap-safe acceptance: the whole segment must lie inside
-						// the advertised receive window (see the F2 fix)
-						ap_uint<32> winRight = rxSar.recvd + (ap_uint<32>)(ap_uint<WINDOW_BITS>)(rxSar.appd - rxSar.recvd(WINDOW_BITS-1, 0) - 1);
-						bool inWindow = seq_leq(segEnd, winRight);
+						// the advertised receive window (see the F2 fix). Only used
+						// for segments starting above rcv_nxt, so the distance
+						// segEnd - rcv_nxt is compared directly with the window.
+						bool inWindow = (ap_uint<32>)(segEnd - rxSar.recvd) <= (ap_uint<32>)rxSar.winSpace;
 						bool accepted = false;
 						ap_uint<WINDOW_BITS> notifyLen = 0;
 						// A segment that starts below rcv_nxt but carries new data
@@ -1549,7 +1550,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						// unread head with the same bytes. An already read head
 						// would alias onto the far end of the window, so such a
 						// segment is still dropped (the peer resends from the ACK).
-						ap_uint<WINDOW_BITS> unread = rxSar.recvd(WINDOW_BITS-1, 0) - rxSar.appd;
+						ap_uint<WINDOW_BITS> unread = ~rxSar.winSpace; //recvd - appd
 						ap_uint<32> oldHead = rxSar.recvd - segStart;
 						bool overlapHead = seq_lt(segStart, rxSar.recvd) && seq_gt(segEnd, rxSar.recvd)
 								&& (oldHead <= (ap_uint<32>)unread);
@@ -2613,7 +2614,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 				stream<sessionLookupReply>&			sLookup2rxEng_rsp,
 				stream<sessionState>&				stateTable2rxEng_upd_rsp,
 				stream<bool>&						portTable2rxEng_rsp,
-				stream<rxSarEntry>&					rxSar2rxEng_upd_rsp,
+				stream<rxSarEngReply>&				rxSar2rxEng_upd_rsp,
 				stream<rxTxSarReply>&				txSar2rxEng_upd_rsp,
 #if !(RX_DDR_BYPASS)
 				stream<mmStatus>&					rxBufferWriteStatus,
@@ -2845,7 +2846,7 @@ template void rx_engine<DATA_WIDTH>(	stream<net_axis<DATA_WIDTH> >&					ipRxData
 				stream<sessionLookupReply>&			sLookup2rxEng_rsp,
 				stream<sessionState>&				stateTable2rxEng_upd_rsp,
 				stream<bool>&						portTable2rxEng_rsp,
-				stream<rxSarEntry>&					rxSar2rxEng_upd_rsp,
+				stream<rxSarEngReply>&				rxSar2rxEng_upd_rsp,
 				stream<rxTxSarReply>&				txSar2rxEng_upd_rsp,
 #if !(RX_DDR_BYPASS)
 				stream<mmStatus>&					rxBufferWriteStatus,

@@ -196,6 +196,21 @@ struct rxSarEntry
 	ap_uint<16> dsackLen;
 };
 
+//rx_sar_table reply to the rx engine: the entry plus window arithmetic
+//precomputed in the table (keeps it off the rxTcpFSM critical path)
+struct rxSarEngReply : public rxSarEntry
+{
+	ap_uint<WINDOW_BITS> winSpace;  //appd - recvd - 1: receive window left of rcv_nxt
+	ap_uint<WINDOW_BITS> freeSpace; //appd - (highest buffered byte) - 1
+	rxSarEngReply() {}
+	rxSarEngReply(const rxSarEntry& entry)
+		:rxSarEntry(entry)
+	{
+		winSpace = entry.appd - entry.recvd(WINDOW_BITS-1, 0) - 1;
+		freeSpace = entry.appd - (entry.gap2 ? entry.head2(WINDOW_BITS-1, 0) : entry.head(WINDOW_BITS-1, 0)) - 1;
+	}
+};
+
 struct rxSarReply
 {
 	ap_uint<32> recvd;

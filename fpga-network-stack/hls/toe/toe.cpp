@@ -600,7 +600,7 @@ void toe(	// Data & Memory Interface
 
 	// RX Sar Table
 	static stream<rxSarRecvd>			rxEng2rxSar_upd_req("rxEng2rxSar_upd_req");
-	static stream<rxSarEntry>			rxSar2rxEng_upd_rsp("rxSar2rxEng_upd_rsp");
+	static stream<rxSarEngReply>		rxSar2rxEng_upd_rsp("rxSar2rxEng_upd_rsp");
 	static stream<rxSarAppd>			rxApp2rxSar_upd_req("rxApp2rxSar_upd_req");
 	static stream<rxSarAppd>			rxSar2rxApp_upd_rsp("rxSar2rxApp_upd_rsp");
 	static stream<ap_uint<17> >			txEng2rxSar_req("txEng2rxSar_req");

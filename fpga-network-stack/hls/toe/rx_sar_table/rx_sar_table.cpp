@@ -43,7 +43,7 @@ using namespace hls;
 void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 					stream<rxSarAppd>&			rxApp2rxSar_upd_req,
 					stream<ap_uint<17> >&		txEng2rxSar_req, //read; [16] = consume the D-SACK block
-					stream<rxSarEntry>&			rxSar2rxEng_upd_rsp,
+					stream<rxSarEngReply>&		rxSar2rxEng_upd_rsp,
 					stream<rxSarAppd>&			rxSar2rxApp_upd_rsp,
 					stream<rxSarReply>&			rxSar2txEng_rsp)
 {
@@ -163,7 +163,7 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
 		}
 		else
 		{
-			rxSar2rxEng_upd_rsp.write(rx_table[in_recvd.sessionID]);
+			rxSar2rxEng_upd_rsp.write(rxSarEngReply(rx_table[in_recvd.sessionID]));
 		}
 	}
 }

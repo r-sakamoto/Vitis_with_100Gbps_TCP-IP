@@ -106,7 +106,7 @@ void rx_engine(	stream<net_axis<WIDTH> >&					ipRxData,
 				stream<sessionLookupReply>&			sLookup2rxEng_rsp,
 				stream<sessionState>&				stateTable2rxEng_upd_rsp,
 				stream<bool>&						portTable2rxEng_rsp,
-				stream<rxSarEntry>&					rxSar2rxEng_upd_rsp,
+				stream<rxSarEngReply>&				rxSar2rxEng_upd_rsp,
 				stream<rxTxSarReply>&				txSar2rxEng_upd_rsp,
 #if !(RX_DDR_BYPASS)
 				stream<mmStatus>&					rxBufferWriteStatus,
