@@ -44,7 +44,7 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 |---|---|---|---|
 | 順序入替(OOO)受信 | **2ギャップ対応** (M1, `multi_gap_sack`テスト): 非bypass構成で同時2レンジをバッファし、充填時のカスケードマージ・上方拡張・レンジ昇格をサポート。RX_DDR_BYPASS=1はバッファなしのため引き続き全ドロップ(アーキテクチャ制約)。3ギャップ以上は最初の2レンジのみ保持 | 完全な再構成キュー | ★(残: bypass構成) |
 | 先頭が重複したセグメント | **対応済** (R10, `dsack`テスト): rcv_nxtより前から始まり新データを含むセグメント(再パケット化された再送など)を、非bypass構成では重複部分が未読なら受理(セグメント全体を元の位置へ書き、未読の先頭は同じバイトで上書き)し、重複部分をD-SACKで報告。重複部分を既にappが読んでいる場合はウィンドウ遠端へのエイリアスを避けて破棄(相手はACK位置から再送)。bypass構成(R12)は重複部分をrxPackageDropperで切り落として受理(FSMのdrop FIFOを17bit化しトリム量を渡す、ワード単位スキップ+バイトシフト)、重複部分はD-SACKで報告 | 先頭をトリムして受理 | ✓(残: 非bypassで既読の場合) |
-| RFC 793受理判定 | **一部実装済** (F2, `seq_window_check`テスト): 非bypassのOOO受理を広告ウィンドウ内に制限(バッファ別名書込み防止)、OOO系比較をmod 2^32化(seq_lt等ヘルパ追加)。ACK側の全面的なwrap対応は未 | あり | ★(残) |
+| RFC 793受理判定 | **一部実装済** (F2, `seq_window_check`テスト): 非bypassのOOO受理を広告ウィンドウ内に制限(バッファ別名書込み防止)、OOO系比較をmod 2^32化(seq_lt等ヘルパ追加)。送信側もmod 2^32で検証済(R15, `tx_seq_wrap`テスト): ISN生成器のレジスタを操作してISSを2^32の4.5KB手前に置き、wrapをまたぐ送信・新規ACK・2^32をまたぐSACKブロックでの選択再送・回復終了・D-SACK undo・RFC 5961のACK検証(snd_nxt超えACKへのchallenge ACK)・wrap後の新規送信を確認 | あり | 完了 |
 | ウィンドウ更新通知 | **実装済** (F1, `window_update`テスト): app読出しでappdが進むとACKイベントを発行しwindow update ACKを送出 | 即時window update | 完了 |
 | ゼロウィンドウプローブ | **実装済** (Z1, `zero_window_probe`テスト): rx側がゼロウィンドウ広告でpersistタイマ(50ms)をセット、満了でseq=snd_nxt-1の純ACKプローブ送出(相手が現ウィンドウを返答)、ウィンドウ回復のACKで解除+送信再開イベント。probe_timerは統一read-modify-writeパスに書換え(書込み順序ハザード根治) | RFC 1122準拠persist | 完了 |
 | Delayed ACK | 64µs固定(Linuxの40msの約1/600、HW TOEのRTTには妥当)。2セグメント毎に即ACK、CE受信時はクイックACK(R7)。**無限延期を修正** (R11): 従来タイマ走査は入力イベントが無いサイクルにしか進まなかったが、入力が連続しても4サイクルに1回は走査に回すようにした(遅延は最悪4倍に有界) (`ack_delay.cpp`) | 40ms/クイックACK | ✓ |

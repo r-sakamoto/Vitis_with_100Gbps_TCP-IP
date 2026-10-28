@@ -4201,6 +4201,182 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // R15: the TOE's own sequence numbers crossing 2^32. The ISN generator
+  // registers are steered so that ISS lands ~4.5KB below the wrap; then new
+  // ACKs, SACK-guided fast retransmit, recovery exit, D-SACK undo and RFC 5961
+  // ACK validation all run with snd_una/snd_nxt/SACK blocks across the wrap.
+  task automatic test_tx_seq_wrap();
+    bytes_t p, pay, d;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] iss, d0, clk_set, target;
+    byte unsigned sent[$];
+    int got, diff, tries, soff, rt_bytes, nseg;
+    bit found;
+    int unsigned cw, cw0, ssth, ssth0;
+
+    app_listen(16'd80, ok);
+    tb_check(ok, "listen(80)");
+
+    // --- steer the ISS: ISN = (rand ^ sid<<16) + isnClock ---
+    target = 32'hFFFF_EE6C;              // 2^32 - 4500
+    clk_set = 32'hFFFF_0000;
+    found = 0;
+    for (tries = 0; tries < 8 && !found; tries++) begin
+      peer_port = 16'd42700 + tries[15:0]; toe_port = 16'd80;
+      peer_seq  = 32'hB200_0000 + tries * 32'd1000; peer_win = 16'hFFFF; peer_ack = 0;
+      @(negedge ap_clk);
+      dut.metaLoader_U0.ml_randomValue_V = 32'd0;
+      dut.metaLoader_U0.isnClock = clk_set;
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, 0, F_SYN, 16'hFFFF, syn_options_sack(), no_bytes()));
+      expect_flags(F_SYN | F_ACK, "SYN-ACK (ISS steering)", p, 100000, 1);
+      if (err_count) return;
+      iss = f_seq(p);
+      peer_ack = iss + 1;
+      peer_seq += 1;
+      diff = $signed(target - iss);
+      if (diff > -1000 && diff < 1000) begin
+        peer_send_seg(F_ACK, no_bytes());
+        found = 1;
+      end
+      else begin
+        peer_send_seg(F_RST, no_bytes());
+        repeat (300) @(posedge ap_clk);
+        // the next try gets the next session id: (rand ^ sid<<16) grows by
+        // 1<<16 (rand's upper half is 0 here)
+        clk_set += diff - 32'h1_0000;
+      end
+    end
+    tb_check(found, $sformatf("ISS steered below 2^32 (iss=%h after %0d tries)", iss, tries));
+    if (!found) return;
+    notif_q.delete();
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    // --- 8 x 1400B across the wrap: contiguous seqs, intact payload ---
+    d0 = iss + 1;
+    sent.delete();
+    for (int i = 0; i < 8; i++) begin
+      pay = gen_payload(1400, 8'h20 + i[7:0]);
+      app_send(sid, pay, rsp);
+      tb_check(rsp.error == 0, $sformatf("app_send %0d accepted", i));
+      foreach (pay[j]) sent.push_back(pay[j]);
+    end
+    got = 0;
+    while (got < 8) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout collecting data segments"); return; end
+      if (f_payload_len(p) == 0) continue;
+      soff = f_seq(p) - d0;
+      tb_check(soff == got * 1400 && f_payload_len(p) == 1400,
+               $sformatf("segment %0d at offset %0d len %0d", got, soff, f_payload_len(p)));
+      d = f_payload(p);
+      for (int i = 0; i < d.size(); i++)
+        if (d[i] !== sent[soff + i]) begin
+          tb_check(0, $sformatf("payload mismatch at stream offset %0d", soff + i));
+          return;
+        end
+      got++;
+    end
+    tb_info($sformatf("stream wraps 2^32 at offset %0d", 32'h0 - d0));
+
+    // --- new ACK across the wrap point: slow start growth ---
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 1400, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    cw0   = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    ssth0 = dut.tx_sar_table_U0.tx_table_slowstart_threshold_V_U.ram[sid];
+    tb_check(dut.tx_sar_table_U0.tx_table_ackd_V_U.ram[sid] == d0 + 1400, "snd_una advanced");
+
+    // --- 3 dup ACKs, SACK block straddling 2^32 -> selective retransmit ---
+    for (int i = 0; i < 3; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, d0 + 1400, F_ACK, peer_win,
+                        sack_opt(d0 + 2800, d0 + 5600), no_bytes()));
+      repeat (100) @(posedge ap_clk);
+    end
+    // fast retransmit sends at most 4 segments per event (go-back-N bound)
+    rt_bytes = 0; nseg = 0;
+    while (nseg < 4) begin
+      wait_pkt(p, 500000, ok);
+      if (!ok) begin tb_error($sformatf("timeout waiting for retransmissions (%0d B)", rt_bytes)); return; end
+      if (f_payload_len(p) == 0) continue;
+      soff = f_seq(p) - d0;
+      if (nseg == 0)
+        tb_check(soff == 1400, $sformatf("first retransmit at offset %0d expected 1400", soff));
+      tb_check(soff >= 1400 && soff + f_payload_len(p) <= 11200
+               && (soff + f_payload_len(p) <= 2800 || soff >= 5600),
+               $sformatf("retransmit [%0d,+%0d) avoids the SACKed [2800,5600)", soff, f_payload_len(p)));
+      d = f_payload(p);
+      for (int i = 0; i < d.size(); i++)
+        if (d[i] !== sent[soff + i]) begin
+          tb_check(0, $sformatf("retransmit payload mismatch at stream offset %0d", soff + i));
+          return;
+        end
+      rt_bytes += f_payload_len(p);
+      nseg++;
+    end
+    ssth = dut.tx_sar_table_U0.tx_table_slowstart_threshold_V_U.ram[sid];
+    tb_check(ssth == 4900, $sformatf("ssthresh=%0d expected 4900", ssth));
+
+    // --- full ACK ends the recovery ---
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 11200, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cw == 4900, $sformatf("cwnd=%0d expected 4900 after recovery", cw));
+    tb_check(dut.tx_sar_table_U0.tx_table_ackd_V_U.ram[sid] == d0 + 11200, "snd_una past the wrap");
+
+    // --- D-SACK of the first retransmitted segment (below the ACK, across
+    // the wrap) undoes the reduction ---
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 11200, F_ACK, peer_win,
+                      sack_opt(d0 + 1400, d0 + 2800), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    ssth = dut.tx_sar_table_U0.tx_table_slowstart_threshold_V_U.ram[sid];
+    tb_check(cw == cw0 && ssth == ssth0,
+             $sformatf("D-SACK undo cwnd=%0d ssthresh=%0d expected %0d/%0d", cw, ssth, cw0, ssth0));
+
+    // --- RFC 5961: ACK above snd_nxt is not accepted, answered with an ACK ---
+    while (net_pkts.size() > 0) void'(net_pkts.pop_front());
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 11200 + 1000, F_ACK, peer_win, no_bytes(), no_bytes()));
+    expect_flags(F_ACK, "challenge ACK for ACK above snd_nxt", p, 200000, 0);
+    if (err_count) return;
+    tb_check(f_seq(p) == d0 + 11200, "challenge ACK seq = snd_nxt");
+    tb_check(dut.tx_sar_table_U0.tx_table_ackd_V_U.ram[sid] == d0 + 11200, "snd_una unchanged");
+
+    // --- new data after the wrap goes out at snd_nxt ---
+    pay = gen_payload(600, 8'h90);
+    app_send(sid, pay, rsp);
+    tb_check(rsp.error == 0, "app_send after wrap accepted");
+    got = 0;
+    while (!got) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout waiting for post-wrap data"); return; end
+      if (f_payload_len(p) == 600) got = 1;
+    end
+    tb_check(f_seq(p) == d0 + 11200, "post-wrap data seq");
+    d = f_payload(p);
+    for (int i = 0; i < 600; i++)
+      if (d[i] !== pay[i]) begin
+        tb_check(0, $sformatf("post-wrap payload mismatch at %0d", i));
+        return;
+      end
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 11800, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   task automatic test_ecn();
     bytes_t p;
     bit ok;
@@ -4971,6 +5147,7 @@ module tb_toe_top;
       "ecn"            : test_ecn();
       "dsack"          : test_dsack();
       "dsack_undo"     : test_dsack_undo();
+      "tx_seq_wrap"    : test_tx_seq_wrap();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 
