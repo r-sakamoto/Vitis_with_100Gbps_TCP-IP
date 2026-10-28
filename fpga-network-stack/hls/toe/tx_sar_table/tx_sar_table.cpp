@@ -65,7 +65,11 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 		txTxSarQuery tst_txEngUpdate = txEng2txSar_upd_req.read();
 		if (tst_txEngUpdate.write)
 		{
-			if (!tst_txEngUpdate.isRtQuery)
+			if (tst_txEngUpdate.rtHighWrite)
+			{
+				tx_table[tst_txEngUpdate.sessionID].rtHigh = tst_txEngUpdate.not_ackd;
+			}
+			else if (!tst_txEngUpdate.isRtQuery)
 			{
 				tx_table[tst_txEngUpdate.sessionID].not_ackd = tst_txEngUpdate.not_ackd;
 				tx_table[tst_txEngUpdate.sessionID].lastTxTime = nowUnits;
@@ -105,8 +109,10 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 				ap_uint<16> lwMss = tx_table[tst_txEngUpdate.sessionID].mss;
 				tx_table[tst_txEngUpdate.sessionID].cong_window = (lwMss == 0) ? (ap_uint<16>)MSS : lwMss;
 				tx_table[tst_txEngUpdate.sessionID].ca_acc = 0;
-				// a timeout ends any pending D-SACK undo of a fast recovery
+				// a timeout ends the fast recovery and any pending D-SACK undo
 				tx_table[tst_txEngUpdate.sessionID].undoValid = false;
+				tx_table[tst_txEngUpdate.sessionID].fastRetransmitted = false;
+				tx_table[tst_txEngUpdate.sessionID].count = 0;
 			}
 		}
 		else // Read
@@ -236,6 +242,11 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 				tx_table[tst_rxEngUpdate.sessionID].undoSsthresh = tst_rxEngUpdate.undoSsthresh;
 				tx_table[tst_rxEngUpdate.sessionID].undoSeq = tst_rxEngUpdate.undoSeq;
 			}
+			if (tst_rxEngUpdate.recoverWrite)
+			{
+				tx_table[tst_rxEngUpdate.sessionID].recoverSeq = tst_rxEngUpdate.recoverSeq;
+				tx_table[tst_rxEngUpdate.sessionID].rtHigh = tst_rxEngUpdate.rtHigh;
+			}
 			// effective cwnd for the app-side min_window push (on init the
 			// query still carries a stale value, use the fresh IW instead)
 			ap_uint<WINDOW_BITS> effCongWindow = tst_rxEngUpdate.cong_window;
@@ -311,6 +322,8 @@ void tx_sar_table(	stream<rxTxSarQuery>&			rxEng2txSar_upd_req,
 			rxEngReply.undoCwnd = tx_table[tst_rxEngUpdate.sessionID].undoCwnd;
 			rxEngReply.undoSsthresh = tx_table[tst_rxEngUpdate.sessionID].undoSsthresh;
 			rxEngReply.undoSeq = tx_table[tst_rxEngUpdate.sessionID].undoSeq;
+			rxEngReply.recoverSeq = tx_table[tst_rxEngUpdate.sessionID].recoverSeq;
+			rxEngReply.rtHigh = tx_table[tst_rxEngUpdate.sessionID].rtHigh;
 			txSar2rxEng_upd_rsp.write(rxEngReply);
 		}
 	}

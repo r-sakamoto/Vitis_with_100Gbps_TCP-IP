@@ -32,8 +32,8 @@ port_table / state_table / ack_delay / tx_app_* / rx_app_*)、および
 |---|---|---|---|
 | RTT計測 / 適応RTO | **実装済** (P2, `adaptive_rto`テスト): 新モジュール`rtt_estimator`がKarn方式でRTT計測、RFC 6298のSRTT/RTTVAR→RTO=clamp(SRTT+4V, 250ms, 30s)。retransmit_timerはRTO×2^retriesの指数バックオフ化。Timestampsオプション(PAWS含む)は未 | SRTT/RTTVARによるRFC 6298、最小RTO 200ms | ★(残: TSopt) |
 | 再送回数上限 | **改善済** (C3, `rt_abort`テスト): データ再送は7回(RTO上限30sで累計1分超)後にセッション解放+app通知、SYN/SYN-ACKは4回のまま。LinuxもRTO枯渇時にRSTは送らない(ETIMEDOUT) | tcp_retries2(15回) | ★(残: 回数) |
-| 再送方式 | **改善済** (S2+C2): peer SACKブロック(最大2個)の範囲をスキップ/クランプする選択的再送。RTOあたり最大4セグメントの上限は残る(SACKで実質補完) | SACKベースの選択再送 | 完了 |
-| Fast Retransmit | **実装済** (P3, `fast_recovery`テスト): 3rd dup ACKでssthresh=max(flight/2,2MSS)・cwnd=ssthresh+3MSS、dup ACK毎に+MSS膨張、回復脱出でcwnd=ssthresh収縮。NewReno partial-ACK再送はgo-back-N再送のため実質不要 | RFC 5681 fast recovery、partial ACK処理 | 完了 |
+| 再送方式 | **改善済** (S2+C2): peer SACKブロック(最大2個)の範囲をスキップ/クランプする選択的再送。fast retransmitは1バースト最大4セグメントで、残りはpartial ACKごとに次のバースト(R16) | SACKベースの選択再送 | 完了 |
+| Fast Retransmit | **実装済** (P3, `fast_recovery`テスト): 3rd dup ACKでssthresh=max(flight/2,2MSS)・cwnd=ssthresh+3MSS、dup ACK毎に+MSS膨張、回復脱出でcwnd=ssthresh収縮。NewReno partial ACK実装済(R16, `newreno_partial`テスト, RFC 6582): 回復突入時のsnd_nxt(recover)を超えるACKまで回復を継続、partial ACKではcwnd -= acked, += MSSで収縮し、直前の再送バースト(最大4セグメント)の終端までACKされていれば新しいsnd_unaから次のバーストを送る(バースト内のpartial ACKでは再送せず重複再送を回避)。RTOで回復を終了 | RFC 5681 fast recovery、partial ACK処理 | 完了 |
 | 輻輳制御 | **正規化済** (P3+C1+G2+G3, `ca_growth`/`cwnd_idle_restart`/`rto_single_seg`テスト): cwnd初期=IW10、RTO後=1×MSSかつ再送は先頭1セグメントのみ(ACKクロック駆動)、slow start+sessMSS/ACK、輻輳回避はRFC 3465バイトカウント、~1秒無送信でcwnd→IWへ再検証(RFC 5681 4.1)。CUBIC/pacing/RACK-TLPは未(Reno相当) | CUBIC(デフォルト)ほか、ABC、pacing、RACK-TLP | ★(残: CUBIC/RACK) |
 | dup ACK判定 | **準拠** (P3+G1, `dupack_win_change`テスト): staleACKガード+広告ウィンドウ不変チェック(純window updateはdupカウントされずfast retransmitを誤発火しない) | RFC 5681準拠 | 完了 |
 | シーケンス番号の巡回演算 | **統一済** (F2+P3+C4): OOO受理・dup ACK判定・ACK受理窓(snd_una≤ack≤snd_nxt)・PAWS・SACK処理はすべてseq_lt/leq/gt/geqヘルパ(mod 2^32)。等値比較はwrap非依存 | 全比較がmod 2^32 | 完了 |

@@ -4377,6 +4377,123 @@ module tb_toe_top;
     repeat (2000) @(posedge ap_clk);
   endtask
 
+  // R16: NewReno partial ACKs (RFC 6582). A fast retransmit burst is bounded
+  // to 4 segments; a partial ACK that covers the burst sends the next one
+  // from the new snd_una, a partial ACK below its end sends nothing (no
+  // duplicate retransmissions). cwnd is deflated by the acked data + 1 MSS
+  // per partial ACK and set to ssthresh on the full ACK.
+  task automatic test_newreno_partial();
+    bytes_t p, pay, d;
+    bit ok;
+    notif_t n;
+    bit [15:0] sid;
+    txrsp_t rsp;
+    bit [31:0] d0;
+    byte unsigned sent[$];
+    int got, soff, nseg, rt_end;
+    int unsigned cw, ssth;
+
+    app_listen(16'd80, ok);
+    do_passive_handshake(16'd80, 16'd42800);
+    if (err_count) return;
+    peer_send_seg(F_ACK, gen_payload(8, 8'h01));
+    wait_notif(n, 200000, ok);
+    tb_check(ok, "data notification");
+    if (!ok) return;
+    sid = n.sessionID;
+    peer_seq += 8;
+    expect_flags(F_ACK, "ACK of 8B", p, 400000, 0);
+
+    sent.delete();
+    for (int i = 0; i < 8; i++) begin
+      pay = gen_payload(1400, 8'hA0 + i[7:0]);
+      app_send(sid, pay, rsp);
+      tb_check(rsp.error == 0, $sformatf("app_send %0d accepted", i));
+      foreach (pay[j]) sent.push_back(pay[j]);
+    end
+    got = 0;
+    while (got < 8) begin
+      wait_pkt(p, 400000, ok);
+      if (!ok) begin tb_error("timeout collecting data segments"); return; end
+      if (f_payload_len(p) == 1400) begin
+        if (got == 0) d0 = f_seq(p);
+        got++;
+      end
+    end
+
+    // 3 dup ACKs at d0 -> recovery, first burst [0, 4 segments)
+    for (int i = 0; i < 3; i++) begin
+      net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                        peer_seq, d0, F_ACK, peer_win, no_bytes(), no_bytes()));
+      repeat (100) @(posedge ap_clk);
+    end
+    nseg = 0; rt_end = 0;
+    while (nseg < 4) begin
+      wait_pkt(p, 500000, ok);
+      if (!ok) begin tb_error("timeout waiting for the first burst"); return; end
+      if (f_payload_len(p) == 0) continue;
+      soff = f_seq(p) - d0;
+      tb_check(soff == rt_end, $sformatf("burst 1 segment at %0d expected %0d", soff, rt_end));
+      rt_end = soff + f_payload_len(p);
+      nseg++;
+    end
+    repeat (3000) @(posedge ap_clk);
+    ssth = dut.tx_sar_table_U0.tx_table_slowstart_threshold_V_U.ram[sid];
+    cw   = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(ssth == 5600 && cw == 9980,
+             $sformatf("recovery entry ssthresh=%0d cwnd=%0d expected 5600/9980", ssth, cw));
+    tb_check(rt_end == 5840, $sformatf("first burst ends at %0d expected 5840 (4 x MSS)", rt_end));
+
+    // partial ACK inside the burst: deflate, no retransmission
+    while (net_pkts.size() > 0) void'(net_pkts.pop_front());
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 1400, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (5000) @(posedge ap_clk);
+    got = 0;
+    while (net_pkts.size() > 0) begin
+      p = net_pkts.pop_front();
+      if (f_payload_len(p) > 0) got++;
+    end
+    tb_check(got == 0, $sformatf("no retransmission on a partial ACK inside the burst (%0d sent)", got));
+    cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cw == 10040, $sformatf("partial ACK cwnd=%0d expected 10040 (9980-1400+1460)", cw));
+    tb_check(dut.tx_sar_table_U0.tx_table_fastRetransmitted_U.ram[sid] == 1, "still in recovery");
+
+    // partial ACK covering the burst: next burst from 5840 up to snd_nxt
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 5840, F_ACK, peer_win, no_bytes(), no_bytes()));
+    rt_end = 5840;
+    while (rt_end < 11200) begin
+      wait_pkt(p, 500000, ok);
+      if (!ok) begin tb_error($sformatf("timeout waiting for the second burst at %0d", rt_end)); return; end
+      if (f_payload_len(p) == 0) continue;
+      soff = f_seq(p) - d0;
+      tb_check(soff == rt_end, $sformatf("burst 2 segment at %0d expected %0d", soff, rt_end));
+      if (soff != rt_end) return;
+      d = f_payload(p);
+      for (int i = 0; i < d.size(); i++)
+        if (d[i] !== sent[soff + i]) begin
+          tb_check(0, $sformatf("burst 2 payload mismatch at %0d", soff + i));
+          return;
+        end
+      rt_end = soff + f_payload_len(p);
+    end
+    repeat (3000) @(posedge ap_clk);
+    cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cw == 7060, $sformatf("partial ACK cwnd=%0d expected 7060 (10040-4440+1460)", cw));
+
+    // full ACK: recovery ends, cwnd = ssthresh
+    net_send(make_tcp(PEER_IP, TOE_IP, peer_port, toe_port,
+                      peer_seq, d0 + 11200, F_ACK, peer_win, no_bytes(), no_bytes()));
+    repeat (3000) @(posedge ap_clk);
+    cw = dut.tx_sar_table_U0.tx_table_cong_window_V_U.ram[sid];
+    tb_check(cw == 5600, $sformatf("full ACK cwnd=%0d expected 5600 (ssthresh)", cw));
+    tb_check(dut.tx_sar_table_U0.tx_table_fastRetransmitted_U.ram[sid] == 0, "recovery ended");
+
+    while (net_pkts.size() > 0) void'(net_pkts.pop_front());
+    repeat (2000) @(posedge ap_clk);
+  endtask
+
   task automatic test_ecn();
     bytes_t p;
     bit ok;
@@ -5148,6 +5265,7 @@ module tb_toe_top;
       "dsack"          : test_dsack();
       "dsack_undo"     : test_dsack_undo();
       "tx_seq_wrap"    : test_tx_seq_wrap();
+      "newreno_partial": test_newreno_partial();
       default: tb_error($sformatf("unknown TESTNAME '%s'", testname));
     endcase
 

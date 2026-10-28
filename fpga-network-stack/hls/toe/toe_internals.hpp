@@ -335,6 +335,10 @@ struct txSarEntry
 	ap_uint<WINDOW_BITS> undoCwnd;
 	ap_uint<WINDOW_BITS> undoSsthresh;
 	ap_uint<32>	undoSeq;
+	//NewReno (RFC 6582): snd_nxt at recovery entry, and the end of the last
+	//fast retransmit burst (the next burst waits until that is acked)
+	ap_uint<32>	recoverSeq;
+	ap_uint<32>	rtHigh;
 };
 
 struct rxTxSarQuery
@@ -369,6 +373,9 @@ struct rxTxSarQuery
 	ap_uint<WINDOW_BITS> undoCwnd = 0;
 	ap_uint<WINDOW_BITS> undoSsthresh = 0;
 	ap_uint<32>	undoSeq = 0;
+	ap_uint<1>	recoverWrite = 0;   //recovery entry: write recoverSeq and rtHigh
+	ap_uint<32>	recoverSeq = 0;
+	ap_uint<32>	rtHigh = 0;
 	ap_uint<1> write;
 	ap_uint<1>	init;
 	rxTxSarQuery () {}
@@ -394,6 +401,7 @@ struct txTxSarQuery
 	bool		finSent;
 	bool		isRtQuery;
 	ap_uint<1>	cwrClear = 0; //the CWR flag went out on this transmission
+	ap_uint<1>	rtHighWrite = 0; //only store not_ackd as the end of a fast retransmit burst
 	txTxSarQuery() {}
 	txTxSarQuery(ap_uint<16> id)
 				:sessionID(id), not_ackd(0), write(0), init(0), finReady(false), finSent(false), isRtQuery(false) {}
@@ -457,6 +465,8 @@ struct rxTxSarReply
 	ap_uint<WINDOW_BITS> undoCwnd = 0;
 	ap_uint<WINDOW_BITS> undoSsthresh = 0;
 	ap_uint<32>	undoSeq = 0;
+	ap_uint<32>	recoverSeq = 0;
+	ap_uint<32>	rtHigh = 0;
 	rxTxSarReply() {}
 	rxTxSarReply(ap_uint<32> ack, ap_uint<32> next, ap_uint<WINDOW_BITS> cong_win, ap_uint<WINDOW_BITS> sstresh, ap_uint<2> count, bool fastRetransmitted)
 			:prevAck(ack), nextByte(next), cong_window(cong_win), slowstart_threshold(sstresh), count(count), fastRetransmitted(fastRetransmitted), mss(MSS), ca_acc(0), peerSackStart(0), peerSackEnd(0), peerSackValid(false) {}

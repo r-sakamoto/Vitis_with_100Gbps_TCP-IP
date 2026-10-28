@@ -916,6 +916,14 @@ void metaLoader(hls::stream<extendedEvent>&				eventEng2txEng_event,
 				ap_uint<WINDOW_BITS+1> minB = (tillSack1 < tillSack2) ? tillSack1 : tillSack2;
 				ap_uint<WINDOW_BITS+1> segLen = (minA < minB) ? minA : minB;
 				bool lastSegment = (segLen == remaining);
+				// end of a fast retransmit burst: report where it stopped, the
+				// rx engine sends the next burst on a partial ACK covering it
+				if (ml_curEvent.rt_count == 0 && (lastSegment || ml_segmentCount == 3))
+				{
+					txTxSarQuery rtHighUpd(ml_curEvent.sessionID, ml_rtSeq + segLen, 1);
+					rtHighUpd.rtHighWrite = 1;
+					txEng2txSar_upd_req.write(rtHighUpd);
+				}
 
 				meta.seqNumb = ml_rtSeq;
 				meta.length = segLen;

@@ -1271,6 +1271,8 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 					// per-session effective MSS for congestion arithmetic
 					ap_uint<16> sessMSS = (txSar.mss == 0) ? (ap_uint<16>)MSS : txSar.mss;
 					bool enterFastRecovery = false;
+					bool partialAck = txSar.fastRetransmitted && seq_lt(fsm_meta.meta.ackNumb, txSar.recoverSeq);
+					bool partialRt = false;
 					// congestion state before this ACK, saved on recovery entry
 					ap_uint<WINDOW_BITS> priorCwnd = txSar.cong_window;
 					ap_uint<WINDOW_BITS> priorSsthresh = txSar.slowstart_threshold;
@@ -1362,9 +1364,22 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						rxEng2timer_clearProbeTimer.write(fsm_meta.sessionID);
 						// Report the cumulative ACK to the RTT estimator
 						rxEng2rtt_ack.write(rttAck(fsm_meta.sessionID, fsm_meta.meta.ackNumb));
-						if (txSar.fastRetransmitted)
+						if (partialAck)
 						{
-							// leaving fast recovery: deflate cwnd to ssthresh (RFC 5681)
+							// NewReno (RFC 6582) partial ACK: stay in recovery,
+							// deflate cwnd by the newly acked data and add back
+							// one MSS. Once the last fast retransmit burst is
+							// acked, the next one starts at the new snd_una.
+							ap_uint<32> ackedBytes = fsm_meta.meta.ackNumb - txSar.prevAck;
+							txSar.cong_window = ((ap_uint<32>)txSar.cong_window > ackedBytes)
+									? (ap_uint<WINDOW_BITS>)(txSar.cong_window - ackedBytes(WINDOW_BITS-1, 0) + sessMSS)
+									: (ap_uint<WINDOW_BITS>)sessMSS;
+							partialRt = seq_geq(fsm_meta.meta.ackNumb, txSar.rtHigh);
+						}
+						else if (txSar.fastRetransmitted)
+						{
+							// full ACK (snd_nxt at entry covered): leaving fast
+							// recovery, deflate cwnd to ssthresh (RFC 5681)
 							txSar.cong_window = txSar.slowstart_threshold;
 							txSar.ca_acc = 0;
 						}
@@ -1393,7 +1408,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 							txSar.ca_acc = accSum(WINDOW_BITS-1, 0);
 						}
 						txSar.count = 0;
-						txSar.fastRetransmitted = false;
+						txSar.fastRetransmitted = partialAck;
 					}
 					// else: stale ACK (older than snd_una) - ignore for congestion state
 					if (ecnReduce)
@@ -1439,6 +1454,9 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 						txSarUpd.undoCwnd = priorCwnd;
 						txSarUpd.undoSsthresh = priorSsthresh;
 						txSarUpd.undoSeq = txSar.prevAck;
+						txSarUpd.recoverWrite = enterFastRecovery;
+						txSarUpd.recoverSeq = txSar.nextByte;
+						txSarUpd.rtHigh = txSar.prevAck;
 						txSarUpd.ca_acc = enterFastRecovery ? (ap_uint<WINDOW_BITS>)0 : txSar.ca_acc;
 						txSarUpd.ecnUpdate = 1;
 						txSarUpd.ecnHold = ecnHoldNow || ecnReduce;
@@ -1749,7 +1767,7 @@ void rxTcpFSM(			stream<rxFsmMetaData>&					fsmMetaDataFifo,
 
 
 #if FAST_RETRANSMIT
-					if (txSar.count == 3 && !txSar.fastRetransmitted)
+					if (enterFastRecovery || partialRt)
 					{
 						rxEng2eventEng_setEvent.write(event(RT, fsm_meta.sessionID));
 					}
